@@ -35,6 +35,8 @@ def ForCausalLMLoss(
     #print(math.exp(-average_log_prob))
     #print(-sum_log_prob/(44 * math.log(2)))
     loss = transformers.loss.loss_utils.fixed_cross_entropy(logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
+    my_loss = -average_log_prob
+    assert(math.fabs((my_loss - loss)/loss) < 0.0001)
     return loss
 
 def calculate_perplexity(file_path):
