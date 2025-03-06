@@ -15,10 +15,10 @@ def calculate_perplexity(file_path):
     model = GPT2LMHeadModel.from_pretrained('gpt2')
     model.eval()
     
-    tokens = tokenizer.encode(text, add_special_tokens=False)
-    
-    byte_count = len(text.encode('utf-8'))
+    tokens = tokenizer.encode(text)
     token_count = len(tokens)
+    tokens = [50256] + tokens
+    byte_count = len(text.encode('utf-8'))
     tokens_per_byte = token_count / byte_count
     
     with torch.no_grad():
