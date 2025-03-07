@@ -164,6 +164,7 @@ def calculate_standard_bpb(document, tokenizer, model):
     byte_count = len(document.encode('utf-8'))
     tokens = tokenizer.encode(document, add_special_tokens=False)
     token_count = len(tokens)
+    tokens = [50256] + tokens
     
     tokens_tensor = torch.tensor([tokens])
     model._loss_function = ForCausalLMLoss
