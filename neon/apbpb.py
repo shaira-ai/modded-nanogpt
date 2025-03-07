@@ -134,7 +134,7 @@ def calculate_naive_apbpb(document, tokenizer, model):
         next_token_probs = torch.softmax(logits, dim=0)
         token_probs[(token_id, byte_pos_start)] = next_token_probs[token_id].item()
     
-    prob_array = np.zeros(len(document) + 1)
+    prob_array = np.zeros(len(document) + 1 + 1000)
     prob_array[0] = 1.0  # Start with 100% probability
     
     # Process each byte position
@@ -148,6 +148,7 @@ def calculate_naive_apbpb(document, tokenizer, model):
         for token_id, token_text in valid_tokens:
             if (token_id, pos) in token_probs:
                 token_prob = token_probs[(token_id, pos)]
+                print(f"in position {pos} I can get \"{token_text}\" with probability {token_prob}")
                 new_pos = pos + len(token_text)
                 prob_array[new_pos] += prob_array[pos] * token_prob
     
