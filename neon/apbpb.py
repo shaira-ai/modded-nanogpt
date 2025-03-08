@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
 import transformers
+import mpmath  # For better precision with small numbers
 
 def ForCausalLMLoss(
     logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs
@@ -41,9 +42,6 @@ def ForCausalLMLoss(
     return loss
 
 def find_valid_next_tokens(text, byte_position, tokenizer, max_length=None):
-    """
-    Find all tokens that could start at the given byte position.
-    """
     remaining_text = text[byte_position:]
     valid_tokens = []
     
@@ -61,6 +59,7 @@ def find_valid_next_tokens(text, byte_position, tokenizer, max_length=None):
             valid_tokens.append((token_id, token_text))
     
     return valid_tokens
+
 
 def generate_canonical_token_positions(document, tokenizer):
     prefixes = [document[:i+1] for i in range(len(document))]
@@ -102,78 +101,91 @@ def generate_canonical_token_positions(document, tokenizer):
 def calculate_naive_apbpb(document, tokenizer, model):
     byte_count = len(document.encode('utf-8'))
     separator_token = "<|endoftext|>"
-
-    token_data = generate_canonical_token_positions(document, tokenizer)
     
-    df = pd.DataFrame([(token_id, token_text, token_pos, byte_pos_end) 
-                      for token_id, token_text, token_pos, byte_pos_end in token_data],
-                     columns=['token_id', 'token_text', 'token_position', 'byte_position_end'])
+    # Use mpmath for high precision calculations to avoid underflow
+    mpmath.mp.dps = 100  # Set precision to 100 decimal places
     
-    #print("\nSorted by byte position (end) and token length:")
-    #print(df.head(10))
+    position_tokens = {}
+    for pos in range(len(document)):
+        valid_tokens = find_valid_next_tokens(document, pos, tokenizer)
+        position_tokens[pos] = valid_tokens
     
+    prob_array = [mpmath.mpf(0)] * (len(document) + 1 + 1000)
+    prob_array[0] = mpmath.mpf(1.0)  # Start with 100% probability
+    
+    # Get canonical token positions for analysis/debugging
+    # canonical_token_data = generate_canonical_token_positions(document, tokenizer)
+    
+    # Print canonical token positions for debugging
+    # print("\nCanonical token positions from prefixes:")
+    # for token_id, token_text, token_pos, byte_pos_end in canonical_token_data[:10]:  # Show first 10
+    #     print(f"Token: '{token_text}', Position: {token_pos}, End byte: {byte_pos_end}")
+    
+    # Calculate token probabilities for each position (one model call per position)
     token_probs = {}
-    
-    for token_id, token_text, _, byte_pos_end in token_data:
-        byte_pos_start = byte_pos_end - len(token_text)
-        prefix = document[:byte_pos_start]
-        
-        if byte_pos_start == 0:
+    for pos in range(len(document)):
+        # Prepare input for the model
+        if pos == 0:
             input_text = separator_token
         else:
-            input_text = separator_token + prefix
+            input_text = separator_token + document[:pos]
         
         inputs = tokenizer(input_text, return_tensors="pt")
         
+        # Get all token probabilities in one go
         with torch.no_grad():
-            model._loss_function = ForCausalLMLoss
             outputs = model(**inputs)
             logits = outputs.logits[0, -1]
+            next_token_probs = torch.softmax(logits, dim=0)
         
-        # Get token probability
-        next_token_probs = torch.softmax(logits, dim=0)
-        token_probs[(token_id, byte_pos_start)] = next_token_probs[token_id].item()
+        # Store probabilities for all valid tokens at this position
+        for token_id, token_text in position_tokens[pos]:
+            token_prob = next_token_probs[token_id].item()
+            token_probs[(token_id, pos)] = token_prob
     
-    prob_array = np.zeros(len(document) + 1 + 1000)
-    prob_array[0] = 1.0  # Start with 100% probability
-    
-    # Process each byte position
+    # Process each byte position to update probability array
     for pos in range(len(document)):
         # Skip positions that can't be reached
         if prob_array[pos] <= 0:
             continue
         
-        valid_tokens = find_valid_next_tokens(document, pos, tokenizer)
-        
-        for token_id, token_text in valid_tokens:
-            if (token_id, pos) in token_probs:
-                token_prob = token_probs[(token_id, pos)]
-                print(f"in position {pos} I can get \"{token_text}\" with probability {token_prob}")
-                new_pos = pos + len(token_text)
-                prob_array[new_pos] += prob_array[pos] * token_prob
+        # Process all valid tokens from this position
+        for token_id, token_text in position_tokens[pos]:
+            token_prob = token_probs[(token_id, pos)]
+            
+            # Update probability array
+            new_pos = pos + len(token_text)
+            prob_array[new_pos] += prob_array[pos] * mpmath.mpf(token_prob)
+            
+            print(f"in position {pos} I can get \"{token_text}\" with probability {token_prob}")
     
     final_prob = prob_array[len(document)]
     
     if final_prob > 0:
-        apbpb = -math.log2(final_prob) / byte_count
+        apbpb = -mpmath.log(final_prob, 2) / byte_count
     else:
         apbpb = float('inf')
     
-    return apbpb, prob_array, token_data
+    # Convert to float for printing
+    float_prob_array = [float(p) if p > 0 else 0.0 for p in prob_array]
+    
+    return float(apbpb), float_prob_array
 
 def calculate_standard_bpb(document, tokenizer, model):
     byte_count = len(document.encode('utf-8'))
-    tokens = tokenizer.encode(document, add_special_tokens=False)
-    token_count = len(tokens)
-    tokens = [50256] + tokens
+    separator_id = tokenizer.encode("<|endoftext|>", add_special_tokens=False)[0]
+    
+    # Add separator token at the beginning - this was missing before
+    tokens = [separator_id] + tokenizer.encode(document, add_special_tokens=False)
+    token_count = len(tokens) - 1  # Subtract 1 for the separator token
     
     tokens_tensor = torch.tensor([tokens])
-    model._loss_function = ForCausalLMLoss
+    model._loss_function = ForCausalLMLoss  # Set the loss function
     with torch.no_grad():
         outputs = model(tokens_tensor, labels=tokens_tensor)
         loss = outputs.loss.item()
     
-    bpb = (token_count / byte_count) * loss * 1.44269504
+    bpb = (token_count / byte_count) * loss * math.log2(math.e)
     
     return bpb
 
@@ -194,21 +206,20 @@ def main():
     
     standard_bpb = calculate_standard_bpb(document, tokenizer, model)
 
-    naive_apbpb, prob_array, token_data = calculate_naive_apbpb(document, tokenizer, model)
+    naive_apbpb, prob_array = calculate_naive_apbpb(document, tokenizer, model)
     
     print(f"Standard token-wise BPB: {standard_bpb:.6f}")
     print(f"Naive APBPB: {naive_apbpb:.6f}")
     
     print(f"APBPB < BPB? {'Yes' if naive_apbpb < standard_bpb else 'No'}")
-    print(f"Final probability: {prob_array[-1]:.8e}")
+    print(f"Final probability: {prob_array[len(document)]:.8e}")
     
-    '''
+    # Print selected probabilities
     print("Showing probability at selected positions:")
     step = max(1, len(document) // 10)
     for i in range(0, len(document) + 1, step):
         pos_text = document[:i] if i > 0 else "<start>"
         print(f"Position {i:3d}: {prob_array[i]:.8e} - '{pos_text}'")
-    '''
 
 if __name__ == "__main__":
     main()
