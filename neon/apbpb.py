@@ -6,6 +6,7 @@ import tiktoken
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
 import transformers
 import mpmath  # For better precision with small numbers
+from pre_segment import please_encode
 
 def maybe_utf8_decode(data):
     try:
@@ -73,11 +74,7 @@ def find_valid_next_tokens(text, byte_position, tokenizer, max_length=None):
     # Try all possible substring lengths up to max_length
     for length in range(1, min(len(remaining_text) + 1, max_length + 1)):
         substring = remaining_text[:length]
-        maybe_utf8 = maybe_utf8_decode(substring)
-        if maybe_utf8 is not None:
-            tokens = tokenizer.encode(maybe_utf8, disallowed_special=())
-        else:
-            tokens = tokenizer._encode_bytes(substring)
+        tokens = please_encode(tokenizer, substring)
 
         if len(tokens) == 1:
             token_id = tokens[0]
@@ -161,12 +158,7 @@ def calculate_naive_apbpb(document, encoder, model, device):
     for pos in range(len(document)):
         # Prepare input for the model
         input_text = document[:pos]
-        maybe_utf8 = maybe_utf8_decode(input_text)
-        if maybe_utf8 is not None:
-            inputs = encoder.encode(maybe_utf8)
-        else:
-            raise Exception("TODO: fix apbpb for documents that are not UTF-8 or use multibyte characters")
-            #inputs = encoder._encode_bytes(input_text)
+        inputs = please_encode(encoder, input_text)
         inputs = [separator_id] + inputs
         strings = [encoder.decode([x]) for x in inputs]
         inputs = {
@@ -228,14 +220,7 @@ def calculate_standard_bpb(document, encoder, model, device):
     separator_id = encoder.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
 
     # Add separator token at the beginning - this was missing before
-    maybe_utf8 = maybe_utf8_decode(document)
-    if maybe_utf8 is not None:
-        tokens = [separator_id] + encoder.encode(maybe_utf8, disallowed_special=())
-    else:
-        raise Exception("TODO: fix calculating token bpb for documents that are not UTF-8")
-        #tokens = [separator_id] + encoder._encode_bytes(document)
-        #print(len(document))
-        #print(encoder._encode_bytes(document))
+    tokens = [separator_id] + please_encode(encoder, document)
     token_count = len(tokens) - 1  # Subtract 1 for the separator token
 
     tokens_tensor = torch.tensor([tokens]).to(device)
@@ -254,7 +239,7 @@ def main():
     encoder = tiktoken.get_encoding("gpt2")
     prep_tokenizer(encoder)
     #print(dir(encoder) )
-    #print(encoder._pat_str)
+    #print(repr(encoder._pat_str))
 
     model = GPT2LMHeadModel.from_pretrained("gpt2")
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -270,6 +255,7 @@ def main():
             document = "The quick brown fox jumps over the lazy dog."
     except:
         document = "The quick brown fox jumps over the lazy dog."
+    document = document.encode("utf-8")
 
     standard_bpb = calculate_standard_bpb(document, encoder, model, device)
 
@@ -279,13 +265,14 @@ def main():
     print(f"Naive APBPB: {naive_apbpb:.6f}")
 
     print(f"APBPB < BPB? {'Yes' if naive_apbpb < standard_bpb else 'No'}")
-    print(f"Final probability: {prob_array[len(document)]:.8e}")
+    print(f"Final probability: {sum(prob_array[len(document):]):.8e}")
 
     # Print selected probabilities
     print("Showing probability at selected positions:")
     step = max(1, len(document) // 10)
     for i in range(0, len(document) + 1, step):
-        pos_text = document[:i] if i > 0 else "<start>"
+        pos_text = document[:i] if i > 0 else b"<start>"
+        pos_text = pos_text.decode("utf-8", "backslashreplace")
         print(f"Position {i:3d}: {prob_array[i]:.8e} - '{pos_text}'")
 
 if __name__ == "__main__":
