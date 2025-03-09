@@ -23,7 +23,8 @@ def escape_non_utf8(byte_data: bytes) -> str:
             except UnicodeDecodeError:
                 if j == 1:
                     # Single invalid byte - encode it to Private Use Area
-                    # Use U+E000 + byte value for our encoding
+                    # Use U+E000 as an escape character
+                    # and use U+E001 + byte_value to encode the byte
                     byte_val = byte_data[i]
                     result += backslash
                     result += chr(0xE001 + byte_val)
@@ -65,18 +66,18 @@ def unescape_to_bytes(escaped_str: str) -> bytes:
 def get_compiled_pattern(pattern_str):
     return re.compile(pattern_str)
 
-def please_encode(tokenizer, text , **kwargs):
+def please_encode(tokenizer, text, **kwargs):
     # already a string - just use the tokenizer
     if type(text) == str:
         return tokenizer.encode(text, **kwargs)
-    # let's try to utf-8 decode it
+    # let's try to utf-8 decode it first
     try:
         text = text.decode('utf-8')
         return tokenizer.encode(text, **kwargs)
     except UnicodeDecodeError:
         pass
-    # Using some clevernessapply the GPT-2 pre-tokenization regex
-    # to mixed UTF-8/non-UTF-8 content.
+    # Using some tricks that would not be necessary if this world was sane,
+    # apply the GPT-2 pre-tokenization regex to mixed UTF-8/non-UTF-8 content.
     # Step 1: Escape non-UTF-8 bytes
     escaped_text = escape_non_utf8(text)
 
@@ -88,6 +89,7 @@ def please_encode(tokenizer, text , **kwargs):
     # Step 3: Unescape each segment back to bytes and encode with the tokenizer
     ret = []
     for segment in segments:
+        # Skip empty segments
         if len(segment) == 0:
             continue
         segment = unescape_to_bytes(segment)
