@@ -158,8 +158,7 @@ def calculate_naive_apbpb(document, encoder, model, device):
     for pos in range(len(document)):
         # Prepare input for the model
         input_text = document[:pos]
-        inputs = please_encode(encoder, input_text)
-        inputs = [separator_id] + inputs
+        inputs = [separator_id] + please_encode(encoder, input_text)
         strings = [encoder.decode([x]) for x in inputs]
         inputs = {
             'input_ids': torch.tensor([inputs]).to(device),

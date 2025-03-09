@@ -15,7 +15,7 @@ def get_letter_byte_ranges():
     letter_ranges = []
     current_start = None
     current_end = None
-    
+
     # Check characters up to the Unicode limit
     for codepoint in range(0x110000):
         char = chr(codepoint)
@@ -35,19 +35,19 @@ def get_letter_byte_ranges():
             if current_start is not None:
                 letter_ranges.append((current_start, current_end))
                 current_start = None
-    
+
     # Add the last range if needed
     if current_start is not None:
         letter_ranges.append((current_start, current_end))
     print(letter_ranges)
-    
+
     # Convert ranges to UTF-8 byte patterns
     utf8_byte_patterns = []
     for start, end in letter_ranges:
         # Skip control characters
         if start < 32:
             continue
-            
+
         # Handle ASCII range specially (for efficiency)
         if start < 128:
             ascii_start = max(start, 0)
@@ -57,11 +57,11 @@ def get_letter_byte_ranges():
                     utf8_byte_patterns.append(f"\\x{ascii_start:02x}")
                 else:
                     utf8_byte_patterns.append(f"[\\x{ascii_start:02x}-\\x{ascii_end:02x}]")
-        
+
         # Handle multi-byte UTF-8 sequences
         # This gets complex because UTF-8 encoding isn't a simple range
         # For simplicity, we'll just generate patterns for some key ranges
-        
+
     return utf8_byte_patterns
 
 # Generate and print patterns
