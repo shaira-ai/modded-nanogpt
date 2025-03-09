@@ -97,10 +97,10 @@ def please_encode(tokenizer, text, **kwargs):
             segment = segment.decode('utf-8')
             ret.extend(tokenizer.encode(segment, **kwargs))
         except UnicodeDecodeError:
+            tokens = tokenizer._encode_bytes(segment, **kwargs)
             # published versions of tiktoken include a bug in _encode_bytes.
             # if the byte sequence begins with invalid bytes, it returns an
             # empty list.
-            tokens = tokenizer._encode_bytes(segment, **kwargs)
             if len(tokens) == 0:
                 tokens = tokenizer._encode_bytes(b"The" + segment, **kwargs)[1:]
             ret.extend(tokens)
