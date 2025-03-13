@@ -1,3 +1,4 @@
+#2 
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -818,7 +819,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int
         # Create dummy data for fallback
         tokens = torch.randint(0, 50000, (batch_size * 10,), dtype=torch.int32)
         pos = 0
-
+ 
     while True:
         try:
             # Check if we need to load a new file
