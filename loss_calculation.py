@@ -1,31 +1,27 @@
-# apbpb_calculation.py
-import os
 import torch
-import argparse
 import math
 import numpy as np
 import tiktoken
+import argparse
+import os
 import uuid
 import mpmath
-import torch.nn.functional as F
+import traceback
 from pathlib import Path
 
-# Set up device
-if torch.backends.mps.is_available():
-    device = torch.device("mps")
-elif torch.cuda.is_available():
-    device = torch.device("cuda")
-else:
-    device = torch.device("cpu")
+# Import the custom model
+from model import GPT, Hyperparameters, init_model, device, get_window_size_blocks
 
-print(f"Using device: {device}")
+# Fallback implementation for pre_segment
+def please_encode(tokenizer, text):
+    if isinstance(text, bytes):
+        text = text.decode('utf-8', errors='replace')
+    return tokenizer.encode(text)
 
 def get_token_to_id_mapping(tokenizer):
-    """Get mapping from token bytes to token IDs."""
     return dict(tokenizer._mergeable_ranks)
 
 def prep_tokenizer(tokenizer):
-    """Prepare tokenizer with additional attributes for APBPB calculation."""
     if not hasattr(tokenizer, "non_special_vocab_xd"):
         tokenizer.non_special_vocab_xd = get_token_to_id_mapping(tokenizer)
     if not hasattr(tokenizer, "max_token_length"):
@@ -33,364 +29,382 @@ def prep_tokenizer(tokenizer):
         for k in tokenizer.non_special_vocab_xd:
             vocab_max_token_length = max(vocab_max_token_length, len(k))
         tokenizer.max_token_length = vocab_max_token_length
-    print(f"Max token length: {tokenizer.max_token_length}")
-    print(f"Vocabulary size: {len(tokenizer.non_special_vocab_xd)}")
 
-def load_model(checkpoint_path):
-    """Load model from checkpoint file."""
-    print(f"Loading model from {checkpoint_path}")
+def find_valid_next_tokens(text, byte_position, tokenizer, max_length=None):
+    """Find all valid tokens that can follow the text at the given byte position"""
+    if type(text) != bytes:
+        text = text.encode("utf-8")
     
-    try:
-        # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        
-        # Import model class (delayed import to avoid module execution)
-        from model import GPT, Hyperparameters
-        
-        # Initialize model architecture
-        args = Hyperparameters()
-        model = GPT(
-            vocab_size=args.vocab_size,
-            num_layers=args.num_layers,
-            num_heads=args.num_heads,
-            model_dim=args.model_dim,
-            max_seq_len=args.val_seq_len
-        )
-        
-        # Load state dict with relaxed constraints
-        model.load_state_dict(checkpoint['model'], strict=False)
-        print("Model loaded successfully")
-        
-        # Move to device and set to evaluation mode
-        model = model.to(device)
-        model.eval()
-        
-        return model
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        return None
-
-def find_valid_next_tokens(text_bytes, byte_position, tokenizer):
-    """Find all valid tokens that can start at a given byte position."""
-    remaining_bytes = text_bytes[byte_position:]
+    remaining_text = text[byte_position:]
     valid_tokens = []
-    
-    # Convert bytes to string for printable characters
-    try:
-        remaining_str = remaining_bytes.decode('utf-8', errors='replace')
-    except:
-        remaining_str = str(remaining_bytes)
-    
-    # Try each token in the vocabulary
-    for token_bytes, token_id in tokenizer.non_special_vocab_xd.items():
-        if remaining_bytes.startswith(token_bytes):
-            valid_tokens.append((token_id, token_bytes))
-    
+
+    if max_length is None:
+        max_length = min(tokenizer.max_token_length, len(remaining_text))
+
+    # Try all possible substring lengths up to max_length
+    for length in range(1, min(len(remaining_text) + 1, max_length + 1)):
+        substring = remaining_text[:length]
+        tokens = please_encode(tokenizer, substring)
+
+        if len(tokens) == 1:
+            token_id = tokens[0]
+            token_text = substring
+            valid_tokens.append((token_id, token_text))
+
+    # If this is the end of the string, also try tokens that are longer
+    if max_length == len(remaining_text):
+        for k in tokenizer.non_special_vocab_xd:
+            if len(k) > max_length and k.startswith(remaining_text):
+                valid_tokens.append((tokenizer.non_special_vocab_xd[k], k))
+
     return valid_tokens
 
-def get_token_probabilities(context_bytes, model, tokenizer):
-    """Get next token probabilities from model."""
-    # Handle empty context specially
-    if len(context_bytes) == 0:
-        # For empty context, use a special token or just get probabilities for the first token
-        context_tokens = [50256]  # <|endoftext|> token for GPT-2
-    else:
-        # Convert bytes to string for tiktoken
-        context_str = context_bytes.decode('utf-8', errors='replace')
-        # Tokenize with tiktoken
-        context_tokens = tokenizer.encode(context_str)
+def calculate_standard_bpb(document, encoder, model, device):
+    """Calculate standard token-wise bits per byte"""
+    if type(document) != bytes:
+        document = document.encode("utf-8")
     
-    context_tensor = torch.tensor(context_tokens, dtype=torch.int32).to(device)
+    byte_count = len(document)
+    print(f"Document byte count: {byte_count}")
     
-    # Capture logits
-    logits_list = []
+    # Get the separator token ID
+    separator_id = encoder.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
     
-    def hook_fn(module, input, output):
-        if isinstance(output, torch.Tensor):
-            logits_list.append(output.detach().clone())
-        return output
+    # Tokenize the document
+    tokens = [separator_id] + please_encode(encoder, document)
+    token_count = len(tokens) - 1  # Subtract 1 for the separator token
+    print(f"Document contains {token_count} tokens")
     
-    # Register hook on lm_head
-    handle = model.lm_head.register_forward_hook(hook_fn)
+    if token_count == 0:
+        print("Warning: No tokens found in document")
+        return float('inf')
     
-    # Forward pass
-    with torch.no_grad():
-        try:
-            # First try with return_logits=True
-            _ = model(context_tensor, return_logits=True)
-        except:
-            try:
-                # Fall back to standard call
-                _ = model(context_tensor)
-            except Exception as e:
-                print(f"Error in model forward pass: {e}")
-                handle.remove()
-                return None
+    # Convert to tensors
+    input_tensor = torch.tensor(tokens[:-1], dtype=torch.int32).to(device)
+    target_tensor = torch.tensor(tokens[1:], dtype=torch.int64).to(device)
     
-    # Clean up hook
-    handle.remove()
+    # Get window blocks for attention
+    window_blocks = get_window_size_blocks(1000)
     
-    # Process captured logits
-    if logits_list and len(logits_list[0]) > 0:
-        logits = logits_list[0]
-        
-        # Check tensor dimensions and handle each case
-        if logits.dim() > 2:  # [B, T, V]
-            if logits.size(1) > 0:  # Check if time dimension has at least 1 element
-                logits = logits[0, -1]
-            else:
-                print(f"Warning: Empty time dimension in logits tensor with shape {logits.shape}")
-                return None
-        elif logits.dim() == 2:  # [T, V]
-            if logits.size(0) > 0:  # Check if time dimension has at least 1 element
-                logits = logits[-1]
-            else:
-                print(f"Warning: Empty time dimension in logits tensor with shape {logits.shape}")
-                return None
-        elif logits.dim() == 1:  # [V]
-            # Already a single vector of logits
-            pass
-        else:
-            print(f"Warning: Unexpected logits tensor with shape {logits.shape}")
-            return None
-        
-        # Get probabilities
-        probs = F.softmax(logits, dim=-1)
-        return probs
-    
-    print("Warning: No logits captured from model")
-    return None
-
-
-def calculate_bpb(text, model, tokenizer):
-    """Calculate standard bits-per-byte metric."""
-    if isinstance(text, str):
-        text_bytes = text.encode('utf-8')
-    else:
-        text_bytes = text
-    
-    byte_count = len(text_bytes)
-    print(f"Evaluating {byte_count} bytes of text")
-    
-    # Tokenize input text
-    tokens = tokenizer.encode(text)
-    total_loss = 0.0
-    
-    # Evaluate token by token
-    for i in range(len(tokens) - 1):
-        context = tokens[:i+1]
-        next_token = tokens[i+1]
-        
-        # Convert to tensor
-        context_tensor = torch.tensor(context, dtype=torch.int32).to(device)
-        
-        # Capture logits using a hook
-        logits_list = []
-        
-        def hook_fn(module, input, output):
-            # Capture logits before any activation
-            if isinstance(output, torch.Tensor):
-                logits_list.append(output.detach().clone())
-            return output
-        
-        # Register forward hook on lm_head
-        handle = model.lm_head.register_forward_hook(hook_fn)
-        
-        # Run the model with the correct arguments
+    # Get logits from model
+    try:
         with torch.no_grad():
-            try:
-                # Call the model with return_logits=True
-                _ = model(context_tensor, return_logits=True)
-            except Exception as e:
-                print(f"Error during model forward pass: {e}")
-                # Try with just context_tensor
-                try:
-                    _ = model(context_tensor)
-                except Exception as e:
-                    print(f"Second attempt failed: {e}")
-                    handle.remove()
-                    continue
+            model.eval()
+            # In inference mode, we use the logits to calculate loss
+            logits = model(input_tensor, window_blocks)
             
-        # Clean up the hook
-        handle.remove()
+            # Calculate cross-entropy loss manually
+            loss = 0
+            for i in range(len(input_tensor)):
+                token_logits = logits[0, i]
+                target = target_tensor[i]
+                
+                # Apply log softmax to get log probabilities
+                log_probs = torch.nn.functional.log_softmax(token_logits, dim=0)
+                
+                # Get negative log likelihood for this token
+                if target < log_probs.size(0):
+                    loss -= log_probs[target].item()
+                else:
+                    print(f"Warning: Target token {target} out of range")
+            
+            # Average loss
+            loss_value = loss / len(input_tensor)
         
-        # Process captured logits
-        if logits_list:
-            logits = logits_list[0]
-            
-            # Extract logits for the last position
-            if logits.dim() > 2:  # Handle case of [B, T, V]
-                logits = logits[0, -1]
-            elif logits.dim() == 2 and logits.size(0) > 1:
-                logits = logits[-1]
-            
-            # Apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1)
-            
-            # Get probability of next token
-            prob = probs[next_token].item()
-            
-            # Calculate loss
-            token_loss = -math.log2(max(prob, 1e-10))
-            total_loss += token_loss
-            
-            if (i+1) % 5 == 0 or i == len(tokens) - 2:
-                print(f"Processed {i+1}/{len(tokens)-1} tokens")
-        else:
-            print(f"Warning: Failed to capture logits for position {i}")
-            continue
+        # Calculate bits per byte
+        bpb = (token_count / byte_count) * loss_value * math.log2(math.e)
+        return bpb
     
-    # Calculate BPB
-    bpb = total_loss / byte_count
-    return bpb
+    except Exception as e:
+        print(f"Error calculating standard BPB: {e}")
+        traceback.print_exc()
+        return float('inf')
 
-def calculate_apbpb(text, model, tokenizer, verbose=False):
-    """Calculate All-Paths Bits-Per-Byte metric."""
-    # Ensure text is bytes
-    if isinstance(text, str):
-        text_bytes = text.encode('utf-8')
-    else:
-        text_bytes = text
+def calculate_naive_apbpb(document, encoder, model, device):
+    """Calculate all-paths bits per byte using the naive algorithm"""
+    if type(document) != bytes:
+        document = document.encode("utf-8")
     
-    byte_count = len(text_bytes)
-    print(f"Calculating APBPB for {byte_count} bytes of text")
+    byte_count = len(document)
     
-    # High precision for calculations
-    mpmath.mp.dps = 100
+    # Get separator token
+    separator_id = encoder.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
     
-    # Initialize probability array with zeros except for position 0
-    prob_array = [mpmath.mpf(0)] * (byte_count + 1 + tokenizer.max_token_length)
-    prob_array[0] = mpmath.mpf(1.0)  # Start with 100% probability at position 0
-    
-    # Track valid tokens at each position
-    position_tokens = {}
-    valid_count = 0
+    # Use mpmath for high precision
+    mpmath.mp.dps = 1000
     
     # Find all valid tokens at each position
-    for pos in range(byte_count):
-        tokens = find_valid_next_tokens(text_bytes, pos, tokenizer)
-        position_tokens[pos] = tokens
-        valid_count += len(tokens)
-        if verbose or pos % 10 == 0:
-            print(f"Position {pos}: found {len(tokens)} valid tokens")
+    position_tokens = {}
+    total_valid_tokens = 0
     
-    print(f"Total valid tokens found: {valid_count}")
+    for pos in range(len(document)):
+        valid_tokens = find_valid_next_tokens(document, pos, encoder)
+        position_tokens[pos] = valid_tokens
+        total_valid_tokens += len(valid_tokens)
+        
+        if pos % 10 == 0:
+            print(f"Position {pos}: found {len(valid_tokens)} valid tokens")
     
-    # Calculate token probabilities
+    print(f"Total valid tokens found: {total_valid_tokens}")
+    
+    # Initialize probability array
+    prob_array = [mpmath.mpf(0)] * (len(document) + 1 + encoder.max_token_length)
+    prob_array[0] = mpmath.mpf(1.0)  # Start with 100% probability
+    
+    # Calculate token probabilities for each position
     token_probs = {}
-    positions_processed = 0
     
-    # For each position with non-zero probability
-    for pos in range(byte_count):
-        # Skip positions that can't be reached
-        if float(prob_array[pos]) <= 0:
-            continue
+    for pos in range(len(document)):
+        if prob_array[pos] <= 0:
+            continue  # Skip unreachable positions
+            
+        # Prepare input for the model
+        input_text = document[:pos]
+        inputs = [separator_id] + please_encode(encoder, input_text)
+        inputs_tensor = torch.tensor(inputs, dtype=torch.int32).to(device)
         
-        positions_processed += 1
-        
-        # Skip if no valid tokens
-        if not position_tokens[pos]:
-            continue
-        
-        # Get probabilities for next tokens
-        context_bytes = text_bytes[:pos]
-        probs = get_token_probabilities(context_bytes, model, tokenizer)
-        
-        if probs is None:
-            print(f"Warning: Failed to get token probabilities at position {pos}")
-            continue
-        
-        # Update probability for each valid token
-        for token_id, token_bytes in position_tokens[pos]:
-            if token_id < probs.size(0):
-                token_prob = probs[token_id].item()
-                token_probs[(token_id, pos)] = token_prob
+        try:
+            # Get token probabilities
+            with torch.no_grad():
+                model.eval()
                 
-                # Update probability array
-                new_pos = pos + len(token_bytes)
-                prob_array[new_pos] += prob_array[pos] * mpmath.mpf(token_prob)
+                # For inference, just pass input_seq (model will create ModelOutput)
+                outputs = model(inputs_tensor)
                 
-                if verbose:
-                    print(f"Position {pos}: token {token_id} ({token_bytes}) with prob {token_prob:.6f}")
-        
-        if positions_processed % 5 == 0:
-            print(f"Processed {positions_processed} positions with non-zero probability")
+                # Extract logits for the last token
+                if hasattr(outputs, 'logits'):
+                    logits = outputs.logits[0, -1]
+                elif isinstance(outputs, torch.Tensor) and outputs.dim() >= 2:
+                    logits = outputs[0, -1]
+                else:
+                    raise ValueError(f"Unexpected output format: {type(outputs)}")
+                
+                # Convert to probabilities
+                next_token_probs = torch.nn.functional.softmax(logits, dim=0)
+            
+            # Store probabilities for valid tokens
+            for token_id, token_text in position_tokens[pos]:
+                if token_id < next_token_probs.size(0):
+                    token_prob = next_token_probs[token_id].item()
+                    token_probs[(token_id, pos)] = token_prob
+                    
+                    # Update probability array
+                    new_pos = pos + len(token_text)
+                    prob_array[new_pos] += prob_array[pos] * mpmath.mpf(token_prob)
+                    
+                    print(f"Position {pos}, token '{token_text.decode('utf-8', 'replace')}': prob={token_prob:.6f}")
+                    
+        except Exception as e:
+            print(f"Error at position {pos}: {str(e)}")
+            traceback.print_exc()
+            # Continue with other positions
     
     # Calculate final probability and APBPB
-    final_prob = sum(prob_array[byte_count:])
-    final_prob_float = float(final_prob)
+    final_prob = sum(prob_array[len(document):])
     
-    print(f"Final probability: {final_prob_float:.10e}")
+    print(f"Final probability sum: {float(final_prob):.8e}")
     
     if final_prob > 0:
-        apbpb = -float(mpmath.log(final_prob, 2)) / byte_count
+        apbpb = -mpmath.log(final_prob, 2) / byte_count
     else:
         apbpb = float('inf')
     
-    # Convert probability array to floats for reporting
+    # Convert to float array for easier handling
     float_prob_array = [float(p) if p > 0 else 0.0 for p in prob_array]
     
-    return apbpb, float_prob_array
+    return float(apbpb), float_prob_array
+
+def load_model_from_checkpoint(checkpoint_path):
+    """Load a GPT model from a checkpoint file"""
+    print(f"Loading model from {checkpoint_path}")
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        
+        if 'model' in checkpoint:
+            state_dict = checkpoint['model']
+            
+            # Infer model dimensions
+            if 'embed.weight' in state_dict:
+                vocab_size, model_dim = state_dict['embed.weight'].shape
+            else:
+                print("Cannot determine model dimensions from state dict")
+                return None
+            
+            # Count layers
+            num_layers = 0
+            while f'blocks.{num_layers}.lambdas' in state_dict:
+                num_layers += 1
+            
+            # Determine number of heads
+            num_heads = None
+            for i in range(num_layers):
+                key = f'blocks.{i}.attn.qkv_w'
+                if key in state_dict:
+                    _, hdim, _ = state_dict[key].shape
+                    num_heads = hdim // 128  # Assuming head_dim=128
+                    break
+            
+            # Find sequence length from rotary embeddings
+            max_seq_len = None
+            for i in range(num_layers):
+                key = f'blocks.{i}.attn.rotary.cos'
+                if key in state_dict:
+                    max_seq_len = state_dict[key].shape[0]
+                    break
+            
+            if max_seq_len is None:
+                max_seq_len = 128  # Default value
+            
+            print(f"Inferred model config: dim={model_dim}, layers={num_layers}, heads={num_heads}, seq_len={max_seq_len}")
+            
+            # Create model with correct configuration
+            config = Hyperparameters(
+                vocab_size=vocab_size,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                model_dim=model_dim,
+                max_seq_len=max_seq_len
+            )
+            
+            model = init_model(config)
+            
+            # Load weights
+            model.load_state_dict(state_dict, strict=True)
+            model.eval()
+            
+            print("Model loaded successfully")
+            return model
+        else:
+            print("Checkpoint does not contain model state dict")
+            return None
+    
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        traceback.print_exc()
+        return None
 
 def main():
-    parser = argparse.ArgumentParser(description="Calculate APBPB for a trained model")
-    parser.add_argument("--checkpoint", type=str, default="logs/0809cf1a-7c34-45c5-8d69-1c595d387cdc/state_step000100.pt", help="Path to model checkpoint file")
-    parser.add_argument("--text", type=str, default="The quick brown fox jumps over the lazy dog.", help="Text to evaluate")
-    parser.add_argument("--file", type=str, default=None, help="File containing text to evaluate")
-    parser.add_argument("--verbose", action="store_true", help="Show detailed output")
+    parser = argparse.ArgumentParser(description="Calculate bits per byte metrics")
+    parser.add_argument("--checkpoint", type=str, help="Path to model checkpoint")
+    parser.add_argument("--text", type=str, default="The quick brown fox jumps over the lazy dog.", 
+                      help="Text to evaluate")
+    parser.add_argument("--output", type=str, help="Output file path")
+    parser.add_argument("--skip_standard", action="store_true", help="Skip standard BPB calculation")
+    parser.add_argument("--skip_apbpb", action="store_true", help="Skip APBPB calculation")
+    parser.add_argument("--debug", action="store_true", help="Enable additional debug output")
     args = parser.parse_args()
     
-    # Get evaluation text
-    if args.file:
-        try:
-            with open(args.file, 'r', encoding='utf-8') as f:
-                eval_text = f.read()
-        except Exception as e:
-            print(f"Error reading file: {e}")
-            eval_text = args.text
-    else:
-        eval_text = args.text
-    
-    print(f"Evaluating: {eval_text[:50]}...")
-    
     # Initialize tokenizer
-    tokenizer = tiktoken.get_encoding("gpt2")
-    prep_tokenizer(tokenizer)
+    encoder = tiktoken.get_encoding("gpt2")
+    prep_tokenizer(encoder)
+    
+    print(f"Using device: {device}")
+    print(f"Evaluating: {args.text[:30]}...")
     
     # Load model
-    model = load_model(args.checkpoint)
-    if model is None:
-        print("Failed to load model. Exiting.")
-        return
+    if args.checkpoint:
+        model = load_model_from_checkpoint(args.checkpoint)
+        if model is None:
+            print("Failed to load model. Exiting.")
+            return
+    else:
+        print("No checkpoint provided. Using default model.")
+        model = init_model()
+    
+    # Test model with a simple input
+    print("Testing model inference...")
+    try:
+        test_input = torch.tensor([50256, 1], dtype=torch.int32, device=device)
+        with torch.no_grad():
+            test_output = model(test_input)
+        print(f"✓ Model test successful")
+        if hasattr(test_output, 'logits'):
+            print(f"  Logits shape: {test_output.logits.shape}")
+    except Exception as e:
+        print(f"✗ Model test failed: {e}")
+        traceback.print_exc()
+        print("Attempting to continue anyway...")
+    
+    # Convert text to bytes
+    document = args.text.encode("utf-8")
+    print(f"Processing {len(document)} bytes of text")
+    
+    # Results storage
+    results = {
+        "text": args.text,
+        "standard_bpb": None,
+        "apbpb": None,
+        "comparison": None,
+        "position_probs": []
+    }
+    
+    # Calculate standard BPB
+    if not args.skip_standard:
+        print("\n=== Calculating Standard Token-wise BPB ===")
+        try:
+            standard_bpb = calculate_standard_bpb(document, encoder, model, device)
+            results["standard_bpb"] = standard_bpb
+            print(f"Standard token-wise BPB: {standard_bpb:.6f}")
+        except Exception as e:
+            print(f"Failed to calculate standard BPB: {e}")
+            traceback.print_exc()
+            results["standard_bpb"] = float('inf')
     
     # Calculate APBPB
-    apbpb, prob_array = calculate_apbpb(eval_text, model, tokenizer, verbose=args.verbose)
-    print(f"All-paths bits per byte (APBPB): {apbpb:.6f}")
-    
-    # Show probabilities at key positions
-    print("\nShowing probabilities at key positions:")
-    byte_text = eval_text.encode('utf-8')
-    step = max(1, len(byte_text) // 10)
-    for i in range(0, len(byte_text) + 1, step):
-        pos_text = byte_text[:i] if i > 0 else b"<start>"
+    if not args.skip_apbpb:
+        print("\n=== Calculating All-Paths BPB (APBPB) ===")
         try:
-            pos_str = pos_text.decode("utf-8", "backslashreplace")
-        except:
-            pos_str = str(pos_text)
-        print(f"Position {i:3d}: {prob_array[i]:.8e} - '{pos_str}'")
+            apbpb, prob_array = calculate_naive_apbpb(document, encoder, model, device)
+            results["apbpb"] = apbpb
+            print(f"All-paths BPB (APBPB): {apbpb:.6f}")
+            
+            # Store position probabilities
+            for i in range(0, len(document) + 1, max(1, len(document) // 10)):
+                pos_text = document[:i].decode('utf-8', errors='replace') if i > 0 else "<start>"
+                prob = prob_array[i]
+                results["position_probs"].append((i, prob, pos_text))
+                if args.debug:
+                    print(f"Position {i:3d}: {prob:.8e} - '{pos_text}'")
+        except Exception as e:
+            print(f"Failed to calculate APBPB: {e}")
+            traceback.print_exc()
+            results["apbpb"] = float('inf')
     
-    # Log results
-    run_id = uuid.uuid4()
-    log_path = f"logs/apbpb_{run_id}.txt"
-    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    # Compare results
+    if results["standard_bpb"] is not None and results["apbpb"] is not None:
+        print("\n=== Comparison ===")
+        print(f"Standard BPB: {results['standard_bpb']:.6f}")
+        print(f"APBPB:        {results['apbpb']:.6f}")
+        is_better = results["apbpb"] < results["standard_bpb"]
+        results["comparison"] = is_better
+        print(f"APBPB < BPB?  {'Yes' if is_better else 'No'}")
     
-    with open(log_path, "w") as f:
-        f.write(f"Checkpoint: {args.checkpoint}\n")
-        f.write(f"Text: {eval_text[:100]}...\n")
-        f.write(f"APBPB: {apbpb:.6f}\n")
-        f.write(f"Final probability: {sum(prob_array[len(byte_text):]):.10e}\n")
+    # Save results
+    if args.output:
+        output_path = args.output
+    else:
+        os.makedirs("logs", exist_ok=True)
+        output_path = f"logs/bpb_results_{uuid.uuid4()}.txt"
     
-    print(f"Results saved to {log_path}")
+    with open(output_path, "w") as f:
+        f.write(f"Text: {results['text']}\n\n")
+        
+        if results["standard_bpb"] is not None:
+            f.write(f"Standard BPB: {results['standard_bpb']:.6f}\n")
+        
+        if results["apbpb"] is not None:
+            f.write(f"APBPB: {results['apbpb']:.6f}\n")
+        
+        if results["comparison"] is not None:
+            f.write(f"APBPB < BPB? {'Yes' if results['comparison'] else 'No'}\n\n")
+        
+        # Write probability distribution
+        if results["position_probs"]:
+            f.write("Position probabilities:\n")
+            for pos, prob, text in results["position_probs"]:
+                f.write(f"Position {pos:3d}: {prob:.8e} - '{text}'\n")
+    
+    print(f"\nResults saved to {output_path}")
 
 if __name__ == "__main__":
     main()

@@ -1,4 +1,3 @@
-#1
 from dataclasses import dataclass
 import os
 import sys
@@ -255,8 +254,13 @@ def norm(x: Tensor):
     """
     Unified norm function that handles both CUDA and MPS
     """
-    target_dtype = torch.float32 if device.type == "mps" else x.dtype
-    return F.rms_norm(x.to(target_dtype), (x.size(-1),))
+    # For MPS, ensure we're using float32 for better numerical stability
+    if device.type == "mps":
+        x_float32 = x.to(torch.float32)
+        return F.layer_norm(x_float32, (x.shape[-1],), weight=None, bias=None)
+    else:
+        # For CUDA, use rms_norm with original dtype
+        return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
@@ -351,15 +355,23 @@ class CausalSelfAttention(nn.Module):
         q, k = norm(q), norm(k)
         q, k = self.rotary(q), self.rotary(k)
 
+        # Fix for MPS: Check if ve is not None and has the right shape before using it
         if ve is not None:
-            v = self.lambdas[0] * v + self.lambdas[1] * ve.view_as(v)
+            try:
+                # Try to reshape ve to match v
+                ve_shaped = ve.view_as(v)
+                v = self.lambdas[0] * v + self.lambdas[1] * ve_shaped
+            except (RuntimeError, ValueError):
+                # If reshaping fails, just use v with lambda[0] scaling
+                print(f"Warning: Value embedding shape mismatch. Using only primary values.")
+                v = self.lambdas[0] * v
         else:
             v = self.lambdas[0] * v
 
         # Use flex_attention on CUDA, standard attention on MPS
         if device.type == "cuda" and FLEX_ATTENTION_SUPPORTED:
             y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 
-                               block_mask=block_mask, scale=0.12).transpose(1, 2)
+                            block_mask=block_mask, scale=0.12).transpose(1, 2)
         else:
             # Correctly transpose dimensions for standard attention
             q = q.transpose(1, 2)  # [B, num_heads, T, head_dim]
@@ -400,19 +412,27 @@ class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         hdim = 4 * dim  # Expansion factor of 4
-        # Use CastedLinear for CUDA, standard Linear for MPS
-        self.c_fc = nn.Linear(dim, hdim) if device.type == "mps" else CastedLinear(dim, hdim)
-        self.c_proj = nn.Linear(hdim, dim) if device.type == "mps" else CastedLinear(hdim, dim)
         
-        if device.type != "mps":
+        # Use standard Linear for both MPS and CPU for better compatibility
+        if device.type in ["mps", "cpu"]:
+            self.c_fc = nn.Linear(dim, hdim)
+            self.c_proj = nn.Linear(hdim, dim)
+        else:
+            # Use CastedLinear for CUDA
+            self.c_fc = CastedLinear(dim, hdim)
+            self.c_proj = CastedLinear(hdim, dim)
             self.c_proj.weight.detach().zero_()  # Zero init (CUDA only)
 
     def forward(self, x: Tensor):
-        x = self.c_fc(x)
-        if device.type == "mps":
-            x = F.gelu(x)  # More stable on Mac
+        if device.type in ["mps", "cpu"]:
+            # Ensure float32 for MPS and handle with activation
+            x = self.c_fc(x.to(torch.float32) if device.type == "mps" else x)
+            x = F.gelu(x)  # More stable on MPS/CPU
         else:
+            # CUDA path
+            x = self.c_fc(x)
             x = F.relu(x).square()  # Faster on CUDA
+            
         x = self.c_proj(x)
         return x
 
@@ -504,17 +524,23 @@ class GPT(nn.Module):
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
-        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
-        assert len(ve) == len(self.blocks)
+        # Handle value embeddings differently for MPS vs CUDA
+        if device.type == "mps":
+            # For MPS, it's safer to use None for value embeddings to avoid reshape errors
+            ve = [None] * len(self.blocks)
+        else:
+            # Original code for CUDA
+            ve = [value_embed(input_seq) for value_embed in self.value_embeds]
+            # 012 ... 012 structure on token value embeddings
+            ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
+            assert len(ve) == len(self.blocks)
 
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
         
         # Handle both CUDA with block masks and MPS without them
         if device.type == "cuda":
             block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, 
-                          short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+                        short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
             # Make sure we have enough block masks for all blocks
             if len(block_masks) < len(self.blocks):
                 block_masks.extend([long_bm] * (len(self.blocks) - len(block_masks)))
@@ -524,9 +550,9 @@ class GPT(nn.Module):
             
         assert len(block_masks) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here
 
-        # U-net design by @brendanh0gan
+        # U-net design
         skip_connections = []
         n = len(self.skip_weights)
         for i in range(len(self.blocks)):
@@ -538,7 +564,7 @@ class GPT(nn.Module):
 
         x = norm(x)
         logits = self.lm_head(x).float()
-        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
+        # Sigmoid-based softcapping
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='sum' if self.training else 'mean')
         return loss
@@ -658,20 +684,19 @@ class Hyperparameters:
     # data
     train_files = "data/fineweb10B/fineweb_train_*.bin"
     val_files = "data/fineweb10B/fineweb_val_*.bin"
-    val_tokens = 10240         # Use a smaller, fixed number of tokens for validation
-    train_seq_len = 512        # Shorter sequence length for training (512 tokens)
-    val_seq_len = 512          # Shorter sequence length for validation
+    val_tokens = 10240         # Fixed number of tokens for validation
+    train_seq_len = 512        # Training sequence length (512 tokens)
+    val_seq_len = 512          # Validation sequence length (512 tokens)
     # optimization
-    num_iterations = 5000       # Fewer iterations for quick testing/training
+    num_iterations = 1000    # Number of training iterations
     cooldown_frac = 0.4
     # architecture
     vocab_size = 50257
-    # Reduce the model architecture for testing on a Mac:
-    num_layers = 4             # Fewer transformer layers
-    num_heads = 4              # Fewer attention heads
-    model_dim = 256            # Lower model dimension
+    num_layers = 12             # At least 6 transformer layers to satisfy the U-net embedding structure
+    num_heads = 4              # Number of attention heads
+    model_dim = 256            # Model dimension
     # evaluation and logging
-    val_loss_every = 10        # Evaluate more frequently for debugging
+    val_loss_every = 10        # Frequency of validation evaluation
     save_checkpoint = True
 args = Hyperparameters()
 
@@ -882,24 +907,33 @@ train_steps = args.num_iterations
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
 
-    # --------------- VALIDATION SECTION -----------------
+        # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if device.type == "cuda":
             torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
 
+        print0(f"Starting validation at step {step}/{train_steps}...", console=True)
         model.eval()
         val_loss = 0
+        val_steps = args.val_tokens // args.val_seq_len
         with torch.no_grad():
-            for _ in range(args.val_tokens // args.val_seq_len):
+            for val_step in range(val_steps):
+                if val_step == 0:
+                    print0(f"  Running validation step 1/{val_steps}...", console=True)
                 inputs, targets = next(val_loader)
-                val_loss += model(inputs, targets, get_window_size_blocks(step))
-        val_loss /= (args.val_tokens // args.val_seq_len)
+                batch_loss = model(inputs, targets, get_window_size_blocks(step))
+                val_loss += batch_loss
+                if val_step == val_steps - 1:
+                    print0(f"  Completed validation step {val_steps}/{val_steps}", console=True)
+        
+        val_loss /= val_steps
 
         if device.type == "cuda":
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
 
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        # More detailed logging
+        print0(f"RESULT - step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
         model.train()
 
         if device.type == "cuda":
@@ -908,9 +942,27 @@ for step in range(train_steps + 1):
 
     if last_step:
         if master_process and args.save_checkpoint:
-            log = dict(step=step, code=code, model=model.state_dict(), optimizers=[opt.state_dict() for opt in optimizers])
-            os.makedirs(f"logs/{run_id}", exist_ok=True)
-            torch.save(log, f"logs/{run_id}/state_step{step:06d}.pt")
+            try:
+                checkpoint_dir = f"logs/{run_id}"
+                checkpoint_file = f"{checkpoint_dir}/state_step{step:06d}.pt"
+                
+                print0(f"Attempting to save checkpoint to {checkpoint_file}", console=True)
+                
+                os.makedirs(checkpoint_dir, exist_ok=True)
+                
+                log = dict(
+                    step=step, 
+                    code=code, 
+                    model=model.state_dict(), 
+                    optimizers=[opt.state_dict() for opt in optimizers]
+                )
+                
+                torch.save(log, checkpoint_file)
+                print0(f"Successfully saved checkpoint to {checkpoint_file}", console=True)
+            except Exception as e:
+                print0(f"ERROR saving checkpoint: {str(e)}", console=True)
+        else:
+            print0(f"Checkpoint saving skipped: master_process={master_process}, save_checkpoint={args.save_checkpoint}", console=True)
         break  # End training
 
     # --------------- TRAINING SECTION -----------------
