@@ -45,7 +45,7 @@ def load_model(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         
         # Import model class (delayed import to avoid module execution)
-        from model2 import GPT, Hyperparameters
+        from model import GPT, Hyperparameters
         
         # Initialize model architecture
         args = Hyperparameters()
