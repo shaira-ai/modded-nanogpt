@@ -123,7 +123,7 @@ def generate_canonical_token_positions(document, tokenizer):
 
     # Sort by byte_position_end first, then by token length
     sorted_token_data = sorted(unique_token_data,
-                              key=lambda x: (x[3], len(x[1])))
+                            key=lambda x: (x[3], len(x[1])))
 
     return sorted_token_data
 
@@ -158,6 +158,8 @@ def calculate_naive_apbpb(document, encoder, model, device):
     for pos in range(len(document)):
         # Prepare input for the model
         input_text = document[:pos]
+        inputs = please_encode(encoder, input_text)
+        inputs = [separator_id] + inputs
         inputs = [separator_id] + please_encode(encoder, input_text)
         strings = [encoder.decode([x]) for x in inputs]
         inputs = {
@@ -211,65 +213,27 @@ def calculate_naive_apbpb(document, encoder, model, device):
     return float(apbpb), float_prob_array
 
 def calculate_standard_bpb(document, encoder, model, device):
-    """Calculate standard token-wise bits per byte"""
     if type(document) != bytes:
-        document = document.encode("utf-8")
-    
+        print(f"document {document} wasn't bytes")
+        document = document.encode()
     byte_count = len(document)
-    print(f"Document byte count: {byte_count}")
-    
-    # Get the separator token ID
+    print("byte count: "+str(byte_count))
     separator_id = encoder.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
-    
-    # Tokenize the document
+
+    # Add separator token at the beginning - this was missing before
     tokens = [separator_id] + please_encode(encoder, document)
     token_count = len(tokens) - 1  # Subtract 1 for the separator token
-    print(f"Document contains {token_count} tokens")
-    
-    if token_count == 0:
-        print("Warning: No tokens found in document")
-        return float('inf')
-    
-    # Convert to tensors
-    input_tensor = torch.tensor(tokens[:-1], dtype=torch.int32).to(device)
-    target_tensor = torch.tensor(tokens[1:], dtype=torch.int64).to(device)
-    
-    # Get window blocks for attention
-    window_blocks = get_window_size_blocks(1000)
-    
-    # Get logits from model
-    try:
-        with torch.no_grad():
-            model.eval()
-            # In inference mode, we use the logits to calculate loss
-            logits = model(input_tensor, window_blocks)
-            
-            # Calculate cross-entropy loss manually
-            loss = 0
-            for i in range(len(input_tensor)):
-                token_logits = logits[0, i]
-                target = target_tensor[i]
-                
-                # Apply log softmax to get log probabilities
-                log_probs = torch.nn.functional.log_softmax(token_logits, dim=0)
-                
-                # Get negative log likelihood for this token
-                if target < log_probs.size(0):
-                    loss -= log_probs[target].item()
-                else:
-                    print(f"Warning: Target token {target} out of range")
-            
-            # Average loss
-            loss_value = loss / len(input_tensor)
-        
-        # Calculate bits per byte
-        bpb = (token_count / byte_count) * loss_value * math.log2(math.e)
-        return bpb
-    
-    except Exception as e:
-        print(f"Error calculating standard BPB: {e}")
-        traceback.print_exc()
-        return float('inf')
+
+    tokens_tensor = torch.tensor([tokens]).to(device)
+    model._loss_function = ForCausalLMLoss  # Set the loss function
+    #print("standard bpb tokens: "+str(tokens_tensor))
+    with torch.no_grad():
+        outputs = model(tokens_tensor, labels=tokens_tensor)
+        loss = outputs.loss.item()
+
+    bpb = (token_count / byte_count) * loss * math.log2(math.e)
+
+    return bpb
 
 def main():
     # Use tiktoken for GPT-2 tokenization
