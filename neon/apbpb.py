@@ -246,7 +246,7 @@ def main():
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     model = model.to(device)
     model.eval()
-
+    model._loss_function = ForCausalLMLoss
     try:
         import sys
         if len(sys.argv) > 1:

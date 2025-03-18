@@ -10,7 +10,7 @@ import traceback
 from pathlib import Path
 
 # Import the custom model
-from model import GPT, Hyperparameters, init_model, device, get_window_size_blocks
+from model2 import GPT, Hyperparameters, init_model, device, get_window_size_blocks
 
 # Fallback implementation for pre_segment
 def please_encode(tokenizer, text):
@@ -120,6 +120,531 @@ def calculate_standard_bpb(document, encoder, model, device):
         traceback.print_exc()
         return float('inf')
 
+import torch
+import mpmath
+import traceback
+import numpy as np
+from collections import defaultdict
+
+def calculate_optimized_apbpb(document, encoder, model, device):
+    """
+    Calculate All Paths Bits Per Byte (APBPB) in a single forward pass.
+    This optimizes the calculation by processing all unique token positions together.
+    """
+    if type(document) != bytes:
+        document = document.encode("utf-8")
+    
+    byte_count = len(document)
+    print(f"Document length in bytes: {byte_count}")
+    
+    separator_id = encoder.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
+    separator_text = b"<|endoftext|>"
+    
+    mpmath.mp.dps = 1000
+    
+    # Step 1: Find canonical segmentations for all prefixes
+    print("Finding canonical segmentations for all prefixes...")
+    all_segmentations = {}
+    
+    # Add separator token as the segmentation for the empty prefix (position 0)
+    all_segmentations[0] = [(separator_id, separator_text, 0)]
+    print(f"  Prefix length 0: 1 token (<|endoftext|>)")
+    
+    for end_pos in range(1, byte_count+1):
+        prefix = document[:end_pos]
+        try:
+            tokens = please_encode(encoder, prefix)
+            
+            # Decode each token to get its text representation
+            segmentation = []
+            current_bytes = b""
+            for token_id in tokens:
+                remaining = prefix[len(current_bytes):]
+                
+                # Try different lengths to find the token text
+                found = False
+                for token_len in range(1, min(len(remaining) + 1, encoder.max_token_length + 1)):
+                    token_text = remaining[:token_len]
+                    test_tokens = please_encode(encoder, token_text)
+                    if len(test_tokens) == 1 and test_tokens[0] == token_id:
+                        segmentation.append((token_id, token_text, len(current_bytes)+1))
+                        current_bytes += token_text
+                        found = True
+                        break
+                
+                if not found:
+                    raise ValueError(f"Could not find token text for token ID {token_id}")
+            
+            all_segmentations[end_pos] = segmentation
+            print(f"  Prefix length {end_pos}: {len(segmentation)} tokens")
+        except Exception as e:
+            print(f"Error finding segmentation for prefix length {end_pos}: {str(e)}")
+    
+    # Step 2: Build the list of unique (token_id, byte_position, token_text) tuples
+    print("Building list of unique token positions...")
+    token_positions = set()
+    position_map = {}  # Maps (token_id, byte_pos) to index in input sequence
+    
+    # Add all tokens from segmentations (including separator token which is already in all_segmentations[0])
+    for prefix_len, segmentation in all_segmentations.items():
+        for token_id, token_text, byte_pos in segmentation:
+            token_positions.add((token_id, byte_pos, token_text))
+    
+    # Convert to list and calculate end positions for sorting
+    token_positions_with_end = []
+    for token_id, byte_pos, token_text in token_positions:
+        end_pos = byte_pos + len(token_text)
+        token_positions_with_end.append((token_id, byte_pos, token_text, end_pos))
+
+    # Custom sorting function to ensure separator is first
+    def sort_key(item):
+        token_id, byte_pos, token_text, end_pos = item
+        # If this is the separator token, give it lowest possible value to sort first
+        if token_id == separator_id and byte_pos == 0:
+            return (-1, -1, -1)
+        # Otherwise sort by end position, then start position
+        return (end_pos, byte_pos, token_id)
+
+    # Sort with our custom sorting function
+    token_positions_with_end.sort(key=sort_key)
+
+    # Extract back to original format and create position map
+    token_positions = [(t[0], t[1], t[2]) for t in token_positions_with_end[:-1]]
+    
+    # Create mapping from position to index
+    for i, (token_id, byte_pos, token_text) in enumerate(token_positions):
+        position_map[(token_id, byte_pos)] = i
+        
+    # Print the tokens in order
+    print(f"Found {len(token_positions)} unique token positions (including <|endoftext|>)")
+    print("Token positions in processing order (sorted by end byte position):")
+    for i, (token_id, byte_pos, token_text) in enumerate(token_positions):
+        # Get a readable representation of the token
+        if token_id == separator_id and byte_pos == 0:
+            token_name = "<|endoftext|>"
+        else:
+            try:
+                token_name = repr(token_text.decode('utf-8', errors='replace'))
+            except:
+                token_name = f"[Binary token of length {len(token_text)}]"
+        
+        end_pos = byte_pos + len(token_text)
+        print(f"  [{i}] Bytes {byte_pos}-{end_pos}: ID:{token_id} - {token_name}")
+    
+    # Step 3: Build the ancestry relationships
+    print("Building ancestry relationships...")
+    ancestry = {}
+    
+    separator_pos = (separator_id, 0)
+    
+    for prefix_len, segmentation in all_segmentations.items():
+        for i, (token_id, token_text, byte_pos) in enumerate(segmentation):
+            ancestors = []
+            
+            if not (token_id == separator_id and byte_pos == 0):
+                ancestors.append(separator_pos)
+                
+            # Add preceding tokens in this segmentation as ancestors
+            for j in range(i):
+                ancestor_id, ancestor_text, ancestor_pos = segmentation[j]
+                ancestors.append((ancestor_id, ancestor_pos))
+            
+            ancestry[(token_id, byte_pos)] = ancestors
+            
+    # Print ancestry relationships for debugging
+    print("\nAncestry relationships:")
+    for pos_idx, (token_id, byte_pos, token_text) in enumerate(token_positions):
+        if (token_id, byte_pos) in ancestry:
+            ancestors = ancestry[(token_id, byte_pos)]
+            if ancestors:
+                ancestor_texts = []
+                for ancestor_id, ancestor_pos in ancestors:
+                    # Find the ancestor's token text
+                    for tok_id, tok_pos, tok_text in token_positions:
+                        if tok_id == ancestor_id and tok_pos == ancestor_pos:
+                            if tok_id == separator_id and tok_pos == 0:
+                                ancestor_name = "<|endoftext|>"
+                            else:
+                                try:
+                                    ancestor_name = repr(tok_text.decode('utf-8', errors='replace'))
+                                except:
+                                    ancestor_name = f"[Binary token ID:{tok_id}]"
+                            ancestor_texts.append(ancestor_name)
+                            break
+                
+                if token_id == separator_id and byte_pos == 0:
+                    token_name = "<|endoftext|>"
+                else:
+                    try:
+                        token_name = repr(token_text.decode('utf-8', errors='replace'))
+                    except:
+                        token_name = f"[Binary token ID:{token_id}]"
+                    
+                print(f"  {token_name} at pos {byte_pos} has ancestors: {', '.join(ancestor_texts)}")
+        
+        # Limit output if there are too many tokens
+        if pos_idx >= 15:
+            remaining = len(token_positions) - pos_idx - 1
+            print(f"  ... and {remaining} more tokens (omitted for brevity)")
+            break
+    
+    # Step 4: Build attention mask
+    print("\nBuilding attention mask...")
+    attn_mask = torch.zeros((len(token_positions), len(token_positions)), dtype=torch.float32)
+    
+    for i, (token_id, byte_pos, token_text) in enumerate(token_positions):
+        # Token can attend to itself
+        attn_mask[i, i] = 1
+        
+        # Token can attend to its ancestors
+        if (token_id, byte_pos) in ancestry:
+            for ancestor_id, ancestor_pos in ancestry[(token_id, byte_pos)]:
+                if (ancestor_id, ancestor_pos) in position_map:
+                    j = position_map[(ancestor_id, ancestor_pos)]
+                    attn_mask[i, j] = 1
+    
+    # Print visualization of the attention mask
+    print("\nAttention Mask Visualization:")
+    print("(Rows: from tokens, Columns: to tokens - 1 means attention is allowed)")
+    
+    # For cleaner printing, use a numpy array
+    attn_np = attn_mask.cpu().numpy()
+    
+    # Limit visualization to first 20x20 elements if mask is large
+    max_display = min(20, len(token_positions))
+    
+    # Create token labels with consistent width for better display
+    token_labels = []
+    max_label_len = 0
+    
+    for i, (token_id, byte_pos, token_text) in enumerate(token_positions[:max_display]):
+        if byte_pos == -1:
+            label = "<|eot|>"
+        else:
+            try:
+                # Get up to first 6 chars of token for labels
+                decoded = token_text.decode('utf-8', errors='replace')
+                # Replace spaces with underscores, and handle special characters
+                decoded = decoded.replace(' ', '_').replace('\n', '\\n').replace('\t', '\\t')
+                label = decoded[:6]
+            except:
+                label = f"ID:{token_id}"
+        
+        token_labels.append(label)
+        max_label_len = max(max_label_len, len(label))
+    
+    # Ensure all labels have consistent width with padding
+    padded_labels = []
+    for label in token_labels:
+        padded_labels.append(label.ljust(max_label_len))
+    
+    # Create header row with column labels
+    header = " " * (max_label_len + 2)  # Padding for row labels
+    for label in padded_labels:
+        header += label + " "
+    print(header)
+    
+    # Print separator line
+    print(" " * (max_label_len + 2) + "-" * (max_display * (max_label_len + 1)))
+    
+    # Print each row with padded row label
+    for i in range(max_display):
+        row_label = padded_labels[i]
+        row_str = f"{row_label} |"
+        for j in range(max_display):
+            if attn_np[i, j] > 0:
+                row_str += " 1 " + " " * (max_label_len - 2)
+            else:
+                row_str += " . " + " " * (max_label_len - 2)
+        print(row_str)
+    
+    # If mask is larger than display limit, indicate truncation
+    if len(token_positions) > max_display:
+        print(f"\n[Showing only first {max_display}x{max_display} of {len(token_positions)}x{len(token_positions)} attention mask]")
+    
+    # Step 5: Build position encodings
+    print("\nBuilding position encodings...")
+    positions = torch.zeros(len(token_positions), dtype=torch.int32)
+    unique_byte_positions = sorted(set(byte_pos for _, byte_pos, _ in token_positions))
+    byte_to_seq_position = {byte_pos: i for i, byte_pos in enumerate(unique_byte_positions)}
+
+    for i, (token_id, byte_pos, token_text) in enumerate(token_positions):
+        # If position is -1 (separator token), keep it as 0
+        # Otherwise use the byte position
+        positions[i] = byte_to_seq_position.get(byte_pos, 0)
+    
+    # Print position encodings
+    print("Position encodings:")
+    for i, (token_id, byte_pos, token_text) in enumerate(token_positions):  # Show first 15
+        try:
+            token_name = repr(token_text.decode('utf-8', errors='replace'))
+        except:
+            token_name = f"[Binary token ID:{token_id}]"
+            
+        print(f"  Token {i}: {token_name} - position {positions[i].item()}")
+
+    
+    # Step 6: Build input tensor
+    print("\nBuilding input tensor...")
+    input_ids = torch.zeros(len(token_positions), dtype=torch.int32)
+    
+    for i, (token_id, byte_pos, token_text) in enumerate(token_positions):
+        input_ids[i] = token_id
+        
+    # Print input IDs
+    print("Input IDs:")
+    for i, (token_id, byte_pos, token_text) in enumerate(token_positions[:15]):  # Show first 15
+        try:
+            token_name = repr(token_text.decode('utf-8', errors='replace'))
+        except:
+            token_name = f"[Binary token of length {len(token_text)}]"
+            
+        print(f"  Position {i}: ID {token_id} - {token_name}")
+    if len(token_positions) > 15:
+        print(f"  ... and {len(token_positions) - 15} more (omitted for brevity)")
+    
+    # Step 7: Move tensors to device
+    input_ids = input_ids.to(device)
+    positions = positions.to(device)
+    attn_mask = attn_mask.to(device)
+    
+    # Step 8: Run single forward pass
+    print("Running forward pass...")
+    try:
+        with torch.no_grad():
+            model.eval()
+            # NOTE: This is a placeholder - you'll need to adapt this to your model's API
+            # Depending on your model, you might need to pass position_ids and attention_mask differently
+            outputs = model(
+                input_ids=input_ids.unsqueeze(0), 
+                position_ids=positions.unsqueeze(0),
+                attention_mask=attn_mask.unsqueeze(0)
+            )
+            
+            # Extract logits
+            if hasattr(outputs, 'logits'):
+                logits = outputs.logits[0]  # [num_tokens, vocab_size]
+            elif isinstance(outputs, torch.Tensor) and outputs.dim() >= 2:
+                logits = outputs[0]  # [num_tokens, vocab_size]
+            else:
+                raise ValueError(f"Unexpected output format: {type(outputs)}")
+            
+            # Convert to probabilities
+            probs = torch.nn.functional.softmax(logits, dim=-1)
+    except Exception as e:
+        print(f"Error during forward pass: {str(e)}")
+        traceback.print_exc()
+        return float('inf'), {}
+    
+    # Step 9: Extract probabilities and propagate them
+    print("Extracting and propagating probabilities...")
+
+    prob_array = [mpmath.mpf(0)] * (byte_count + 1 + encoder.max_token_length)
+    prob_array[0] = mpmath.mpf(1.0)
+
+    # Process prefixes in ascending order to ensure proper probability propagation
+    for prefix_len in sorted(all_segmentations.keys()):
+        # Skip if this position has zero probability (unreachable)
+        if prob_array[prefix_len] <= 0:
+            continue
+            
+        # Find the last token in this prefix's segmentation
+        segmentation = all_segmentations[prefix_len]
+        if not segmentation:
+            continue
+            
+        last_token = segmentation[-1]
+        last_token_id, last_token_text, last_token_pos = last_token
+        
+        # Find this token's index in our token_positions list
+        if (last_token_id, last_token_pos) in position_map:
+            idx = position_map[(last_token_id, last_token_pos)]
+            
+            # Get the token's output distribution
+            token_probs = probs[idx]
+            
+            # Find all valid next tokens at this position
+            next_byte_pos = prefix_len
+            valid_tokens = find_valid_next_tokens(document, next_byte_pos, encoder)
+            
+            # Format prefix string for display
+            if prefix_len == 0:
+                prefix_str = "<empty>"
+            else:
+                try:
+                    prefix_str = document[:prefix_len].decode('utf-8', errors='replace')
+                except:
+                    prefix_str = f"[Binary prefix of length {prefix_len}]"
+            
+            # Display prefix info
+            if last_token_id == separator_id and last_token_pos == 0:
+                last_token_display = "<|endoftext|>"
+            else:
+                try:
+                    last_token_display = repr(last_token_text.decode('utf-8', errors='replace'))
+                except:
+                    last_token_display = f"[Binary token ID:{last_token_id}]"
+                    
+            print(f"\nPrefix: {repr(prefix_str)} (length {prefix_len})")
+            print(f"  Last token: {last_token_display} (ID: {last_token_id})")
+            print(f"  Current position probability: {float(prob_array[prefix_len]):.8e}")
+            
+            # Show valid completions with individual probabilities
+            print("  Valid completions:")
+            
+            # Sort by probability (highest first) for more informative display
+            token_prob_pairs = []
+            position_total_prob = mpmath.mpf(0)
+            
+            for next_token_id, next_token_text in valid_tokens:
+                if next_token_id < token_probs.size(0):
+                    token_prob = token_probs[next_token_id].item()
+                    if token_prob > 0:
+                        # Calculate the new position
+                        new_pos = prefix_len + len(next_token_text)
+                        
+                        # Update probability array (just like in naive method)
+                        prob_array[new_pos] += prob_array[prefix_len] * mpmath.mpf(token_prob)
+                        
+                        try:
+                            completion_str = next_token_text.decode('utf-8', errors='replace')
+                            completion_display = repr(completion_str)
+                        except:
+                            completion_display = f"[Binary token ID:{next_token_id}]"
+                        
+                        token_prob_pairs.append((completion_display, token_prob, next_token_id, new_pos))
+                        position_total_prob += mpmath.mpf(token_prob)
+            
+            # Sort by probability (highest first)
+            token_prob_pairs.sort(key=lambda x: x[1], reverse=True)
+            
+            # Display individual token probabilities (limit to top 10 for readability)
+            display_count = min(10, len(token_prob_pairs))
+            for i, (completion_display, prob, token_id, new_pos) in enumerate(token_prob_pairs[:display_count]):
+                print(f"    {completion_display}: prob={prob:.8e} (ID: {token_id}) → pos {new_pos}")
+            
+            # Show count of remaining tokens if there are more than the display limit
+            if len(token_prob_pairs) > display_count:
+                print(f"    ... and {len(token_prob_pairs) - display_count} more tokens")
+            
+            # Show total probability for this position
+            print(f"  Total probability at position {prefix_len}: {float(position_total_prob):.8e}")
+
+    # Step 10: Compute APBPB
+    print("Computing final APBPB...")
+
+    # Calculate final probability (sum of probabilities at or beyond document length)
+    final_prob = sum(prob_array[byte_count:])
+    print(f"Final probability sum: {float(final_prob):.8e}")
+
+    if final_prob > 0:
+        apbpb = -mpmath.log(final_prob, 2) / byte_count
+    else:
+        apbpb = float('inf')
+
+    print(f"APBPB: {float(apbpb):.6f}")
+
+    print("\nCalculating standard BPB...")
+
+    standard_bpb = float('inf')
+
+    # Try to get the canonical segmentation for the full document
+    # Fall back to the longest available segmentation if needed
+    if byte_count in all_segmentations:
+        full_segmentation = all_segmentations[byte_count]
+        print(f"Found canonical segmentation for full document length ({byte_count} bytes)")
+    else:
+        # Find the longest available segmentation
+        longest_len = max(all_segmentations.keys())
+        if longest_len < byte_count:
+            full_segmentation = all_segmentations[longest_len]
+            print(f"Warning: No canonical segmentation found for full document length {byte_count}")
+            print(f"Using longest available segmentation (length {longest_len} bytes) instead")
+        else:
+            # This shouldn't happen as we should have segmentations for all prefixes,
+            # but just in case, grab a segmentation that's closest to the document length
+            closest_len = min(all_segmentations.keys(), key=lambda x: abs(x - byte_count))
+            full_segmentation = all_segmentations[closest_len]
+            print(f"Warning: Using closest available segmentation (length {closest_len} bytes)")
+
+    # For debugging, show the canonical segmentation
+    print(f"Segmentation used for BPB ({len(full_segmentation)} tokens):")
+    for i, (token_id, token_text, byte_pos) in enumerate(full_segmentation):
+        try:
+            token_display = repr(token_text.decode('utf-8', errors='replace'))
+        except:
+            token_display = f"[Binary token ID:{token_id}]"
+        print(f"  Token {i}: {token_display} at position {byte_pos}")
+
+    # Calculate standard BPB
+    token_count = len(full_segmentation)
+    total_neg_log_prob = 0.0
+
+    if token_count > 0:
+        # Create the sequence: separator token followed by segmentation tokens
+        token_ids = [separator_id] + [t[0] for t in full_segmentation]
+        
+        # Process each token transition
+        for i in range(token_count):
+            # Get current and previous token
+            current_token_id = token_ids[i+1]  # +1 because token_ids includes separator
+            
+            # Get position of previous token
+            if i == 0:
+                # Previous token is separator at position 0
+                prev_token_key = (separator_id, 0)
+            else:
+                # Previous token is from segmentation
+                prev_pos = full_segmentation[i-1][2]
+                prev_token_key = (full_segmentation[i-1][0], prev_pos)
+            
+            # Find previous token's index in token_positions
+            if prev_token_key in position_map:
+                prev_idx = position_map[prev_token_key]
+                
+                # Get the logits predicted by the previous token
+                prev_token_logits = logits[prev_idx]
+                
+                # Apply softmax to get probabilities
+                prev_token_probs = torch.nn.functional.softmax(prev_token_logits, dim=-1)
+                
+                # Get the probability of the current token
+                if current_token_id < prev_token_probs.size(0):
+                    prob = prev_token_probs[current_token_id].item()
+                    if prob > 0:
+                        # Add negative log probability
+                        neg_log_prob = -math.log(prob)
+                        total_neg_log_prob += neg_log_prob
+                        
+                        if i < 5:
+                            try:
+                                token_display = repr(full_segmentation[i][1].decode('utf-8', errors='replace'))
+                            except:
+                                token_display = f"[Binary token ID:{current_token_id}]"
+                            print(f"  Token {token_display}: prob={prob:.8e}, -log(prob)={neg_log_prob:.8f}")
+                    else:
+                        print(f"Warning: Zero probability for token ID {current_token_id}")
+                        total_neg_log_prob += 100  # Large penalty for zero probability
+                else:
+                    print(f"Warning: Token ID {current_token_id} out of range")
+                    total_neg_log_prob += 100  # Large penalty
+            else:
+                print(f"Warning: Previous token key {prev_token_key} not found in position map")
+                total_neg_log_prob += 100  # Large penalty
+
+        # Average loss
+        loss_value = total_neg_log_prob / token_count
+        
+        standard_bpb = (token_count / byte_count) * loss_value * math.log2(math.e)
+        print(f"Standard BPB: {standard_bpb:.6f}")
+    else:
+        print("Warning: No tokens found in segmentation")
+        standard_bpb = float('inf')
+
+    print(f"APBPB: {float(apbpb):.6f}, Standard BPB: {float(standard_bpb):.6f}")
+
+    return float(standard_bpb), float(apbpb), {i: float(p) for i, p in enumerate(prob_array) if p > 0}
+    
 def calculate_naive_apbpb(document, encoder, model, device):
     """Calculate all-paths bits per byte using the naive algorithm"""
     if type(document) != bytes:
@@ -182,17 +707,55 @@ def calculate_naive_apbpb(document, encoder, model, device):
                 # Convert to probabilities
                 next_token_probs = torch.nn.functional.softmax(logits, dim=0)
             
+            # Format prefix string for display
+            if pos == 0:
+                prefix_str = "<empty>"
+            else:
+                try:
+                    prefix_str = document[:pos].decode('utf-8', errors='replace')
+                except:
+                    prefix_str = f"[Binary prefix of length {pos}]"
+            
+            print(f"\nPrefix: {repr(prefix_str)} (length {pos})")
+            print("  Valid completions:")
+            
+            # Sort by probability (highest first) for more informative display
+            token_prob_pairs = []
+            
             # Store probabilities for valid tokens
             for token_id, token_text in position_tokens[pos]:
                 if token_id < next_token_probs.size(0):
                     token_prob = next_token_probs[token_id].item()
                     token_probs[(token_id, pos)] = token_prob
                     
-                    # Update probability array
+                    # Update probability array (original code unchanged)
                     new_pos = pos + len(token_text)
                     prob_array[new_pos] += prob_array[pos] * mpmath.mpf(token_prob)
                     
-                    print(f"Position {pos}, token '{token_text.decode('utf-8', 'replace')}': prob={token_prob:.6f}")
+                    # Add to our display list
+                    try:
+                        completion_str = token_text.decode('utf-8', errors='replace')
+                        completion_display = repr(completion_str)
+                    except:
+                        completion_display = f"[Binary token ID:{token_id}]"
+                    
+                    token_prob_pairs.append((completion_display, token_prob, token_id))
+            
+            # Sort by probability (highest first)
+            token_prob_pairs.sort(key=lambda x: x[1], reverse=True)
+            
+            # Display individual token probabilities (limit to top 10 for readability)
+            display_count = min(10, len(token_prob_pairs))
+            for i, (completion_display, prob, token_id) in enumerate(token_prob_pairs[:display_count]):
+                print(f"    {completion_display}: prob={prob:.8e} (ID: {token_id})")
+            
+            # Show count of remaining tokens if there are more than the display limit
+            if len(token_prob_pairs) > display_count:
+                print(f"    ... and {len(token_prob_pairs) - display_count} more tokens")
+            
+            # Calculate and show total probability for this position
+            total_pos_prob = sum(prob for _, prob, _ in token_prob_pairs)
+            print(f"  Total probability: {total_pos_prob:.8e}")
                     
         except Exception as e:
             print(f"Error at position {pos}: {str(e)}")
@@ -309,7 +872,7 @@ def main():
             return
     else:
         print("No checkpoint provided. Using default model.")
-        model = init_model()
+        model = load_model_from_checkpoint('logs/e4d007cc-b53b-42ee-90d4-75ad9d35dfa7/state_step001000.pt')
     
     # Test model with a simple input
     print("Testing model inference...")
@@ -354,7 +917,8 @@ def main():
     if not args.skip_apbpb:
         print("\n=== Calculating All-Paths BPB (APBPB) ===")
         try:
-            apbpb, prob_array = calculate_naive_apbpb(document, encoder, model, device)
+            bpb, apbpb, prob_array = calculate_optimized_apbpb(document, encoder, model, device)
+            results["bpb"] = bpb
             results["apbpb"] = apbpb
             print(f"All-paths BPB (APBPB): {apbpb:.6f}")
             
@@ -371,11 +935,11 @@ def main():
             results["apbpb"] = float('inf')
     
     # Compare results
-    if results["standard_bpb"] is not None and results["apbpb"] is not None:
+    if results["bpb"] is not None and results["apbpb"] is not None:
         print("\n=== Comparison ===")
-        print(f"Standard BPB: {results['standard_bpb']:.6f}")
+        print(f"Standard BPB: {results['bpb']:.6f}")
         print(f"APBPB:        {results['apbpb']:.6f}")
-        is_better = results["apbpb"] < results["standard_bpb"]
+        is_better = results["apbpb"] < results["bpb"]
         results["comparison"] = is_better
         print(f"APBPB < BPB?  {'Yes' if is_better else 'No'}")
     
