@@ -66,6 +66,43 @@ def unescape_to_bytes(escaped_str: str) -> bytes:
 def get_compiled_pattern(pattern_str):
     return re.compile(pattern_str)
 
+def get_pre_segments(tokenizer, text):
+    """
+    Apply only the pre-tokenization regex to get chunks of text.
+    Returns the list of segments without encoding them.
+    
+    Args:
+        tokenizer: The tokenizer with a _pat_str attribute for the regex pattern
+        text: String or bytes to segment
+    
+    Returns:
+        List of segments (strings or bytes, matching the type of input)
+    """
+    # Handle string input
+    if type(text) == str:
+        # Apply the pre-tokenization regex directly
+        pattern = get_compiled_pattern(tokenizer._pat_str)
+        matches = pattern.finditer(text)
+        return [match.group() for match in matches if match.group()]
+    
+    # Handle bytes input
+    try:
+        # Try to decode as UTF-8 and segment
+        text_str = text.decode('utf-8')
+        pattern = get_compiled_pattern(tokenizer._pat_str)
+        matches = pattern.finditer(text_str)
+        segments_str = [match.group() for match in matches if match.group()]
+        # Convert back to bytes
+        return [segment.encode('utf-8') for segment in segments_str]
+    except UnicodeDecodeError:
+        # Handle non-UTF-8 bytes
+        escaped_text = escape_non_utf8(text)
+        pattern = get_compiled_pattern(tokenizer._pat_str)
+        matches = pattern.finditer(escaped_text)
+        segments_escaped = [match.group() for match in matches if match.group()]
+        # Convert back to bytes
+        return [unescape_to_bytes(segment) for segment in segments_escaped]
+
 def please_encode(tokenizer, text, **kwargs):
     # already a string - just use the tokenizer
     if type(text) == str:

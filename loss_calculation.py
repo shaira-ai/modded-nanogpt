@@ -8,15 +8,9 @@ import uuid
 import mpmath
 import traceback
 from pathlib import Path
-
-# Import the custom model
+from neon.pre_segment import please_encode, get_pre_segments
 from model2 import GPT, Hyperparameters, init_model, device, get_window_size_blocks
-
-# Fallback implementation for pre_segment
-def please_encode(tokenizer, text):
-    if isinstance(text, bytes):
-        text = text.decode('utf-8', errors='replace')
-    return tokenizer.encode(text)
+from collections import defaultdict
 
 def get_token_to_id_mapping(tokenizer):
     return dict(tokenizer._mergeable_ranks)
@@ -120,12 +114,6 @@ def calculate_standard_bpb(document, encoder, model, device):
         traceback.print_exc()
         return float('inf')
 
-import torch
-import mpmath
-import traceback
-import numpy as np
-from collections import defaultdict
-
 def calculate_optimized_apbpb(document, encoder, model, device):
     """
     Calculate All Paths Bits Per Byte (APBPB) in a single forward pass.
@@ -141,25 +129,107 @@ def calculate_optimized_apbpb(document, encoder, model, device):
     separator_text = b"<|endoftext|>"
     
     mpmath.mp.dps = 1000
+
+    # Step 0: Pre-segment the document to optimize tokenization
+    print("Pre-segmenting document...")
+    document_chunks = get_pre_segments(encoder, document)
     
-    # Step 1: Find canonical segmentations for all prefixes
-    print("Finding canonical segmentations for all prefixes...")
+    # Show a few chunks for debugging
+    print(f"Document divided into {len(document_chunks)} chunks:")
+    for i, chunk in enumerate(document_chunks[:5]):  # Show first 5 chunks
+        try:
+            chunk_str = chunk.decode('utf-8', errors='replace')
+            print(f"  Chunk {i}: {repr(chunk_str)}")
+        except:
+            print(f"  Chunk {i}: [Binary chunk of length {len(chunk)}]")
+    if len(document_chunks) > 5:
+        print(f"  ... and {len(document_chunks) - 5} more chunks")
+    
+    # Step 1: Find canonical segmentations for all prefixes more efficiently
+    print("Finding canonical segmentations for all prefixes using chunk optimization...")
     all_segmentations = {}
-    
+
     # Add separator token as the segmentation for the empty prefix (position 0)
     all_segmentations[0] = [(separator_id, separator_text, 0)]
     print(f"  Prefix length 0: 1 token (<|endoftext|>)")
-    
+
+    # First, calculate the canonical segmentation for each chunk
+    print("Pre-calculating segmentations for each chunk...")
+    chunk_segmentations = []  # Will store segmentation for each chunk
+    chunk_boundaries = [0]    # Start positions of each chunk in the document
+
+    current_pos = 0
+    for i, chunk in enumerate(document_chunks):
+        chunk_boundaries.append(current_pos + len(chunk))
+        
+        # Get canonical segmentation for this chunk
+        tokens = please_encode(encoder, chunk)
+        
+        # Decode each token to get its text representation
+        segmentation = []
+        current_bytes = b""
+        for token_id in tokens:
+            remaining = chunk[len(current_bytes):]
+            
+            # Try different lengths to find the token text
+            found = False
+            for token_len in range(1, min(len(remaining) + 1, encoder.max_token_length + 1)):
+                token_text = remaining[:token_len]
+                test_tokens = please_encode(encoder, token_text)
+                if len(test_tokens) == 1 and test_tokens[0] == token_id:
+                    # Store with position relative to document start
+                    segmentation.append((token_id, token_text, current_pos + len(current_bytes) + 1))
+                    current_bytes += token_text
+                    found = True
+                    break
+            
+            if not found:
+                raise ValueError(f"Could not find token text for token ID {token_id} in chunk {i}")
+        
+        chunk_segmentations.append(segmentation)
+        print(f"  Chunk {i} ({len(chunk)} bytes): {len(segmentation)} tokens")
+        current_pos += len(chunk)
+
+    # Now, calculate the segmentation for each prefix position
+    print("Generating segmentations for all prefix positions...")
     for end_pos in range(1, byte_count+1):
-        prefix = document[:end_pos]
-        try:
-            tokens = please_encode(encoder, prefix)
+        # Find which chunk this position falls into
+        chunk_idx = 0
+        while chunk_idx < len(chunk_boundaries) - 1 and end_pos > chunk_boundaries[chunk_idx + 1]:
+            chunk_idx += 1
+        
+        # Calculate the position within the chunk
+        pos_in_chunk = end_pos - chunk_boundaries[chunk_idx]
+        
+        if pos_in_chunk == len(document_chunks[chunk_idx]):
+            # Position is at a chunk boundary - we can just combine full chunk segmentations
+            segmentation = []
+            for i in range(chunk_idx + 1):
+                # Add segmentation for this complete chunk
+                segmentation.extend(chunk_segmentations[i])
+            
+            all_segmentations[end_pos] = segmentation
+        else:
+            # Position is within a chunk - reuse previous chunks and compute partial chunk
+            segmentation = []
+            
+            # Add segmentations for all complete previous chunks
+            for i in range(chunk_idx):
+                segmentation.extend(chunk_segmentations[i])
+            
+            # Calculate segmentation for the partial chunk
+            partial_chunk = document_chunks[chunk_idx][:pos_in_chunk]
+            
+            # Get canonical segmentation for this partial chunk
+            tokens = please_encode(encoder, partial_chunk)
             
             # Decode each token to get its text representation
-            segmentation = []
+            partial_segmentation = []
             current_bytes = b""
+            offset = chunk_boundaries[chunk_idx]  # Start position of this chunk
+            
             for token_id in tokens:
-                remaining = prefix[len(current_bytes):]
+                remaining = partial_chunk[len(current_bytes):]
                 
                 # Try different lengths to find the token text
                 found = False
@@ -167,18 +237,25 @@ def calculate_optimized_apbpb(document, encoder, model, device):
                     token_text = remaining[:token_len]
                     test_tokens = please_encode(encoder, token_text)
                     if len(test_tokens) == 1 and test_tokens[0] == token_id:
-                        segmentation.append((token_id, token_text, len(current_bytes)+1))
+                        # Store with position relative to document start
+                        partial_segmentation.append((token_id, token_text, offset + len(current_bytes) + 1))
                         current_bytes += token_text
                         found = True
                         break
                 
                 if not found:
-                    raise ValueError(f"Could not find token text for token ID {token_id}")
+                    raise ValueError(f"Could not find token text for token ID {token_id} in partial chunk")
+            
+            # Add segmentation for the partial chunk
+            segmentation.extend(partial_segmentation)
             
             all_segmentations[end_pos] = segmentation
-            print(f"  Prefix length {end_pos}: {len(segmentation)} tokens")
-        except Exception as e:
-            print(f"Error finding segmentation for prefix length {end_pos}: {str(e)}")
+        
+        # Print progress every 10 positions or for small positions
+        if end_pos % 10 == 0 or end_pos < 10:
+            print(f"  Prefix length {end_pos}: {len(all_segmentations[end_pos])} tokens")
+
+    print(f"Generated segmentations for {len(all_segmentations)} prefix positions")
     
     # Step 2: Build the list of unique (token_id, byte_position, token_text) tuples
     print("Building list of unique token positions...")
@@ -846,6 +923,7 @@ def load_model_from_checkpoint(checkpoint_path):
         traceback.print_exc()
         return None
 
+import time
 def main():
     parser = argparse.ArgumentParser(description="Calculate bits per byte metrics")
     parser.add_argument("--checkpoint", type=str, help="Path to model checkpoint")
@@ -856,6 +934,9 @@ def main():
     parser.add_argument("--skip_apbpb", action="store_true", help="Skip APBPB calculation")
     parser.add_argument("--debug", action="store_true", help="Enable additional debug output")
     args = parser.parse_args()
+
+    # Record the start time
+    start_time = time.time()
     
     # Initialize tokenizer
     encoder = tiktoken.get_encoding("gpt2")
@@ -969,6 +1050,12 @@ def main():
                 f.write(f"Position {pos:3d}: {prob:.8e} - '{text}'\n")
     
     print(f"\nResults saved to {output_path}")
+    # Record the end time
+    end_time = time.time()
+
+    # Calculate the elapsed time
+    elapsed_time = end_time - start_time
+    print(f"Time taken: {elapsed_time:.6f} seconds")
 
 if __name__ == "__main__":
     main()
