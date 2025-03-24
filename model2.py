@@ -148,9 +148,8 @@ class Rotary(nn.Module):
             sin = torch.index_select(self.sin, 0, positions.view(-1)).view(B, T, 1, -1)
         else:
             # Standard sequential positions
-            seq_len = min(T, self.cos.size(0))
-            cos = self.cos[:seq_len].unsqueeze(0).unsqueeze(2)  # [1, T, 1, D]
-            sin = self.sin[:seq_len].unsqueeze(0).unsqueeze(2)  # [1, T, 1, D]
+            cos, sin = self.cos[:x_BTHD.size(-3)].unsqueeze(0).unsqueeze(2), \
+                   self.sin[:x_BTHD.size(-3)].unsqueeze(0).unsqueeze(2)
         
         # Apply rotary embeddings
         x1, x2 = x_BTHD.chunk(2, dim=-1)
@@ -443,13 +442,17 @@ class GPT(nn.Module):
         indices = dense_blockmask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
         return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
-    def forward(self, input_ids=None, attention_mask=None, position_ids=None, sliding_window_num_blocks=None, input_seq=None):
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None, sliding_window_num_blocks=None, 
+                input_seq=None, target_seq=None):
+        # Support both training and inference modes
+        is_training = target_seq is not None
+        
         # Handle input from either input_ids (for APBPB) or input_seq (for regular use)
         if input_ids is not None:
             input_seq = input_ids
-        elif input_seq is None:
+        elif input_seq is None and not is_training:
             raise ValueError("Either input_ids or input_seq must be provided")
-            
+        
         # Handle single token or sequence input
         is_single_token = input_seq.ndim == 0
         if is_single_token:
@@ -530,7 +533,13 @@ class GPT(nn.Module):
         # Sigmoid-based softcapping
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
         
-        # Return logits directly instead of computing loss
+        # For training, calculate loss and return it
+        if is_training:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, 
+                                  reduction='sum' if self.training else 'mean')
+            return loss
+        
+        # For inference, return just the logits
         return logits
 
 
