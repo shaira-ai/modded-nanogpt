@@ -1,7 +1,8 @@
 const std = @import("std");
+const BakaCorasick = @import("baka_corasick.zig").BakaCorasick;
+const ArrayList = std.ArrayList;
 
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-const allocator = gpa.allocator();
+const allocator = std.heap.c_allocator;
 
 // [*:0]const u8 : a sequence of constant bytes that ends with a zero byte
 // [*]const [*:0]const u8 : a sequence of constant strings
@@ -32,6 +33,80 @@ export fn convertToUC(input_arr: [*]const [*:0]const u8, input_count: usize, res
 
     result_count.* = count;
     return result.ptr;
+}
+
+export fn makeBC(input_arr: [*]const [*]const u8, lengths: [*]const usize, token_ids: [*]const u32, input_count: usize) usize {
+    var bc = allocator.create(BakaCorasick) catch @panic("Failed to allocate memory for BakaCorasick");
+    bc.* = BakaCorasick.init(allocator) catch @panic("Failed to initialize BakaCorasick");
+    const print_ids = [_]u32{309, 289, 339, 365, 255, 10662};
+    for (0..input_count) |i| {
+        for (print_ids) |id| {
+            if (token_ids[i] == id) {
+                std.log.err("token {d} is \"{s}\" with length {d}", .{token_ids[i], input_arr[i][0..lengths[i]], lengths[i]});
+            }
+        }
+        const input = input_arr[i][0..lengths[i]];
+        bc.insert(input, token_ids[i]) catch @panic("Failed to insert token");
+    }
+    for (print_ids) |id| {
+        var str: []const u8 = undefined;
+        for (0..input_count) |i| {
+            if (token_ids[i] == id) {
+                str = input_arr[i][0..lengths[i]];
+                var state: u32 = 0;
+                var idx: u32 = 0;
+                std.log.err("Hello, idx={} and state={} and depth={} and token_id={}", .{idx, state, bc.info[state].depth, bc.info[state].token_id});
+                while (idx < str.len) {
+                    state = bc.transitions[state][str[idx]];
+                    idx += 1;
+                    std.log.err("Hello, idx={} and state={} and depth={} and token_id={}", .{idx, state, bc.info[state].depth, bc.info[state].token_id});
+                }
+            }
+        }
+    }
+    bc.computeSuffixLinks() catch @panic("Failed to compute suffix links");
+    std.log.err("I will return {d}", .{@intFromPtr(bc)});
+    return @intFromPtr(bc);
+}
+
+export fn getAllMatches(bc_: usize, input: [*]const u8, input_len: usize, result_count: *usize) [*]const u32 {
+    std.log.err("I got a pointer to BakaCorasick at {d}", .{bc_});
+    const bc: *BakaCorasick = @ptrFromInt(bc_);
+    var state: u32 = 0;
+    var ret: ArrayList(u32) = ArrayList(u32).init(allocator);
+    defer ret.deinit();
+    var idx: u32 = 0;
+    while (idx < input_len) {
+        std.log.err("Hello, idx={} and state={}", .{idx, state});
+        state = bc.transitions[state][input[idx]];
+        idx += 1;
+        if (bc.info[state].token_id != BakaCorasick.NO_TOKEN) {
+            ret.ensureUnusedCapacity(3) catch @panic("Failed to ensure unused capacity");
+            const token_id = bc.info[state].token_id;
+            const depth = bc.info[state].depth;
+            const start_idx = idx - depth;
+            ret.appendAssumeCapacity(start_idx);
+            ret.appendAssumeCapacity(token_id);
+            ret.appendAssumeCapacity(depth);
+        }
+        var other_token_state = bc.info[state].green;
+        while (other_token_state != 0) {
+            ret.ensureUnusedCapacity(3) catch @panic("Failed to ensure unused capacity");
+            const token_id = bc.info[other_token_state].token_id;
+            const depth = bc.info[other_token_state].depth;
+            const start_idx = idx - depth;
+            ret.appendAssumeCapacity(start_idx);
+            ret.appendAssumeCapacity(token_id);
+            ret.appendAssumeCapacity(depth);
+            other_token_state = bc.info[other_token_state].green;
+        }
+    }
+    const ret_slice = allocator.alloc(u32, ret.items.len) catch @panic("Failed to allocate memory for return slice");
+    for (ret.items, 0..) |item, i| {
+        ret_slice[i] = item;
+    }
+    result_count.* = ret_slice.len;
+    return ret_slice.ptr;
 }
 
 export fn free_uc_strings(strings: [*]const [*:0]u8, count: usize) void {

@@ -254,13 +254,7 @@ def norm(x: Tensor):
     """
     Unified norm function that handles both CUDA and MPS
     """
-    # For MPS, ensure we're using float32 for better numerical stability
-    if device.type == "mps":
-        x_float32 = x.to(torch.float32)
-        return F.layer_norm(x_float32, (x.shape[-1],), weight=None, bias=None)
-    else:
-        # For CUDA, use rms_norm with original dtype
-        return F.rms_norm(x, (x.size(-1),))
+    return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
