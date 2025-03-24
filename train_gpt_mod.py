@@ -171,7 +171,35 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
         A = X @ X.mT
         B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
-    
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+def zeropower_via_newtonschulz5_nocompile(G: Tensor, steps: int) -> Tensor:
+    """
+    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
+    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
+    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
+    zero even beyond the point where the iteration no longer converges all the way to one everywhere
+    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
+    where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
+    performance at all relative to UV^T, where USV^T = G is the SVD.
+    """
+    assert G.ndim >= 2 # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    a, b, c = (3.4445, -4.7750,  2.0315)
+    X = G.float()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Perform the NS iterations
+    for _ in range(steps):
+        A = X @ X.mT
+        B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
+        X = a * X + B @ X
+
     if G.size(-2) > G.size(-1):
         X = X.mT
     return X
@@ -199,14 +227,15 @@ class Muon(torch.optim.Optimizer):
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1, device="cuda"):
         self.rank = rank
         self.world_size = world_size
+        self.device = device
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
         params: list[Tensor] = [*params]
         param_groups = []
         for size in {p.numel() for p in params}:
-            b = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
+            b = torch.empty(world_size, size, dtype=torch.float32, device=device)
             group = dict(params=[p for p in params if p.numel() == size],
                          update_buffer=b, update_buffer_views=[b[i] for i in range(world_size)])
             param_groups.append(group)
@@ -215,45 +244,72 @@ class Muon(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
-            update_buffer: Tensor = group["update_buffer"]
-            update_buffer_views: list[Tensor] = group["update_buffer_views"]
-            # generate weight updates in distributed fashion
-            params: list[Tensor] = group["params"]
-            handle = None
-            params_world = None
-            def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
-                handle.wait()
-                for p_world, g_world in zip(params_world, update_buffer_views):
-                    p_world.add_(g_world.view_as(p_world),
-                                 alpha=-group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
-            for base_i in range(len(params))[::self.world_size]:
-                if base_i + self.rank < len(params):
-                    p = params[base_i + self.rank]
-                    g = p.grad
-                    assert g is not None
+            # For MPS, we'll use a simpler non-distributed implementation
+            if self.device == "mps":
+                params: list[Tensor] = group["params"]
+                for p in params:
+                    if p.grad is None:
+                        continue
+
                     state = self.state[p]
                     if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
+                        state["momentum_buffer"] = torch.zeros_like(p.grad)
+
+                    # Update momentum buffer
                     buf: Tensor = state["momentum_buffer"]
-                    buf.lerp_(g, 1 - group["momentum"])
-                    g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
-                else:
-                    g = update_buffer_views[self.rank]
-                if base_i > 0:
-                    update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
-                handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
-                params_world = params[base_i : base_i + self.world_size]
-            update_prev()
+                    buf.lerp_(p.grad, 1 - group["momentum"])
+
+                    # Get gradient with momentum
+                    g = p.grad.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+
+                    # Use the non-compiled version for MPS
+                    g_processed = zeropower_via_newtonschulz5_nocompile(g, steps=group["ns_steps"])
+
+                    # Apply update with the scaling factor
+                    lr_scaled = -group["lr"] * max(1, p.size(-2) / p.size(-1))**0.5
+                    p.add_(g_processed, alpha=lr_scaled)
+            else:
+                # Original distributed implementation for CUDA
+                update_buffer: Tensor = group["update_buffer"]
+                update_buffer_views: list[Tensor] = group["update_buffer_views"]
+                params: list[Tensor] = group["params"]
+                handle = None
+                params_world = None
+
+                def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
+                    handle.wait()
+                    for p_world, g_world in zip(params_world, update_buffer_views):
+                        p_world.add_(g_world.view_as(p_world),
+                                    alpha=-group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
+
+                for base_i in range(len(params))[::self.world_size]:
+                    if base_i + self.rank < len(params):
+                        p = params[base_i + self.rank]
+                        g = p.grad
+                        assert g is not None
+                        state = self.state[p]
+                        if "momentum_buffer" not in state:
+                            state["momentum_buffer"] = torch.zeros_like(g)
+                        buf: Tensor = state["momentum_buffer"]
+                        buf.lerp_(g, 1 - group["momentum"])
+                        g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+                        if self.device == "cuda":
+                            g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
+                        else:
+                            g = zeropower_via_newtonschulz5_nocompile(g, steps=group["ns_steps"]).flatten()
+                    else:
+                        g = update_buffer_views[self.rank]
+                    if base_i > 0:
+                        update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
+                    handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
+                    params_world = params[base_i : base_i + self.world_size]
+                update_prev()
 
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
 def norm(x: Tensor):
-    """
-    Unified norm function that handles both CUDA and MPS
-    """
     return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
@@ -276,12 +332,9 @@ class CastedLinear(nn.Linear):
             out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
             return out.reshape(*x.shape[:-1], -1)
         else:
-            # Ensure MPS compatibility by keeping float32 precision
-            if device.type == "mps":
-                x = x.to(torch.float32)
             return F.linear(x, self.weight)
 
-# Rotary Positional Embeddings (RoPE), a technique used in transformers to introduce 
+# Rotary Positional Embeddings (RoPE), a technique used in transformers to introduce
 # position information into attention mechanisms without requiring explicit positional embeddings
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -299,11 +352,6 @@ class Rotary(nn.Module):
 
     def forward(self, x_BTHD: Tensor):
         assert self.cos.size(0) >= x_BTHD.size(-3), "Sequence length exceeds RoPE limit"
-        
-        # Ensure float32 for MPS
-        original_dtype = x_BTHD.dtype
-        x_BTHD = x_BTHD.to(torch.float32) if device.type == "mps" else x_BTHD
-
         # Extract cos and sin for the required sequence length
         cos, sin = self.cos[:x_BTHD.size(-3)].unsqueeze(0).unsqueeze(2), \
                    self.sin[:x_BTHD.size(-3)].unsqueeze(0).unsqueeze(2)
@@ -315,10 +363,8 @@ class Rotary(nn.Module):
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
 
-        # Return with original dtype if not MPS
-        result = torch.cat((y1, y2), dim=-1)
-        return result if device.type == "mps" else result.to(original_dtype)
-    
+        return torch.cat((y1, y2), dim=-1)
+
 
 # CausalSelfAttention class implements a multi-head self-attention mechanism using a causal mask
 class CausalSelfAttention(nn.Module):
@@ -329,8 +375,8 @@ class CausalSelfAttention(nn.Module):
         hdim = num_heads * head_dim
 
         std = 0.5 * (dim ** -0.5)
-        bound = (3 ** 0.5) * std  
-        
+        bound = (3 ** 0.5) * std
+
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(head_dim, max_seq_len)
@@ -339,7 +385,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
         B, T = x.size(0), x.size(1)
-        
+
         # Only assert batch size on CUDA as it's required for FlexAttention
         if device.type == "cuda":
             assert B == 1, "Batch size must be 1 for FlexAttention (CUDA)."
@@ -364,7 +410,7 @@ class CausalSelfAttention(nn.Module):
 
         # Use flex_attention on CUDA, standard attention on MPS
         if device.type == "cuda" and FLEX_ATTENTION_SUPPORTED:
-            y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 
+            y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
                             block_mask=block_mask, scale=0.12).transpose(1, 2)
         else:
             # Correctly transpose dimensions for standard attention
@@ -383,50 +429,32 @@ class CausalSelfAttention(nn.Module):
         Standard Scaled Dot-Product Attention (for MPS)
         """
         scale_factor = (self.head_dim ** -0.5)
-        
+
         # Compute attention scores and ensure correct precision
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale_factor
-        
-        # Ensure float32 precision on MPS
-        if device.type == "mps":
-            attn_scores = attn_scores.to(torch.float32)
-            
+
         # Apply causal mask (upper triangular)
         seq_len = q.size(-2)
         causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
         attn_scores = attn_scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), -1e9)
-        
+
         attn_probs = F.softmax(attn_scores, dim=-1)
         y = torch.matmul(attn_probs, v)
         return y
-    
+
 
 # Feedforward Network in Transformer
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         hdim = 4 * dim  # Expansion factor of 4
-        
-        # Use standard Linear for both MPS and CPU for better compatibility
-        if device.type in ["mps", "cpu"]:
-            self.c_fc = nn.Linear(dim, hdim)
-            self.c_proj = nn.Linear(hdim, dim)
-        else:
-            # Use CastedLinear for CUDA
-            self.c_fc = CastedLinear(dim, hdim)
-            self.c_proj = CastedLinear(hdim, dim)
-            self.c_proj.weight.detach().zero_()  # Zero init (CUDA only)
+        self.c_fc = CastedLinear(dim, hdim)
+        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj.weight.detach().zero_()  # Zero init
 
     def forward(self, x: Tensor):
-        if device.type in ["mps", "cpu"]:
-            # Ensure float32 for MPS and handle with activation
-            x = self.c_fc(x.to(torch.float32) if device.type == "mps" else x)
-            x = F.gelu(x)  # More stable on MPS/CPU
-        else:
-            # CUDA path
-            x = self.c_fc(x)
-            x = F.relu(x).square()  # Faster on CUDA
-            
+        x = self.c_fc(x)
+        x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
@@ -475,7 +503,7 @@ class GPT(nn.Module):
         if device.type == "mps":
             # Return dummy block masks for MPS that will be ignored
             return None, None
-            
+
         BLOCK_SIZE = 128
         docs = (input_seq == 50256).cumsum(0)
 
@@ -530,10 +558,10 @@ class GPT(nn.Module):
             assert len(ve) == len(self.blocks)
 
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
-        
+
         # Handle both CUDA with block masks and MPS without them
         if device.type == "cuda":
-            block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, 
+            block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm,
                         short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
             # Make sure we have enough block masks for all blocks
             if len(block_masks) < len(self.blocks):
@@ -541,10 +569,10 @@ class GPT(nn.Module):
         else:
             # On MPS, block masks aren't used, so we'll just provide None
             block_masks = [None] * len(self.blocks)
-            
+
         assert len(block_masks) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here
+        x = x0 = norm(self.embed(input_seq)[None])
 
         # U-net design
         skip_connections = []
@@ -587,10 +615,10 @@ def _load_data_shard(file: Path):
         # Now read the token data
         f.seek(256 * 4)  # Skip the 256-int header
         token_bytes = f.read(actual_num_tokens * 2)  # Read token data (2 bytes per token)
-        
+
         # Create tensor from bytes
         tokens = torch.frombuffer(token_bytes, dtype=torch.uint16)
-        
+
     return tokens
 
 def distributed_data_generator(filename_pattern: str, batch_size: int, rank : int, world_size : int):
@@ -598,7 +626,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
     file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
-    
+
     # Handle case where no files are found
     if not files:
         print(f"Warning: No files found matching pattern: {filename_pattern}. Using dummy data.")
@@ -608,7 +636,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
                 inputs = dummy_data[pos + rank * local_batch_size:][:local_batch_size].to(device=device, dtype=torch.int32)
                 targets = dummy_data[pos + rank * local_batch_size + 1:][:local_batch_size].to(device=device, dtype=torch.int64)
                 yield inputs, targets
-    
+
     tokens, pos = _load_data_shard(next(file_iter)), 0
     while True:
         if pos + batch_size + 1 >= len(tokens):
@@ -618,7 +646,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank : in
                 print("Warning: Reached end of file list, restarting from beginning")
                 file_iter = iter(files)
                 tokens, pos = _load_data_shard(next(file_iter)), 0
-        
+
         buf = tokens[pos + rank * local_batch_size:][:local_batch_size + 1]
         inputs = buf[:-1].to(device=device, dtype=torch.int32, non_blocking=True) # no sync on host side;
         targets = buf[1:].to(device=device, dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
@@ -641,7 +669,7 @@ def sequential_data_generator(filename_pattern: str, batch_size: int):
                 inputs = buf[:-1].to(device=device, dtype=torch.int32)
                 targets = buf[1:].to(device=device, dtype=torch.int64)
                 yield inputs, targets
-                
+
     file_iter = iter(files)
     try:
         tokens, pos = _load_data_shard(next(file_iter)), 0
@@ -741,11 +769,11 @@ print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__}")
 if cuda_available:
     print0(f"PyTorch compiled for CUDA {torch.version.cuda}")
-    
+
     def nvidia_smi():
         import subprocess  # avoid top-level import
         return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
-    
+
     print0(nvidia_smi())
 
 elif mps_available:
@@ -774,7 +802,7 @@ gc.collect()
 #    Construct model and optimizer     #
 ########################################
 
-model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=args.num_layers, num_heads=args.num_heads, 
+model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=args.num_layers, num_heads=args.num_heads,
                        model_dim=args.model_dim, max_seq_len=max(args.train_seq_len, args.val_seq_len)).to(device)
 
 if cuda_available:
@@ -782,7 +810,7 @@ if cuda_available:
     for m in model.modules():
         if isinstance(m, nn.Embedding):
             m.bfloat16()
-    
+
     # Broadcast model parameters
     for param in model.parameters():
         dist.broadcast(param.detach(), 0)
@@ -797,7 +825,8 @@ head_params = [model.lm_head.weight]
 if device.type == "cuda":
     optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
 else:  # MPS case
-    optimizer2 = torch.optim.AdamW(hidden_matrix_params, lr=0.05, betas=(0.9, 0.95))
+    #optimizer2 = torch.optim.AdamW(hidden_matrix_params, lr=0.05, betas=(0.9, 0.95))
+    optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, device="mps")
 
 # First optimizer (same for both CUDA and MPS)
 adam_params = [
@@ -920,7 +949,7 @@ for step in range(train_steps + 1):
                 val_loss += batch_loss
                 if val_step == val_steps - 1:
                     print0(f"  Completed validation step {val_steps}/{val_steps}", console=True)
-        
+
         val_loss /= val_steps
 
         if device.type == "cuda":
@@ -939,18 +968,18 @@ for step in range(train_steps + 1):
             try:
                 checkpoint_dir = f"logs/{run_id}"
                 checkpoint_file = f"{checkpoint_dir}/state_step{step:06d}.pt"
-                
+
                 print0(f"Attempting to save checkpoint to {checkpoint_file}", console=True)
-                
+
                 os.makedirs(checkpoint_dir, exist_ok=True)
-                
+
                 log = dict(
-                    step=step, 
-                    code=code, 
-                    model=model.state_dict(), 
+                    step=step,
+                    code=code,
+                    model=model.state_dict(),
                     optimizers=[opt.state_dict() for opt in optimizers]
                 )
-                
+
                 torch.save(log, checkpoint_file)
                 print0(f"Successfully saved checkpoint to {checkpoint_file}", console=True)
             except Exception as e:

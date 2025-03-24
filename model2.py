@@ -70,9 +70,6 @@ def _(x: Tensor, w: Tensor, *_):
 # PyTorch nn.Module definitions for the model
 
 def norm(x: Tensor):
-    """
-    Unified norm function that handles both CUDA and MPS
-    """
     return F.rms_norm(x, (x.size(-1),))
 
 class CastedLinear(nn.Linear):
@@ -100,7 +97,7 @@ class CastedLinear(nn.Linear):
                 x = x.to(torch.float32)
             return F.linear(x, self.weight)
 
-# Rotary Positional Embeddings (RoPE), a technique used in transformers to introduce 
+# Rotary Positional Embeddings (RoPE), a technique used in transformers to introduce
 # position information into attention mechanisms without requiring explicit positional embeddings
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -119,7 +116,7 @@ class Rotary(nn.Module):
     def forward(self, x_BTHD: Tensor, position_ids=None):
         # Support custom position IDs for APBPB calculation
         B, T, H, D = x_BTHD.shape
-        
+
         # Ensure precision based on device
         original_dtype = x_BTHD.dtype
         x_BTHD = x_BTHD.to(torch.float32) if device.type == "mps" else x_BTHD
@@ -127,16 +124,16 @@ class Rotary(nn.Module):
         if position_ids is not None:
             # Custom positions - validate and use them
             max_pos = self.cos.size(0) - 1
-            
+
             # Ensure positions are within bounds
             positions = torch.clamp(position_ids, 0, max_pos)
-            
+
             # Handle the shape based on how position_ids is provided
             # position_ids might be [B, T] or just [T]
             if positions.dim() == 1:
                 # Single sequence of positions [T]
                 positions = positions.unsqueeze(0)  # [1, T]
-            
+
             # Get cos/sin for these specific positions
             cos = torch.index_select(self.cos, 0, positions.view(-1)).view(B, T, 1, -1)
             sin = torch.index_select(self.sin, 0, positions.view(-1)).view(B, T, 1, -1)
@@ -144,7 +141,7 @@ class Rotary(nn.Module):
             # Standard sequential positions
             cos, sin = self.cos[:x_BTHD.size(-3)].unsqueeze(0).unsqueeze(2), \
                    self.sin[:x_BTHD.size(-3)].unsqueeze(0).unsqueeze(2)
-        
+
         # Apply rotary embeddings
         x1, x2 = x_BTHD.chunk(2, dim=-1)
         y1 = x1 * cos + x2 * sin
@@ -152,7 +149,7 @@ class Rotary(nn.Module):
 
         result = torch.cat((y1, y2), dim=-1)
         return result if device.type == "mps" else result.to(original_dtype)
-    
+
 
 # CausalSelfAttention class implements a multi-head self-attention mechanism using a causal mask
 class CausalSelfAttention(nn.Module):
@@ -163,8 +160,8 @@ class CausalSelfAttention(nn.Module):
         hdim = num_heads * head_dim
 
         std = 0.5 * (dim ** -0.5)
-        bound = (3 ** 0.5) * std  
-        
+        bound = (3 ** 0.5) * std
+
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(head_dim, max_seq_len)
@@ -173,7 +170,7 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask | Tensor, position_ids=None):
         B, T = x.size(0), x.size(1)
-        
+
         # Only assert batch size on CUDA as it's required for FlexAttention
         if device.type == "cuda":
             assert B == 1, "Batch size must be 1 for FlexAttention (CUDA)."
@@ -181,7 +178,7 @@ class CausalSelfAttention(nn.Module):
         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)) \
             .view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k)
-        
+
         # Pass position_ids to Rotary embeddings
         q = self.rotary(q, position_ids)
         k = self.rotary(k, position_ids)
@@ -199,7 +196,7 @@ class CausalSelfAttention(nn.Module):
 
         # Use flex_attention on CUDA with BlockMask, standard attention otherwise
         if device.type == "cuda" and FLEX_ATTENTION_SUPPORTED and isinstance(block_mask, BlockMask):
-            y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), 
+            y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
                             block_mask=block_mask, scale=0.12).transpose(1, 2)
         else:
             # Standard attention with custom mask support
@@ -218,24 +215,20 @@ class CausalSelfAttention(nn.Module):
         Standard Scaled Dot-Product Attention with support for custom masks
         """
         scale_factor = (self.head_dim ** -0.5)
-        
+
         # Compute attention scores and ensure correct precision
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale_factor
-        
-        # Ensure float32 precision on MPS
-        if device.type == "mps":
-            attn_scores = attn_scores.to(torch.float32)
-            
+
         # Apply custom attention mask if provided
         if attention_mask is not None:
             # Prepare the mask for broadcasting to [B, H, T, T]
             if attention_mask.dim() == 2:  # [T, T]
                 attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, T, T]
-            
+
             # Convert to boolean if it's not already (True = keep, False = mask)
             if attention_mask.dtype != torch.bool:
                 attention_mask = attention_mask.bool()
-                
+
             # Apply the mask (set masked positions to -1e9)
             attn_scores = attn_scores.masked_fill(~attention_mask, -1e9)
         else:
@@ -243,38 +236,24 @@ class CausalSelfAttention(nn.Module):
             seq_len = q.size(-2)
             causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
             attn_scores = attn_scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), -1e9)
-        
+
         attn_probs = F.softmax(attn_scores, dim=-1)
         y = torch.matmul(attn_probs, v)
         return y
-    
+
 
 # Feedforward Network in Transformer
 class MLP(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
         hdim = 4 * dim  # Expansion factor of 4
-        
-        # Use standard Linear for both MPS and CPU for better compatibility
-        if device.type in ["mps", "cpu"]:
-            self.c_fc = nn.Linear(dim, hdim)
-            self.c_proj = nn.Linear(hdim, dim)
-        else:
-            # Use CastedLinear for CUDA
-            self.c_fc = CastedLinear(dim, hdim)
-            self.c_proj = CastedLinear(hdim, dim)
-            self.c_proj.weight.detach().zero_()  # Zero init (CUDA only)
+        self.c_fc = CastedLinear(dim, hdim)
+        self.c_proj = CastedLinear(hdim, dim)
+        self.c_proj.weight.detach().zero_()  # Zero init
 
     def forward(self, x: Tensor):
-        if device.type in ["mps", "cpu"]:
-            # Ensure float32 for MPS and handle with activation
-            x = self.c_fc(x.to(torch.float32) if device.type == "mps" else x)
-            x = F.gelu(x)  # More stable on MPS/CPU
-        else:
-            # CUDA path
-            x = self.c_fc(x)
-            x = F.relu(x).square()  # Faster on CUDA
-            
+        x = self.c_fc(x)
+        x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
@@ -326,7 +305,7 @@ class GPT(nn.Module):
         if device.type == "mps":
             # Return dummy block masks for MPS that will be ignored
             return None, None
-            
+
         BLOCK_SIZE = 128
         docs = (input_seq == 50256).cumsum(0)
 
@@ -372,17 +351,17 @@ class GPT(nn.Module):
         """
         if not FLEX_ATTENTION_SUPPORTED or device.type != "cuda":
             return attention_mask
-            
+
         BLOCK_SIZE = 128
-        
+
         # Ensure mask is on the correct device and in the right format
         if attention_mask.device != device:
             attention_mask = attention_mask.to(device)
-            
+
         if attention_mask.dim() > 2:
             # Extract just the mask for the first batch and head if multi-dimensional
             attention_mask = attention_mask[0, 0]
-            
+
         T = attention_mask.size(0)
         # Make sure T is a multiple of BLOCK_SIZE for BlockMask
         padded_T = ((T + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
@@ -391,18 +370,18 @@ class GPT(nn.Module):
             padded_mask = torch.zeros((padded_T, padded_T), dtype=attention_mask.dtype, device=device)
             padded_mask[:T, :T] = attention_mask
             attention_mask = padded_mask
-            
+
         num_blocks = padded_T // BLOCK_SIZE
-        
+
         # Create a mask_mod function that applies the original attention pattern
         def custom_mask_mod(b, h, q_idx, kv_idx):
             q_start = q_idx * BLOCK_SIZE
             q_end = min((q_idx + 1) * BLOCK_SIZE, padded_T)
             kv_start = kv_idx * BLOCK_SIZE
             kv_end = min((kv_idx + 1) * BLOCK_SIZE, padded_T)
-            
+
             return attention_mask[q_start:q_end, kv_start:kv_end]
-        
+
         # Create block-level view of the mask
         block_mask = torch.zeros((num_blocks, num_blocks), dtype=torch.bool, device=device)
         for i in range(num_blocks):
@@ -411,15 +390,15 @@ class GPT(nn.Module):
                 j_start, j_end = j * BLOCK_SIZE, (j + 1) * BLOCK_SIZE
                 # A block is attended to if any element in it can be attended to
                 block_mask[i, j] = attention_mask[i_start:i_end, j_start:j_end].any()
-                
+
         # Create block indices
         full_blocks = torch.zeros((num_blocks, num_blocks), dtype=torch.bool, device=device)
         partial_blocks = block_mask & ~full_blocks
-        
+
         # Convert to ordered format
         full_num_blocks, full_indices = self.dense_to_ordered_helper(full_blocks)
         partial_num_blocks, partial_indices = self.dense_to_ordered_helper(partial_blocks)
-        
+
         # Create and return BlockMask
         return BlockMask.from_kv_blocks(
             partial_num_blocks,
@@ -429,39 +408,39 @@ class GPT(nn.Module):
             BLOCK_SIZE=BLOCK_SIZE,
             mask_mod=custom_mask_mod,
         )
-        
+
     def dense_to_ordered_helper(self, dense_blockmask: Tensor):
         """Helper for converting dense block masks to ordered format for BlockMask"""
         num_blocks = dense_blockmask.sum(dim=-1, dtype=torch.int32)
         indices = dense_blockmask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
         return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
-    def forward(self, input_ids=None, attention_mask=None, position_ids=None, sliding_window_num_blocks=None, 
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None, sliding_window_num_blocks=None,
                 input_seq=None, target_seq=None):
         # Support both training and inference modes
         is_training = target_seq is not None
-        
+
         # Handle input from either input_ids (for APBPB) or input_seq (for regular use)
         if input_ids is not None:
             input_seq = input_ids
         elif input_seq is None and not is_training:
             raise ValueError("Either input_ids or input_seq must be provided")
-        
+
         # Handle single token or sequence input
         is_single_token = input_seq.ndim == 0
         if is_single_token:
             input_seq = input_seq.unsqueeze(0)
-        
+
         # Check if input is batched or not
         is_batched = input_seq.ndim == 2
         if not is_batched:
             input_seq = input_seq.unsqueeze(0)  # Add batch dimension
-        
+
         # Set default sliding window blocks if not provided
         if sliding_window_num_blocks is None and attention_mask is None:
-            sliding_window_num_blocks = torch.tensor(max(1, input_seq.size(-1) // 128), 
+            sliding_window_num_blocks = torch.tensor(max(1, input_seq.size(-1) // 128),
                                                 device=input_seq.device, dtype=torch.int32)
-        
+
         # Determine which attention mechanism to use
         if attention_mask is not None:
             # Custom mask provided for APBPB calculation
@@ -484,10 +463,10 @@ class GPT(nn.Module):
                 assert len(ve) == len(self.blocks)
 
             long_bm, short_bm = self.create_blockmasks(input_seq.view(-1), sliding_window_num_blocks)
-            
+
             # Handle both CUDA with block masks and MPS without them
             if device.type == "cuda":
-                block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, 
+                block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm,
                             short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
                 # Make sure we have enough block masks for all blocks
                 if len(block_masks) < len(self.blocks):
@@ -495,7 +474,7 @@ class GPT(nn.Module):
             else:
                 # On MPS, block masks aren't used, so we'll just provide None
                 block_masks = [None] * len(self.blocks)
-                
+
             assert len(block_masks) == len(self.blocks)
 
         # Handle value embeddings differently for MPS vs CUDA
@@ -510,7 +489,7 @@ class GPT(nn.Module):
             assert len(ve) == len(self.blocks)
 
         # Get initial embeddings
-        x = x0 = norm(self.embed(input_seq)) 
+        x = x0 = norm(self.embed(input_seq))
 
         # U-net design
         skip_connections = []
@@ -526,13 +505,13 @@ class GPT(nn.Module):
         logits = self.lm_head(x).float()
         # Sigmoid-based softcapping
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
-        
+
         # For training, calculate loss and return it
         if is_training:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, 
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq,
                                   reduction='sum' if self.training else 'mean')
             return loss
-        
+
         # For inference, return just the logits
         return logits
 
@@ -543,7 +522,7 @@ class GPT(nn.Module):
 @lru_cache(1)
 def get_window_size_blocks_helper(window_size: int):
     tensor = torch.tensor(window_size // 128, dtype=torch.int32)
-    
+
     if device.type == "cuda":
         return tensor.pin_memory().cuda(non_blocking=True)
     return tensor.to(device)
@@ -571,17 +550,17 @@ class Hyperparameters:
 def init_model(config: Hyperparameters = None):
     if config is None:
         config = Hyperparameters()
-    
-    model = GPT(vocab_size=config.vocab_size, 
+
+    model = GPT(vocab_size=config.vocab_size,
                 num_layers=config.num_layers,
-                num_heads=config.num_heads, 
+                num_heads=config.num_heads,
                 model_dim=config.model_dim,
                 max_seq_len=config.max_seq_len).to(device)
-    
+
     # Convert embeddings to bfloat16 on CUDA
     if device.type == "cuda":
         for m in model.modules():
             if isinstance(m, nn.Embedding):
                 m.bfloat16()
-    
+
     return model
