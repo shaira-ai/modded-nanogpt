@@ -1001,6 +1001,8 @@ def main():
             bpb, apbpb, prob_array = calculate_optimized_apbpb(document, encoder, model, device)
             results["bpb"] = bpb
             results["apbpb"] = apbpb
+            naive_apbpb, prob_array = calculate_naive_apbpb(document, encoder, model, device)
+            results["naive_apbpb"] = naive_apbpb
             print(f"All-paths BPB (APBPB): {apbpb:.6f}")
             
             # Store position probabilities
@@ -1018,8 +1020,12 @@ def main():
     # Compare results
     if results["bpb"] is not None and results["apbpb"] is not None:
         print("\n=== Comparison ===")
-        print(f"Standard BPB: {results['bpb']:.6f}")
-        print(f"APBPB:        {results['apbpb']:.6f}")
+        if 'standard_bpb' in results:
+            print(f"Standard BPB (old): {results['standard_bpb']:.6f}")
+        print(f"Standard BPB:       {results['bpb']:.6f}")
+        print(f"APBPB:              {results['apbpb']:.6f}")
+        if 'naive_apbpb' in results:
+            print(f"Naive APBPB:        {results['naive_apbpb']:.6f}")
         is_better = results["apbpb"] < results["bpb"]
         results["comparison"] = is_better
         print(f"APBPB < BPB?  {'Yes' if is_better else 'No'}")
