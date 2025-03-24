@@ -95,12 +95,12 @@ def calculate_standard_bpb(document, encoder, model, device):
                 target = target_tensor[i]
                 
                 # Apply log softmax to get log probabilities
-                log_probs = torch.nn.functional.log_softmax(token_logits, dim=0)
+                my_probs = torch.nn.functional.softmax(token_logits, dim=0)
                 
                 # Get negative log likelihood for this token
-                print(f"Target probability: {log_probs[target].item()}")
-                if target < log_probs.size(0):
-                    loss -= log_probs[target].item()
+                print(f"Target log probability: {math.log(my_probs[target].item())}")
+                if target < my_probs.size(0):
+                    loss -= math.log(my_probs[target].item()) # Use log softmax
                 else:
                     print(f"Warning: Target token {target} out of range")
             
@@ -441,24 +441,27 @@ def calculate_optimized_apbpb(document, encoder, model, device):
     if len(token_positions) > max_display:
         print(f"\n[Showing only first {max_display}x{max_display} of {len(token_positions)}x{len(token_positions)} attention mask]")
     
-    # Step 5: Build position encodings
+    # Step 5: Build position encodings based on attention mask rows
     print("\nBuilding position encodings...")
     positions = torch.zeros(len(token_positions), dtype=torch.int32)
-    unique_byte_positions = sorted(set(byte_pos for _, byte_pos, _ in token_positions))
-    byte_to_seq_position = {byte_pos: i for i, byte_pos in enumerate(unique_byte_positions)}
 
-    for i, (token_id, byte_pos, token_text) in enumerate(token_positions):
-        # If position is -1 (separator token), keep it as 0
-        # Otherwise use the byte position
-        positions[i] = byte_to_seq_position.get(byte_pos, 0)
-    
+    for i in range(len(token_positions)):
+        # Count the number of 1s in this row of the attention mask (how many tokens this token can attend to)
+        num_attended_tokens = torch.sum(attn_mask[i]).item()
+        
+        # Position is (number of attended tokens - 1)
+        positions[i] = int(num_attended_tokens - 1)
+
     # Print position encodings
     print("Position encodings:")
     for i, (token_id, byte_pos, token_text) in enumerate(token_positions):  # Show first 15
         try:
             token_name = repr(token_text.decode('utf-8', errors='replace'))
         except:
-            token_name = f"[Binary token ID:{token_id}]"
+            if token_id == separator_id and byte_pos == 0:
+                token_name = "<|endoftext|>"
+            else:
+                token_name = f"[Binary token ID:{token_id}]"
             
         print(f"  Token {i}: {token_name} - position {positions[i].item()}")
 
