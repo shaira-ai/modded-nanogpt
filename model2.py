@@ -92,9 +92,6 @@ class CastedLinear(nn.Linear):
             out: Tensor = torch.ops.nanogpt.mm(_x, self.weight, x_s=self.x_s, w_s=self.w_s, grad_s=self.grad_s)[0]
             return out.reshape(*x.shape[:-1], -1)
         else:
-            # Ensure MPS compatibility by keeping float32 precision
-            if device.type == "mps":
-                x = x.to(torch.float32)
             return F.linear(x, self.weight)
 
 # Rotary Positional Embeddings (RoPE), a technique used in transformers to introduce
@@ -117,10 +114,9 @@ class Rotary(nn.Module):
         # Support custom position IDs for APBPB calculation
         B, T, H, D = x_BTHD.shape
 
-        # Ensure precision based on device
-        original_dtype = x_BTHD.dtype
-        x_BTHD = x_BTHD.to(torch.float32) if device.type == "mps" else x_BTHD
-        
+        if position_ids is None:
+            #print("Warning: position_ids not provided, using default sequential positions")
+            position_ids = torch.arange(T, dtype=torch.int32, device=device)
         if position_ids is not None:
             # Custom positions - validate and use them
             max_pos = self.cos.size(0) - 1
@@ -147,8 +143,7 @@ class Rotary(nn.Module):
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
 
-        result = torch.cat((y1, y2), dim=-1)
-        return result if device.type == "mps" else result.to(original_dtype)
+        return torch.cat((y1, y2), dim=-1)
 
 
 # CausalSelfAttention class implements a multi-head self-attention mechanism using a causal mask
@@ -349,7 +344,7 @@ class GPT(nn.Module):
         """
         Convert a boolean attention mask to the BlockMask format used by FlexAttention.
         """
-        if not FLEX_ATTENTION_SUPPORTED or device.type != "cuda":
+        if (not FLEX_ATTENTION_SUPPORTED) or (device.type != "cuda"):
             return attention_mask
 
         BLOCK_SIZE = 128
