@@ -86,7 +86,7 @@ def calculate_standard_bpb(document, encoder, model, device):
         with torch.no_grad():
             model.eval()
             # In inference mode, we use the logits to calculate loss
-            logits = model(input_tensor, window_blocks)
+            logits = model(input_tensor, sliding_window_num_blocks=window_blocks)
             
             # Calculate cross-entropy loss manually
             loss = 0
