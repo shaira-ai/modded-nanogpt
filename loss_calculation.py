@@ -9,6 +9,7 @@ import mpmath
 import traceback
 from pathlib import Path
 from neon.pre_segment import please_encode, get_pre_segments
+from neon.zig.bindings import get_all_matches, get_all_matches_including_past_end
 from model2 import GPT, Hyperparameters, init_model, device, get_window_size_blocks
 from collections import defaultdict
 
@@ -97,6 +98,7 @@ def calculate_standard_bpb(document, encoder, model, device):
                 log_probs = torch.nn.functional.log_softmax(token_logits, dim=0)
                 
                 # Get negative log likelihood for this token
+                print(f"Target probability: {log_probs[target].item()}")
                 if target < log_probs.size(0):
                     loss -= log_probs[target].item()
                 else:
@@ -519,6 +521,10 @@ def calculate_optimized_apbpb(document, encoder, model, device):
     prob_array = [mpmath.mpf(0)] * (byte_count + 1 + encoder.max_token_length)
     prob_array[0] = mpmath.mpf(1.0)
 
+    all_tokens_in_doc = get_all_matches_including_past_end(encoder, document)
+    all_tokens_in_doc.sort()
+    all_tokens_idx = 0
+
     # Process prefixes in ascending order to ensure proper probability propagation
     for prefix_len in sorted(all_segmentations.keys()):
         # Skip if this position has zero probability (unreachable)
@@ -542,7 +548,15 @@ def calculate_optimized_apbpb(document, encoder, model, device):
             
             # Find all valid next tokens at this position
             next_byte_pos = prefix_len
-            valid_tokens = find_valid_next_tokens(document, next_byte_pos, encoder)
+
+            range_lo = all_tokens_idx
+            while(all_tokens_idx < len(all_tokens_in_doc) and all_tokens_in_doc[all_tokens_idx][0] == next_byte_pos):
+                all_tokens_idx += 1
+            valid_tokens = all_tokens_in_doc[range_lo:all_tokens_idx]
+            valid_tokens = [(x[2], encoder.token_id_to_bytes[x[2]]) for x in valid_tokens]
+            #other_valid_tokens = find_valid_next_tokens(document, next_byte_pos, encoder)
+            #other_valid_tokens.sort(key=lambda x: len(x[1]))
+            #assert(valid_tokens == other_valid_tokens)
             
             # Format prefix string for display
             if prefix_len == 0:
@@ -738,9 +752,20 @@ def calculate_naive_apbpb(document, encoder, model, device):
     # Find all valid tokens at each position
     position_tokens = {}
     total_valid_tokens = 0
+
+    all_tokens_in_doc = get_all_matches_including_past_end(encoder, document)
+    all_tokens_in_doc.sort()
+    all_tokens_idx = 0
     
     for pos in range(len(document)):
-        valid_tokens = find_valid_next_tokens(document, pos, encoder)
+        range_lo = all_tokens_idx
+        while(all_tokens_idx < len(all_tokens_in_doc) and all_tokens_in_doc[all_tokens_idx][0] == pos):
+            all_tokens_idx += 1
+        valid_tokens = all_tokens_in_doc[range_lo:all_tokens_idx]
+        valid_tokens = [(x[2], encoder.token_id_to_bytes[x[2]]) for x in valid_tokens]
+        #other_valid_tokens = find_valid_next_tokens(document, pos, encoder)
+        #other_valid_tokens.sort(key=lambda x: len(x[1]))
+        #assert(valid_tokens == other_valid_tokens)
         position_tokens[pos] = valid_tokens
         total_valid_tokens += len(valid_tokens)
         

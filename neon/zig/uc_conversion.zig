@@ -1,6 +1,7 @@
 const std = @import("std");
 const BakaCorasick = @import("baka_corasick.zig").BakaCorasick;
 const ArrayList = std.ArrayList;
+const Queue = @import("queue.zig").Queue;
 
 const allocator = std.heap.c_allocator;
 
@@ -42,7 +43,7 @@ export fn makeBC(input_arr: [*]const [*]const u8, lengths: [*]const usize, token
     for (0..input_count) |i| {
         for (print_ids) |id| {
             if (token_ids[i] == id) {
-                std.log.err("token {d} is \"{s}\" with length {d}", .{token_ids[i], input_arr[i][0..lengths[i]], lengths[i]});
+                //std.log.err("token {d} is \"{s}\" with length {d}", .{token_ids[i], input_arr[i][0..lengths[i]], lengths[i]});
             }
         }
         const input = input_arr[i][0..lengths[i]];
@@ -55,50 +56,107 @@ export fn makeBC(input_arr: [*]const [*]const u8, lengths: [*]const usize, token
                 str = input_arr[i][0..lengths[i]];
                 var state: u32 = 0;
                 var idx: u32 = 0;
-                std.log.err("Hello, idx={} and state={} and depth={} and token_id={}", .{idx, state, bc.info[state].depth, bc.info[state].token_id});
+                //std.log.err("Hello, idx={} and state={} and depth={} and token_id={}", .{idx, state, bc.info[state].depth, bc.info[state].token_id});
                 while (idx < str.len) {
                     state = bc.transitions[state][str[idx]];
                     idx += 1;
-                    std.log.err("Hello, idx={} and state={} and depth={} and token_id={}", .{idx, state, bc.info[state].depth, bc.info[state].token_id});
+                    //std.log.err("Hello, idx={} and state={} and depth={} and token_id={}", .{idx, state, bc.info[state].depth, bc.info[state].token_id});
                 }
             }
         }
     }
     bc.computeSuffixLinks() catch @panic("Failed to compute suffix links");
-    std.log.err("I will return {d}", .{@intFromPtr(bc)});
+    //std.log.err("I will return {d}", .{@intFromPtr(bc)});
     return @intFromPtr(bc);
 }
 
-export fn getAllMatches(bc_: usize, input: [*]const u8, input_len: usize, result_count: *usize) [*]const u32 {
-    std.log.err("I got a pointer to BakaCorasick at {d}", .{bc_});
+export fn getAllMatches(
+    bc_: usize,
+    input: [*]const u8,
+    input_len: usize,
+    result_count: *usize,
+) [*]const u32 {
+    return getAllMatchesInternal(false, bc_, input, input_len, result_count);
+}
+
+export fn getAllMatchesIncludingPastEnd(
+    bc_: usize,
+    input: [*]const u8,
+    input_len: usize,
+    result_count: *usize,
+) [*]const u32 {
+    return getAllMatchesInternal(true, bc_, input, input_len, result_count);
+}
+
+fn getAllMatchesInternal(
+    comptime GET_MATCHES_PAST_END: bool,
+    bc_: usize,
+    input: [*]const u8,
+    input_len: usize,
+    result_count: *usize,
+) [*]const u32 {
+    //std.log.err("I got a pointer to BakaCorasick at {d}", .{bc_});
     const bc: *BakaCorasick = @ptrFromInt(bc_);
     var state: u32 = 0;
     var ret: ArrayList(u32) = ArrayList(u32).init(allocator);
     defer ret.deinit();
     var idx: u32 = 0;
     while (idx < input_len) {
-        std.log.err("Hello, idx={} and state={}", .{idx, state});
+        //std.log.err("Hello, idx={} and state={}", .{idx, state});
         state = bc.transitions[state][input[idx]];
         idx += 1;
-        if (bc.info[state].token_id != BakaCorasick.NO_TOKEN) {
-            ret.ensureUnusedCapacity(3) catch @panic("Failed to ensure unused capacity");
-            const token_id = bc.info[state].token_id;
-            const depth = bc.info[state].depth;
-            const start_idx = idx - depth;
-            ret.appendAssumeCapacity(start_idx);
-            ret.appendAssumeCapacity(token_id);
-            ret.appendAssumeCapacity(depth);
+        var green_state = state;
+        if (bc.info[green_state].token_id == BakaCorasick.NO_TOKEN) {
+            green_state = bc.info[green_state].green;
         }
-        var other_token_state = bc.info[state].green;
-        while (other_token_state != 0) {
-            ret.ensureUnusedCapacity(3) catch @panic("Failed to ensure unused capacity");
-            const token_id = bc.info[other_token_state].token_id;
-            const depth = bc.info[other_token_state].depth;
+        while(green_state != 0) {
+            const token_id = bc.info[green_state].token_id;
+            const depth = bc.info[green_state].depth;
             const start_idx = idx - depth;
+            ret.ensureUnusedCapacity(3) catch @panic("Failed to ensure unused capacity");
             ret.appendAssumeCapacity(start_idx);
+            ret.appendAssumeCapacity(idx);
             ret.appendAssumeCapacity(token_id);
-            ret.appendAssumeCapacity(depth);
-            other_token_state = bc.info[other_token_state].green;
+            green_state = bc.info[green_state].green;
+        }
+    }
+    if (GET_MATCHES_PAST_END) {
+        const BFSState = struct {
+            bc_state: u32,
+            idx: u32,
+        };
+        var queue = Queue(BFSState){};
+        for (0..256) |c| {
+            queue.push(allocator, .{ .bc_state = bc.transitions[state][c], .idx = idx + 1 }) catch @panic("Failed to push to queue");
+        }
+        while (queue.pop()) |st| {
+            state = st.bc_state;
+            idx = st.idx;
+            var depth = bc.info[state].depth;
+            var start_idx = idx - depth;
+            if (start_idx >= input_len) {
+                continue;
+            }
+            var green_state = state;
+            if (bc.info[green_state].token_id == BakaCorasick.NO_TOKEN) {
+                green_state = bc.info[green_state].green;
+            }
+            while (green_state != 0) {
+                depth = bc.info[green_state].depth;
+                start_idx = idx - depth;
+                if (start_idx >= input_len) {
+                    break;
+                }
+                const token_id = bc.info[green_state].token_id;
+                ret.ensureUnusedCapacity(3) catch @panic("Failed to ensure unused capacity");
+                ret.appendAssumeCapacity(start_idx);
+                ret.appendAssumeCapacity(idx);
+                ret.appendAssumeCapacity(token_id);
+                green_state = bc.info[green_state].green;
+            }
+            for (0..256) |c| {
+                queue.push(allocator, .{ .bc_state = bc.transitions[state][c], .idx = idx + 1 }) catch @panic("Failed to push to queue");
+            }
         }
     }
     const ret_slice = allocator.alloc(u32, ret.items.len) catch @panic("Failed to allocate memory for return slice");
@@ -107,6 +165,15 @@ export fn getAllMatches(bc_: usize, input: [*]const u8, input_len: usize, result
     }
     result_count.* = ret_slice.len;
     return ret_slice.ptr;
+}
+
+export fn freeSlice(slice: [*]const u32, count: usize) void {
+    allocator.free(slice[0..count]);
+}
+
+export fn getBCMemoryUsage(bc_: usize) usize {
+    const bc: *BakaCorasick = @ptrFromInt(bc_);
+    return bc.capacity * (@sizeOf(@TypeOf(bc.transitions[0])) + @sizeOf(@TypeOf(bc.info[0])));
 }
 
 export fn free_uc_strings(strings: [*]const [*:0]u8, count: usize) void {

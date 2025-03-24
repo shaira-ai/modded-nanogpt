@@ -8,7 +8,7 @@
 ### Compile the Zig Library
 
 ```zsh
-zig build-lib uc_conversion.zig -dynamic
+zig build-lib uc_conversion.zig -dynamic -O ReleaseFast
 ```
 
 This will create:

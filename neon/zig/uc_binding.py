@@ -1,4 +1,5 @@
 import tiktoken
+import time
 import ctypes
 from ctypes import c_char_p, c_size_t, POINTER, c_uint, c_void_p
 
@@ -35,8 +36,18 @@ lib.getAllMatches.argtypes = [
     c_size_t, # input count
     POINTER(c_size_t) # result count
 ]
-
 lib.getAllMatches.restype = POINTER(c_uint)
+
+lib.getAllMatchesIncludingPastEnd.argtypes = [
+    c_size_t, # pointer to BakaCorasick
+    c_char_p, # input string
+    c_size_t, # input count
+    POINTER(c_size_t) # result count
+]
+lib.getAllMatchesIncludingPastEnd.restype = POINTER(c_uint)
+
+lib.getBCMemoryUsage.argtypes = [c_size_t]
+lib.getBCMemoryUsage.restype = c_size_t
 
 def maybe_utf8_decode(data):
     try:
@@ -55,6 +66,13 @@ def prep_tokenizer(tokenizer):
         for k in tokenizer.non_special_vocab_xd:
             vocab_max_token_length = max(vocab_max_token_length, len(k))
         tokenizer.max_token_length = vocab_max_token_length
+    if not hasattr(tokenizer, "token_id_to_bytes"):
+        token_id_to_bytes = [b""] * len(tokenizer.non_special_vocab_xd)
+        for k, v in tokenizer._mergeable_ranks.items():
+            if type(k) != bytes:
+                k = k.encode('utf-8')
+            token_id_to_bytes[v] = k
+        tokenizer.token_id_to_bytes = token_id_to_bytes
 
 def main():
     encoder = tiktoken.get_encoding("gpt2")
@@ -68,8 +86,8 @@ def main():
     for i, k in enumerate(encoder.non_special_vocab_xd):
         if type(k) != bytes:
             k = k.encode('utf-8')
-        if i in print_ids:
-            print(f"token {i} is {k} with length {len(k)}")
+        # if i in print_ids:
+        #     print(f"token {i} is {k} with length {len(k)}")
         input_arr[i] = k
         lengths[i] = len(k)
         token_ids[i] = i
@@ -79,22 +97,39 @@ def main():
             k = k.encode('utf-8')
         token_id_to_bytes[encoder.non_special_vocab_xd[k]] = k
     blah = lib.makeBC(input_arr, lengths, token_ids, n_tokens)
-    print(blah)
+    # print(blah)
     result_length = c_size_t()
     input_str = b"The quick brown fox jumps over the lazy dog."
     input_ptr = c_char_p(input_str)
     input_len = len(input_str)
+    # time this
+    start = time.time()
     result = lib.getAllMatches(blah, input_ptr, input_len, ctypes.byref(result_length))
-    print("hewwo")
+    end = time.time()
+    print(f"Time to get all matches: {end - start}")
+    # print("hewwo")
     result_list = []
     for i in range(result_length.value):
         result_list.append(result[i])
-    print(result_list)
+    # print(result_list)
     token_list = []
     for x in range(0, len(result_list), 3):
         token_list.append(result_list[x:x+3])
     for x in token_list:
-        print(x, token_id_to_bytes[x[1]],  len(token_id_to_bytes[x[1]]))
+        print(x, token_id_to_bytes[x[2]],  len(token_id_to_bytes[x[2]]))
+    print(lib.getBCMemoryUsage(blah))
+    with open("pg844.txt", 'rb') as file:
+        content = file.read()  # content is a bytes object
+    start = time.time()
+    result = lib.getAllMatches(blah, content, len(content), ctypes.byref(result_length))
+    end = time.time()
+    print(f"Time to get all matches: {end - start}")
+    print(result_length.value)
+    start = time.time()
+    result = lib.getAllMatchesIncludingPastEnd(blah, content, len(content), ctypes.byref(result_length))
+    end = time.time()
+    print(f"Time to get all matches including past end: {end - start}")
+    print(result_length.value)
 
 def UCconversion(strings):
     """Convert a list of strings to uppercase using Zig."""
@@ -103,10 +138,7 @@ def UCconversion(strings):
     string_count = len(strings)
     c_strings = (c_char_p * string_count)()
     for i, s in enumerate(strings):
-        print(type(s))
         c_strings[i] = s.encode('utf-8')
-        print(type(c_strings[i]))
-        print(type(c_strings))
     
     # prepare output parameter for result count
     result_count = c_size_t()
@@ -124,8 +156,4 @@ def UCconversion(strings):
     return result
 
 if __name__ == "__main__":
-    test_strings = ["hello", "world", "zig", "Python", "Mixed123Case!"]
-    uppercase = UCconversion(test_strings)
-    print(f"Original: {test_strings}")
-    print(f"Uppercase: {uppercase}")
     main()

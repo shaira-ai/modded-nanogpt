@@ -12,7 +12,7 @@ fi
 echo "Running: python train_gpt_mod.py --device=mps"
 
 # Run with timeout protection (in case it hangs)
-python train_gpt_mod.py --device=mps
+python3 train_gpt_mod.py --device=mps
 
 # Check exit code
 EXIT_CODE=$?
