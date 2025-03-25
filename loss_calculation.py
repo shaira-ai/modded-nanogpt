@@ -10,7 +10,7 @@ import traceback
 from pathlib import Path
 from neon.pre_segment import please_encode, get_pre_segments
 from neon.zig.bindings import get_all_matches, get_all_matches_including_past_end
-from model2 import GPT, Hyperparameters, init_model, device, get_window_size_blocks
+from train_gpt_mod import GPT, Hyperparameters, init_model, device, get_window_size_blocks
 from collections import defaultdict
 
 def get_token_to_id_mapping(tokenizer):
@@ -495,8 +495,6 @@ def calculate_optimized_apbpb(document, encoder, model, device):
     try:
         with torch.no_grad():
             model.eval()
-            # NOTE: This is a placeholder - you'll need to adapt this to your model's API
-            # Depending on your model, you might need to pass position_ids and attention_mask differently
             outputs = model(
                 input_ids=input_ids.unsqueeze(0), 
                 position_ids=positions.unsqueeze(0),
@@ -926,13 +924,15 @@ def load_model_from_checkpoint(checkpoint_path):
             print(f"Inferred model config: dim={model_dim}, layers={num_layers}, heads={num_heads}, seq_len={max_seq_len}")
             
             # Create model with correct configuration
-            config = Hyperparameters(
-                vocab_size=vocab_size,
-                num_layers=num_layers,
-                num_heads=num_heads,
-                model_dim=model_dim,
-                max_seq_len=max_seq_len
-            )
+            config = Hyperparameters()  # Create with defaults
+            # Override with inferred values
+            config.vocab_size = vocab_size
+            config.num_layers = num_layers
+            config.num_heads = num_heads
+            config.model_dim = model_dim
+            # There's no max_seq_len in your class, so use appropriate field
+            config.train_seq_len = max_seq_len
+            config.val_seq_len = max_seq_len
             
             model = init_model(config)
             

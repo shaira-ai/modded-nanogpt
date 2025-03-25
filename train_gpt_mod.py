@@ -24,8 +24,8 @@ if cuda_available:
 
 #MPS does not need this workaround because MPS initializes differently.
 # prevents a bug on some systems
-dummy_device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-torch.empty(1, device=dummy_device, requires_grad=True).backward()
+device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+torch.empty(1, device=device, requires_grad=True).backward()
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, flex_attention
@@ -321,7 +321,7 @@ class CastedLinear(nn.Linear):
         self.grad_s = grad_s
 
     def reset_parameters(self) -> None:
-        std = 0.5 * (self.in_features ** -0.5)  # 0.5 is a bit better than the default 1/sqrt(3)
+        std = 0.5 * (self.in_features ** -0.5) # 0.5 is a bit better than the default 1/sqrt(3)
         bound = (3 ** 0.5) * std
         with torch.no_grad():
             self.weight.uniform_(-bound, bound)
@@ -350,16 +350,33 @@ class Rotary(nn.Module):
         self.register_buffer("cos", theta.cos(), persistent=False)
         self.register_buffer("sin", theta.sin(), persistent=False)
 
-    def forward(self, x_BTHD: Tensor):
-        assert self.cos.size(0) >= x_BTHD.size(-3), "Sequence length exceeds RoPE limit"
-        # Extract cos and sin for the required sequence length
-        cos, sin = self.cos[:x_BTHD.size(-3)].unsqueeze(0).unsqueeze(2), \
+    def forward(self, x_BTHD: Tensor, position_ids=None):
+        # Support custom position IDs for APBPB calculation
+        B, T, H, D = x_BTHD.shape
+
+        if position_ids is not None:
+            # Custom positions - validate and use them
+            max_pos = self.cos.size(0) - 1
+
+            # Ensure positions are within bounds
+            positions = torch.clamp(position_ids, 0, max_pos)
+
+            # Handle the shape based on how position_ids is provided
+            # position_ids might be [B, T] or just [T]
+            if positions.dim() == 1:
+                # Single sequence of positions [T]
+                positions = positions.unsqueeze(0)  # [1, T]
+
+            # Get cos/sin for these specific positions
+            cos = torch.index_select(self.cos, 0, positions.view(-1)).view(B, T, 1, -1)
+            sin = torch.index_select(self.sin, 0, positions.view(-1)).view(B, T, 1, -1)
+        else:
+            # Standard sequential positions
+            cos, sin = self.cos[:x_BTHD.size(-3)].unsqueeze(0).unsqueeze(2), \
                    self.sin[:x_BTHD.size(-3)].unsqueeze(0).unsqueeze(2)
 
-        # Split tensor into two parts for RoPE transformation
+        # Apply rotary embeddings
         x1, x2 = x_BTHD.chunk(2, dim=-1)
-
-        # Apply rotation
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
 
@@ -373,18 +390,18 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         hdim = num_heads * head_dim
-
         std = 0.5 * (dim ** -0.5)
-        bound = (3 ** 0.5) * std
-
+        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
+        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
+        # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
         self.lambdas = nn.Parameter(torch.tensor([0.5, 0.5]))
         self.rotary = Rotary(head_dim, max_seq_len)
         self.c_proj = CastedLinear(hdim, dim)
-        self.c_proj.weight.detach().zero_()
+        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask):
-        B, T = x.size(0), x.size(1)
+    def forward(self, x: Tensor, ve: Tensor | None, block_mask: BlockMask | Tensor, position_ids=None):
+        B, T = x.size(0), x.size(1) # batch size, sequence length
 
         # Only assert batch size on CUDA as it's required for FlexAttention
         if device.type == "cuda":
@@ -393,7 +410,10 @@ class CausalSelfAttention(nn.Module):
         q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)) \
             .view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
         q, k = norm(q), norm(k)
-        q, k = self.rotary(q), self.rotary(k)
+
+        # Pass position_ids to Rotary embeddings
+        q = self.rotary(q, position_ids)
+        k = self.rotary(k, position_ids)
 
         # Fix for MPS: Check if ve is not None and has the right shape before using it
         if ve is not None:
@@ -408,35 +428,48 @@ class CausalSelfAttention(nn.Module):
         else:
             v = self.lambdas[0] * v
 
-        # Use flex_attention on CUDA, standard attention on MPS
-        if device.type == "cuda" and FLEX_ATTENTION_SUPPORTED:
+        # Use flex_attention on CUDA with BlockMask, standard attention otherwise
+        if device.type == "cuda" and FLEX_ATTENTION_SUPPORTED and isinstance(block_mask, BlockMask):
             y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
                             block_mask=block_mask, scale=0.12).transpose(1, 2)
         else:
-            # Correctly transpose dimensions for standard attention
+            # Standard attention with custom mask support
             q = q.transpose(1, 2)  # [B, num_heads, T, head_dim]
             k = k.transpose(1, 2)
             v = v.transpose(1, 2)
-            y = self.standard_attention(q, k, v)
+            y = self.standard_attention(q, k, v, attention_mask=block_mask)
             y = y.transpose(1, 2)  # [B, T, num_heads, head_dim]
 
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
         y = self.c_proj(y)
         return y
 
-    def standard_attention(self, q, k, v):
+    def standard_attention(self, q, k, v, attention_mask=None):
         """
-        Standard Scaled Dot-Product Attention (for MPS)
+        Standard Scaled Dot-Product Attention with support for custom masks
         """
         scale_factor = (self.head_dim ** -0.5)
 
         # Compute attention scores and ensure correct precision
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) * scale_factor
 
-        # Apply causal mask (upper triangular)
-        seq_len = q.size(-2)
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
-        attn_scores = attn_scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), -1e9)
+        # Apply custom attention mask if provided
+        if attention_mask is not None:
+            # Prepare the mask for broadcasting to [B, H, T, T]
+            if attention_mask.dim() == 2:  # [T, T]
+                attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, T, T]
+
+            # Convert to boolean if it's not already (True = keep, False = mask)
+            if attention_mask.dtype != torch.bool:
+                attention_mask = attention_mask.bool()
+
+            # Apply the mask (set masked positions to -1e9)
+            attn_scores = attn_scores.masked_fill(~attention_mask, -1e9)
+        else:
+            # Fall back to causal mask
+            seq_len = q.size(-2)
+            causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+            attn_scores = attn_scores.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), -1e9)
 
         attn_probs = F.softmax(attn_scores, dim=-1)
         y = torch.matmul(attn_probs, v)
@@ -462,18 +495,19 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
         super().__init__()
-        self.attn = (
-            CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        )
+        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
+        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
         self.mlp = MLP(dim)
         self.lambdas = nn.Parameter(torch.tensor([1.0, 0.0]))
 
-    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask):
+    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, block_mask: BlockMask | Tensor, position_ids=None):
         x = self.lambdas[0] * x + self.lambdas[1] * x0
         if self.attn is not None:
-            x = x + self.attn(norm(x), ve, block_mask)
+            # Pass position_ids to attention mechanism
+            x = x + self.attn(norm(x), ve, block_mask, position_ids=position_ids)
         x = x + self.mlp(norm(x))
         return x
+
 
 # -----------------------------------------------------------------------------
 # The main model
@@ -503,7 +537,7 @@ class GPT(nn.Module):
         if device.type == "mps":
             # Return dummy block masks for MPS that will be ignored
             return None, None
-
+            
         BLOCK_SIZE = 128
         docs = (input_seq == 50256).cumsum(0)
 
@@ -543,8 +577,126 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
-        assert input_seq.ndim == 1
+    def convert_to_block_mask(self, attention_mask):
+        """
+        Convert a boolean attention mask to the BlockMask format used by FlexAttention.
+        """
+        if (not FLEX_ATTENTION_SUPPORTED) or (device.type != "cuda"):
+            return attention_mask
+
+        BLOCK_SIZE = 128
+
+        # Ensure mask is on the correct device and in the right format
+        if attention_mask.device != device:
+            attention_mask = attention_mask.to(device)
+
+        if attention_mask.dim() > 2:
+            # Extract just the mask for the first batch and head if multi-dimensional
+            attention_mask = attention_mask[0, 0]
+
+        T = attention_mask.size(0)
+        # Make sure T is a multiple of BLOCK_SIZE for BlockMask
+        padded_T = ((T + BLOCK_SIZE - 1) // BLOCK_SIZE) * BLOCK_SIZE
+        if T < padded_T:
+            # Pad the mask to a multiple of BLOCK_SIZE
+            padded_mask = torch.zeros((padded_T, padded_T), dtype=attention_mask.dtype, device=device)
+            padded_mask[:T, :T] = attention_mask
+            attention_mask = padded_mask
+
+        num_blocks = padded_T // BLOCK_SIZE
+
+        # Create a mask_mod function that applies the original attention pattern
+        def custom_mask_mod(b, h, q_idx, kv_idx):
+            q_start = q_idx * BLOCK_SIZE
+            q_end = min((q_idx + 1) * BLOCK_SIZE, padded_T)
+            kv_start = kv_idx * BLOCK_SIZE
+            kv_end = min((kv_idx + 1) * BLOCK_SIZE, padded_T)
+
+            return attention_mask[q_start:q_end, kv_start:kv_end]
+
+        # Create block-level view of the mask
+        block_mask = torch.zeros((num_blocks, num_blocks), dtype=torch.bool, device=device)
+        for i in range(num_blocks):
+            for j in range(num_blocks):
+                i_start, i_end = i * BLOCK_SIZE, (i + 1) * BLOCK_SIZE
+                j_start, j_end = j * BLOCK_SIZE, (j + 1) * BLOCK_SIZE
+                # A block is attended to if any element in it can be attended to
+                block_mask[i, j] = attention_mask[i_start:i_end, j_start:j_end].any()
+
+        # Create block indices
+        full_blocks = torch.zeros((num_blocks, num_blocks), dtype=torch.bool, device=device)
+        partial_blocks = block_mask & ~full_blocks
+
+        # Convert to ordered format
+        full_num_blocks, full_indices = self.dense_to_ordered_helper(full_blocks)
+        partial_num_blocks, partial_indices = self.dense_to_ordered_helper(partial_blocks)
+
+        # Create and return BlockMask
+        return BlockMask.from_kv_blocks(
+            partial_num_blocks,
+            partial_indices,
+            full_num_blocks,
+            full_indices,
+            BLOCK_SIZE=BLOCK_SIZE,
+            mask_mod=custom_mask_mod,
+        )
+
+    def dense_to_ordered_helper(self, dense_blockmask: Tensor):
+        """Helper for converting dense block masks to ordered format for BlockMask"""
+        num_blocks = dense_blockmask.sum(dim=-1, dtype=torch.int32)
+        indices = dense_blockmask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
+        return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
+
+    def forward(self, input_ids=None, attention_mask=None, position_ids=None, sliding_window_num_blocks=None,
+                input_seq=None, target_seq=None):
+        # Support both training and inference modes
+        is_training = target_seq is not None
+
+        # Handle input from either input_ids (for APBPB) or input_seq (for regular use)
+        if input_ids is not None:
+            input_seq = input_ids
+        elif input_seq is None and not is_training:
+            raise ValueError("Either input_ids or input_seq must be provided")
+
+        # Handle single token or sequence input
+        is_single_token = input_seq.ndim == 0
+        if is_single_token:
+            input_seq = input_seq.unsqueeze(0)
+
+        # Check if input is batched or not
+        is_batched = input_seq.ndim == 2
+        if not is_batched:
+            input_seq = input_seq.unsqueeze(0)  # Add batch dimension
+
+        # Set default sliding window blocks if not provided
+        if sliding_window_num_blocks is None and attention_mask is None:
+            sliding_window_num_blocks = torch.tensor(max(1, input_seq.size(-1) // 128),
+                                                device=input_seq.device, dtype=torch.int32)
+
+        # Determine which attention mechanism to use
+        if attention_mask is not None:
+            # Custom mask provided for APBPB calculation
+            if device.type == "cuda" and FLEX_ATTENTION_SUPPORTED:
+                # Convert to BlockMask format for each layer
+                block_masks = [self.convert_to_block_mask(attention_mask) for _ in range(len(self.blocks))]
+            else:
+                # For MPS/CPU, use the mask directly
+                block_masks = [attention_mask for _ in range(len(self.blocks))]
+        else:
+            long_bm, short_bm = self.create_blockmasks(input_seq.view(-1), sliding_window_num_blocks)
+
+            # Handle both CUDA with block masks and MPS without them
+            if device.type == "cuda":
+                block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm,
+                            short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+                # Make sure we have enough block masks for all blocks
+                if len(block_masks) < len(self.blocks):
+                    block_masks.extend([long_bm] * (len(self.blocks) - len(block_masks)))
+            else:
+                # On MPS, block masks aren't used, so we'll just provide None
+                block_masks = [None] * len(self.blocks)
+
+            assert len(block_masks) == len(self.blocks)
 
         # Handle value embeddings differently for MPS vs CUDA
         if device.type == "mps":
@@ -552,27 +704,13 @@ class GPT(nn.Module):
             ve = [None] * len(self.blocks)
         else:
             # Original code for CUDA
-            ve = [value_embed(input_seq) for value_embed in self.value_embeds]
+            ve = [value_embed(input_seq.squeeze(0)) for value_embed in self.value_embeds]
             # 012 ... 012 structure on token value embeddings
             ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
             assert len(ve) == len(self.blocks)
 
-        long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
-
-        # Handle both CUDA with block masks and MPS without them
-        if device.type == "cuda":
-            block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm,
-                        short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
-            # Make sure we have enough block masks for all blocks
-            if len(block_masks) < len(self.blocks):
-                block_masks.extend([long_bm] * (len(self.blocks) - len(block_masks)))
-        else:
-            # On MPS, block masks aren't used, so we'll just provide None
-            block_masks = [None] * len(self.blocks)
-
-        assert len(block_masks) == len(self.blocks)
-
-        x = x0 = norm(self.embed(input_seq)[None])
+        # Get initial embeddings
+        x = x0 = norm(self.embed(input_seq))
 
         # U-net design
         skip_connections = []
@@ -580,17 +718,23 @@ class GPT(nn.Module):
         for i in range(len(self.blocks)):
             if i >= n:
                 x = x + self.skip_weights[i - n] * skip_connections.pop()
-            x = self.blocks[i](x, ve[i], x0, block_masks[i])
+            x = self.blocks[i](x, ve[i], x0, block_masks[i], position_ids=position_ids)
             if i < n:
                 skip_connections.append(x)
 
         x = norm(x)
         logits = self.lm_head(x).float()
-        # Sigmoid-based softcapping
+        # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction='sum' if self.training else 'mean')
-        return loss
 
+        # For training, calculate loss and return it
+        if is_training:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq,
+                                  reduction='sum' if self.training else 'mean')
+            return loss
+
+        # For inference, return just the logits
+        return logits
 
 # -----------------------------------------------------------------------------
 # Our own simple Distributed Data Loader
@@ -698,161 +842,45 @@ def sequential_data_generator(filename_pattern: str, batch_size: int):
         pos += batch_size
         yield inputs, targets
 
-# -----------------------------------------------------------------------------
-# int main
-
 @dataclass
 class Hyperparameters:
-    # data
-    train_files = "data/fineweb10B/fineweb_train_*.bin"
-    val_files = "data/fineweb10B/fineweb_val_*.bin"
-    val_tokens = 10240         # Fixed number of tokens for validation
-    train_seq_len = 512        # Training sequence length (512 tokens)
-    val_seq_len = 512          # Validation sequence length (512 tokens)
-    # optimization
-    num_iterations = 1000    # Number of training iterations
-    cooldown_frac = 0.4
-    # architecture
-    vocab_size = 50257
-    num_layers = 12             # At least 6 transformer layers to satisfy the U-net embedding structure
-    num_heads = 4              # Number of attention heads
-    model_dim = 256            # Model dimension
-    # evaluation and logging
-    val_loss_every = 10        # Frequency of validation evaluation
-    save_checkpoint = True
+    # Instance fields that can be passed to constructor
+    vocab_size: int = 50257
+    num_layers: int = 12
+    num_heads: int = 4
+    model_dim: int = 256
+    max_seq_len: int = 512  # Add this to match usage in load_model_from_checkpoint
+    
+    # Other configuration options
+    train_files: str = "data/fineweb10B/fineweb_train_*.bin"
+    val_files: str = "data/fineweb10B/fineweb_val_*.bin"
+    val_tokens: int = 10240
+    train_seq_len: int = 512
+    val_seq_len: int = 512
+    num_iterations: int = 1000
+    cooldown_frac: float = 0.4
+    val_loss_every: int = 10
+    save_checkpoint: bool = True
 args = Hyperparameters()
 
-if cuda_available:
-    device_type = "cuda"
-    rank = int(os.environ.get("RANK", 0))
-    world_size = int(os.environ.get("WORLD_SIZE", 1))
-    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
-    torch.cuda.set_device(device)
-    distributed_training = True
-elif mps_available:
-    device_type = "mps"
-    rank = 0
-    world_size = 1
-    device = torch.device("mps")
-    distributed_training = False
-else:
-    raise RuntimeError("No compatible GPU found, make sure you have CUDA or MPS")
+# Function to initialize model and convert embeddings to bfloat16 if on CUDA
+def init_model(config: Hyperparameters = None):
+    if config is None:
+        config = Hyperparameters()
 
-# Initialize distributed training only for CUDA
-if distributed_training:
-    backend = "nccl"
-    dist.init_process_group(backend="nccl", device_id=device)
-    dist.barrier()
-    master_process = (rank == 0) # this process will do logging, checkpointing etc.
-else:
-    master_process = True
+    model = GPT(vocab_size=config.vocab_size,
+                num_layers=config.num_layers,
+                num_heads=config.num_heads,
+                model_dim=config.model_dim,
+                max_seq_len=config.max_seq_len).to(device)
 
-# begin logging
-logfile = None
-if master_process:
-    run_id = uuid.uuid4()
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id}.txt"
-    print(logfile)
-def print0(s, console=False):
-    if master_process:
-        with open(logfile, "a") as f:
-            if console:
-                print(s)
-            print(s, file=f)
+    # Convert embeddings to bfloat16 on CUDA
+    if device.type == "cuda":
+        for m in model.modules():
+            if isinstance(m, nn.Embedding):
+                m.bfloat16()
 
-# begin by printing this file (the Python code)
-print0(code)
-print0("="*100)
-# log information about the hardware/software environment this is running on
-print0(f"Running Python {sys.version}")
-print0(f"Running PyTorch {torch.version.__version__}")
-if cuda_available:
-    print0(f"PyTorch compiled for CUDA {torch.version.cuda}")
-
-    def nvidia_smi():
-        import subprocess  # avoid top-level import
-        return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
-
-    print0(nvidia_smi())
-
-elif mps_available:
-    print0("Running on Apple MPS (Metal Performance Shaders)")
-    # Add MPS-specific memory info if available
-    try:
-        import platform
-        print0(f"Running on {platform.processor()} with macOS {platform.mac_ver()[0]}")
-    except:
-        pass
-
-else:
-    print0("Running on CPU (No GPU detected)")
-
-print0("="*100)
-
-# Clean up memory before creating the model
-if device.type == "mps":
-    torch.mps.empty_cache()
-elif device.type == "cuda":
-    torch.cuda.empty_cache()
-import gc
-gc.collect()
-
-########################################
-#    Construct model and optimizer     #
-########################################
-
-model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=args.num_layers, num_heads=args.num_heads,
-                       model_dim=args.model_dim, max_seq_len=max(args.train_seq_len, args.val_seq_len)).to(device)
-
-if cuda_available:
-    # Convert embeddings to bfloat16
-    for m in model.modules():
-        if isinstance(m, nn.Embedding):
-            m.bfloat16()
-
-    # Broadcast model parameters
-    for param in model.parameters():
-        dist.broadcast(param.detach(), 0)
-
-# collect the parameters to optimize
-hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-scalar_params = [p for p in model.parameters() if p.ndim < 2]
-head_params = [model.lm_head.weight]
-
-# Select the optimizer based on device type
-if device.type == "cuda":
-    optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
-else:  # MPS case
-    #optimizer2 = torch.optim.AdamW(hidden_matrix_params, lr=0.05, betas=(0.9, 0.95))
-    optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, device="mps")
-
-# First optimizer (same for both CUDA and MPS)
-adam_params = [
-    dict(params=head_params, lr=0.22),
-    dict(params=embed_params, lr=0.6),
-    dict(params=scalar_params, lr=0.04)
-]
-optimizer1 = torch.optim.AdamW(adam_params, betas=(0.8, 0.95), eps=1e-10)
-
-# Maintain the same structure for optimizers
-optimizers = [optimizer1, optimizer2]
-
-# Store initial learning rate for scheduling
-for opt in optimizers:
-    for group in opt.param_groups:
-        group["initial_lr"] = group["lr"]
-
-# learning rate schedule: stable then decay
-def get_lr(step: int):
-    x = step / args.num_iterations  # progress in training
-    assert 0 <= x < 1
-    if x < 1 - args.cooldown_frac:
-        return 1.0  # Keep learning rate at max for most of training
-    else:
-        w = (1 - x) / args.cooldown_frac
-        return w * 1.0 + (1 - w) * 0.1  # Linearly decay to 0.1x initial LR
+    return model
 
 # attention window size schedule: linearly increase
 @lru_cache(1)
@@ -871,158 +899,298 @@ def get_window_size_blocks(step: int):
     window_size = next_multiple_of_n(1728 * x, n=128)
     return get_window_size_blocks_helper(window_size)
 
-# Compile model ONLY for CUDA, not MPS
-if device.type == "cuda":
-    try:
-        model = torch.compile(model, dynamic=False)
-        print0("Model compiled successfully")
-    except Exception as e:
-        print0(f"Warning: Model compilation failed: {e}")
-else:
-    print0(f"Skipping model compilation on {device.type}")
+def main():
+    # -----------------------------------------------------------------------------
+    # int main
+    if cuda_available:
+        device_type = "cuda"
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", 0)))
+        torch.cuda.set_device(device)
+        distributed_training = True
+    elif mps_available:
+        device_type = "mps"
+        rank = 0
+        world_size = 1
+        device = torch.device("mps")
+        distributed_training = False
+    else:
+        raise RuntimeError("No compatible GPU found, make sure you have CUDA or MPS")
 
-########################################
-#            Warmup kernels            #
-########################################
+    # Initialize distributed training only for CUDA
+    if distributed_training:
+        backend = "nccl"
+        dist.init_process_group(backend="nccl", device_id=device)
+        dist.barrier()
+        master_process = (rank == 0) # this process will do logging, checkpointing etc.
+    else:
+        master_process = True
 
-# Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 10
-initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                     optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-for _ in range(warmup_steps):
-    inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device=device)
-    model(inputs.to(torch.int32), targets, get_window_size_blocks(0)).backward()
-    if device.type == "cuda":
+    # begin logging
+    logfile = None
+    if master_process:
+        run_id = uuid.uuid4()
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{run_id}.txt"
+        print(logfile)
+    def print0(s, console=False):
+        if master_process:
+            with open(logfile, "a") as f:
+                if console:
+                    print(s)
+                print(s, file=f)
+
+    # begin by printing this file (the Python code)
+    print0(code)
+    print0("="*100)
+    # log information about the hardware/software environment this is running on
+    print0(f"Running Python {sys.version}")
+    print0(f"Running PyTorch {torch.version.__version__}")
+    if cuda_available:
+        print0(f"PyTorch compiled for CUDA {torch.version.cuda}")
+
+        def nvidia_smi():
+            import subprocess  # avoid top-level import
+            return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
+
+        print0(nvidia_smi())
+
+    elif mps_available:
+        print0("Running on Apple MPS (Metal Performance Shaders)")
+        # Add MPS-specific memory info if available
+        try:
+            import platform
+            print0(f"Running on {platform.processor()} with macOS {platform.mac_ver()[0]}")
+        except:
+            pass
+
+    else:
+        print0("Running on CPU (No GPU detected)")
+
+    print0("="*100)
+
+    # Clean up memory before creating the model
+    if device.type == "mps":
+        torch.mps.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+
+    ########################################
+    #    Construct model and optimizer     #
+    ########################################
+
+    model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=args.num_layers, num_heads=args.num_heads,
+                        model_dim=args.model_dim, max_seq_len=max(args.train_seq_len, args.val_seq_len)).to(device)
+
+    if cuda_available:
+        # Convert embeddings to bfloat16
+        for m in model.modules():
+            if isinstance(m, nn.Embedding):
+                m.bfloat16()
+
+        # Broadcast model parameters
         for param in model.parameters():
-            if param.grad is not None:  # Check if grad exists before all_reduce
-                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    for opt in optimizers:
-        opt.step()
-    model.zero_grad(set_to_none=True)
-model.load_state_dict(initial_state["model"])
-for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
-    opt.load_state_dict(opt_state)
+            dist.broadcast(param.detach(), 0)
 
-del initial_state # Free up memory
+    # collect the parameters to optimize
+    hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+    embed_params = [p for n, p in model.named_parameters() if "embed" in n]
+    scalar_params = [p for p in model.parameters() if p.ndim < 2]
+    head_params = [model.lm_head.weight]
 
-
-########################################
-#        Training and validation       #
-########################################
-
-# Use correct data generator based on backend
-if device.type == "cuda":
-    train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
-    val_loader = distributed_data_generator(args.val_files, world_size * args.val_seq_len, rank, world_size)
-else:  # Use sequential loading on MPS
-    train_loader = sequential_data_generator(args.train_files, args.train_seq_len)
-    val_loader = sequential_data_generator(args.val_files, args.val_seq_len)
-
-training_time_ms = 0
-
-# start the clock
-if device.type == "cuda":
-    torch.cuda.synchronize()
-t0 = time.perf_counter()
-
-# begin training
-train_steps = args.num_iterations
-for step in range(train_steps + 1):
-    last_step = (step == train_steps)
-
-        # --------------- VALIDATION SECTION -----------------
-    if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        training_time_ms += 1000 * (time.perf_counter() - t0)
-
-        print0(f"Starting validation at step {step}/{train_steps}...", console=True)
-        model.eval()
-        val_loss = 0
-        val_steps = args.val_tokens // args.val_seq_len
-        with torch.no_grad():
-            for val_step in range(val_steps):
-                if val_step == 0:
-                    print0(f"  Running validation step 1/{val_steps}...", console=True)
-                inputs, targets = next(val_loader)
-                batch_loss = model(inputs, targets, get_window_size_blocks(step))
-                val_loss += batch_loss
-                if val_step == val_steps - 1:
-                    print0(f"  Completed validation step {val_steps}/{val_steps}", console=True)
-
-        val_loss /= val_steps
-
-        if device.type == "cuda":
-            dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-
-        # More detailed logging
-        print0(f"RESULT - step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-        model.train()
-
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-
-    if last_step:
-        if master_process and args.save_checkpoint:
-            try:
-                checkpoint_dir = f"logs/{run_id}"
-                checkpoint_file = f"{checkpoint_dir}/state_step{step:06d}.pt"
-
-                print0(f"Attempting to save checkpoint to {checkpoint_file}", console=True)
-
-                os.makedirs(checkpoint_dir, exist_ok=True)
-
-                log = dict(
-                    step=step,
-                    code=code,
-                    model=model.state_dict(),
-                    optimizers=[opt.state_dict() for opt in optimizers]
-                )
-
-                torch.save(log, checkpoint_file)
-                print0(f"Successfully saved checkpoint to {checkpoint_file}", console=True)
-            except Exception as e:
-                print0(f"ERROR saving checkpoint: {str(e)}", console=True)
-        else:
-            print0(f"Checkpoint saving skipped: master_process={master_process}, save_checkpoint={args.save_checkpoint}", console=True)
-        break  # End training
-
-    # --------------- TRAINING SECTION -----------------
-    inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
-
+    # Select the optimizer based on device type
     if device.type == "cuda":
-        for param in model.parameters():
-            if param.grad is not None:  # Check if grad exists before all_reduce
-                dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+    else:  # MPS case
+        #optimizer2 = torch.optim.AdamW(hidden_matrix_params, lr=0.05, betas=(0.9, 0.95))
+        optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size, device="mps")
 
+    # First optimizer (same for both CUDA and MPS)
+    adam_params = [
+        dict(params=head_params, lr=0.22),
+        dict(params=embed_params, lr=0.6),
+        dict(params=scalar_params, lr=0.04)
+    ]
+    optimizer1 = torch.optim.AdamW(adam_params, betas=(0.8, 0.95), eps=1e-10)
+
+    # Maintain the same structure for optimizers
+    optimizers = [optimizer1, optimizer2]
+
+    # Store initial learning rate for scheduling
     for opt in optimizers:
         for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
+            group["initial_lr"] = group["lr"]
 
+    # learning rate schedule: stable then decay
+    def get_lr(step: int):
+        x = step / args.num_iterations  # progress in training
+        assert 0 <= x < 1
+        if x < 1 - args.cooldown_frac:
+            return 1.0  # Keep learning rate at max for most of training
+        else:
+            w = (1 - x) / args.cooldown_frac
+            return w * 1.0 + (1 - w) * 0.1  # Linearly decay to 0.1x initial LR
+
+
+
+    # Compile model ONLY for CUDA, not MPS
     if device.type == "cuda":
-        for group in optimizer2.param_groups:
-            frac = min(step / 300, 1)
-            group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+        try:
+            model = torch.compile(model, dynamic=False)
+            print0("Model compiled successfully")
+        except Exception as e:
+            print0(f"Warning: Model compilation failed: {e}")
+    else:
+        print0(f"Skipping model compilation on {device.type}")
 
-    for opt in optimizers:
-        opt.step()
+    ########################################
+    #            Warmup kernels            #
+    ########################################
 
-    model.zero_grad(set_to_none=True)
+    # Warmup the training kernels, then re-initialize the state so we aren't cheating
+    warmup_steps = 10
+    initial_state = dict(model=copy.deepcopy(model.state_dict()),
+                        optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
+    for _ in range(warmup_steps):
+        inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device=device)
+        model(input_ids=inputs.to(torch.int32), target_seq= targets, sliding_window_num_blocks=get_window_size_blocks(0), position_ids=None).backward()
+        if device.type == "cuda":
+            for param in model.parameters():
+                if param.grad is not None:  # Check if grad exists before all_reduce
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        for opt in optimizers:
+            opt.step()
+        model.zero_grad(set_to_none=True)
+    model.load_state_dict(initial_state["model"])
+    for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
+        opt.load_state_dict(opt_state)
 
-    # Only print status periodically to avoid console flooding
-    if step % 10 == 0:
-        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-        print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    del initial_state # Free up memory
 
-# Print final memory usage information
-if device.type == "cuda":
-    print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
-           f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
-elif device.type == "mps":
-    print0(f"Training completed on MPS device", console=True)
 
-# Clean up distributed resources
-if device.type == "cuda":
-    dist.destroy_process_group()
+    ########################################
+    #        Training and validation       #
+    ########################################
+
+    # Use correct data generator based on backend
+    if device.type == "cuda":
+        train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
+        val_loader = distributed_data_generator(args.val_files, world_size * args.val_seq_len, rank, world_size)
+    else:  # Use sequential loading on MPS
+        train_loader = sequential_data_generator(args.train_files, args.train_seq_len)
+        val_loader = sequential_data_generator(args.val_files, args.val_seq_len)
+
+    training_time_ms = 0
+
+    # start the clock
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    # begin training
+    train_steps = args.num_iterations
+    for step in range(train_steps + 1):
+        last_step = (step == train_steps)
+
+            # --------------- VALIDATION SECTION -----------------
+        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            training_time_ms += 1000 * (time.perf_counter() - t0)
+
+            print0(f"Starting validation at step {step}/{train_steps}...", console=True)
+            model.eval()
+            val_loss = 0
+            val_steps = args.val_tokens // args.val_seq_len
+            with torch.no_grad():
+                for val_step in range(val_steps):
+                    if val_step == 0:
+                        print0(f"  Running validation step 1/{val_steps}...", console=True)
+                    inputs, targets = next(val_loader)
+                    batch_loss = model(input_ids=inputs, target_seq=targets, sliding_window_num_blocks=get_window_size_blocks(step))
+                    val_loss += batch_loss
+                    if val_step == val_steps - 1:
+                        print0(f"  Completed validation step {val_steps}/{val_steps}", console=True)
+
+            val_loss /= val_steps
+
+            if device.type == "cuda":
+                dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
+
+            # More detailed logging
+            print0(f"RESULT - step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+            model.train()
+
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t0 = time.perf_counter()
+
+        if last_step:
+            if master_process and args.save_checkpoint:
+                try:
+                    checkpoint_dir = f"logs/{run_id}"
+                    checkpoint_file = f"{checkpoint_dir}/state_step{step:06d}.pt"
+
+                    print0(f"Attempting to save checkpoint to {checkpoint_file}", console=True)
+
+                    os.makedirs(checkpoint_dir, exist_ok=True)
+
+                    log = dict(
+                        step=step,
+                        code=code,
+                        model=model.state_dict(),
+                        optimizers=[opt.state_dict() for opt in optimizers]
+                    )
+
+                    torch.save(log, checkpoint_file)
+                    print0(f"Successfully saved checkpoint to {checkpoint_file}", console=True)
+                except Exception as e:
+                    print0(f"ERROR saving checkpoint: {str(e)}", console=True)
+            else:
+                print0(f"Checkpoint saving skipped: master_process={master_process}, save_checkpoint={args.save_checkpoint}", console=True)
+            break  # End training
+
+        # --------------- TRAINING SECTION -----------------
+        inputs, targets = next(train_loader)
+        model(input_ids=inputs, target_seq=targets, sliding_window_num_blocks=get_window_size_blocks(step)).backward()
+
+        if device.type == "cuda":
+            for param in model.parameters():
+                if param.grad is not None:  # Check if grad exists before all_reduce
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * get_lr(step)
+
+        if device.type == "cuda":
+            for group in optimizer2.param_groups:
+                frac = min(step / 300, 1)
+                group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+
+        for opt in optimizers:
+            opt.step()
+
+        model.zero_grad(set_to_none=True)
+
+        # Only print status periodically to avoid console flooding
+        if step % 10 == 0:
+            approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+            print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+    # Print final memory usage information
+    if device.type == "cuda":
+        print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
+            f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
+    elif device.type == "mps":
+        print0(f"Training completed on MPS device", console=True)
+
+    # Clean up distributed resources
+    if device.type == "cuda":
+        dist.destroy_process_group()
+
+if __name__ == "__main__":
+    main()
