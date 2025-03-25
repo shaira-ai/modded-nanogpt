@@ -377,6 +377,8 @@ class Rotary(nn.Module):
 
         # Apply rotary embeddings
         x1, x2 = x_BTHD.chunk(2, dim=-1)
+
+        # Apply rotation
         y1 = x1 * cos + x2 * sin
         y2 = x1 * (-sin) + x2 * cos
 
@@ -390,6 +392,7 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         hdim = num_heads * head_dim
+
         std = 0.5 * (dim ** -0.5)
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
@@ -507,7 +510,6 @@ class Block(nn.Module):
             x = x + self.attn(norm(x), ve, block_mask, position_ids=position_ids)
         x = x + self.mlp(norm(x))
         return x
-
 
 # -----------------------------------------------------------------------------
 # The main model
@@ -900,8 +902,6 @@ def get_window_size_blocks(step: int):
     return get_window_size_blocks_helper(window_size)
 
 def main():
-    # -----------------------------------------------------------------------------
-    # int main
     if cuda_available:
         device_type = "cuda"
         rank = int(os.environ.get("RANK", 0))
@@ -1033,7 +1033,6 @@ def main():
         else:
             w = (1 - x) / args.cooldown_frac
             return w * 1.0 + (1 - w) * 0.1  # Linearly decay to 0.1x initial LR
-
 
 
     # Compile model ONLY for CUDA, not MPS
