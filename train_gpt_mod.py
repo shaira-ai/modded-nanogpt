@@ -353,27 +353,62 @@ class Rotary(nn.Module):
     def forward(self, x_BTHD: Tensor, position_ids=None):
         # Support custom position IDs for APBPB calculation
         B, T, H, D = x_BTHD.shape
+        device = x_BTHD.device  # Get device from input tensor
+
+        # Make sure cos and sin are on the same device as the input
+        cos_device = self.cos.to(device)
+        sin_device = self.sin.to(device)
 
         if position_ids is not None:
+            # Move position_ids to the same device if needed
+            if position_ids.device != device:
+                position_ids = position_ids.to(device)
+                
             # Custom positions - validate and use them
-            max_pos = self.cos.size(0) - 1
+            max_pos = cos_device.size(0) - 1
 
-            # Ensure positions are within bounds
-            positions = torch.clamp(position_ids, 0, max_pos)
-
-            # Handle the shape based on how position_ids is provided
-            # position_ids might be [B, T] or just [T]
-            if positions.dim() == 1:
-                # Single sequence of positions [T]
-                positions = positions.unsqueeze(0)  # [1, T]
-
-            # Get cos/sin for these specific positions
-            cos = torch.index_select(self.cos, 0, positions.view(-1)).view(B, T, 1, -1)
-            sin = torch.index_select(self.sin, 0, positions.view(-1)).view(B, T, 1, -1)
+            # Check if positions contain float values
+            if position_ids.dtype in [torch.float32, torch.float64]:
+                # Handle float positions with interpolation
+                positions_floor = position_ids.floor().to(torch.int64)
+                positions_ceil = position_ids.ceil().to(torch.int64)
+                fractions = position_ids - positions_floor
+                
+                # Ensure positions are within valid range
+                positions_floor = torch.clamp(positions_floor, 0, max_pos)
+                positions_ceil = torch.clamp(positions_ceil, 0, max_pos)
+                
+                # Handle the shape based on how position_ids is provided
+                if positions_floor.dim() == 1:
+                    positions_floor = positions_floor.unsqueeze(0)
+                    positions_ceil = positions_ceil.unsqueeze(0)
+                    fractions = fractions.unsqueeze(0)
+                
+                # Look up values for floor and ceiling positions
+                cos_floor = torch.index_select(cos_device, 0, positions_floor.view(-1)).view(B, T, 1, -1)
+                sin_floor = torch.index_select(sin_device, 0, positions_floor.view(-1)).view(B, T, 1, -1)
+                cos_ceil = torch.index_select(cos_device, 0, positions_ceil.view(-1)).view(B, T, 1, -1)
+                sin_ceil = torch.index_select(sin_device, 0, positions_ceil.view(-1)).view(B, T, 1, -1)
+                
+                # Linearly interpolate based on fractional part
+                fractions = fractions.view(B, T, 1, 1)
+                cos = cos_floor * (1 - fractions) + cos_ceil * fractions
+                sin = sin_floor * (1 - fractions) + sin_ceil * fractions
+            else:
+                # Integer positions - ensure they're within bounds and on correct device
+                positions = torch.clamp(position_ids, 0, max_pos)
+                
+                # Handle the shape based on how position_ids is provided
+                if positions.dim() == 1:
+                    positions = positions.unsqueeze(0)  # [1, T]
+                
+                # Get cos/sin for these specific positions
+                cos = torch.index_select(cos_device, 0, positions.view(-1)).view(B, T, 1, -1)
+                sin = torch.index_select(sin_device, 0, positions.view(-1)).view(B, T, 1, -1)
         else:
             # Standard sequential positions
-            cos, sin = self.cos[:x_BTHD.size(-3)].unsqueeze(0).unsqueeze(2), \
-                   self.sin[:x_BTHD.size(-3)].unsqueeze(0).unsqueeze(2)
+            cos = cos_device[:T].unsqueeze(0).unsqueeze(2)
+            sin = sin_device[:T].unsqueeze(0).unsqueeze(2)
 
         # Apply rotary embeddings
         x1, x2 = x_BTHD.chunk(2, dim=-1)
@@ -854,8 +889,8 @@ class Hyperparameters:
     max_seq_len: int = 512  # Add this to match usage in load_model_from_checkpoint
     
     # Other configuration options
-    train_files: str = "data/fineweb10B/fineweb_train_*.bin"
-    val_files: str = "data/fineweb10B/fineweb_val_*.bin"
+    train_files: str = "data/fineweb10B/fineweb_train_000001.bin"
+    val_files: str = "data/fineweb10B/fineweb_val_000000.bin"
     val_tokens: int = 10240
     train_seq_len: int = 512
     val_seq_len: int = 512
@@ -863,6 +898,7 @@ class Hyperparameters:
     cooldown_frac: float = 0.4
     val_loss_every: int = 10
     save_checkpoint: bool = True
+    use_segmentation_invariant: bool = False
 args = Hyperparameters()
 
 # Function to initialize model and convert embeddings to bfloat16 if on CUDA
@@ -1045,43 +1081,76 @@ def main():
     else:
         print0(f"Skipping model compilation on {device.type}")
 
-    ########################################
-    #            Warmup kernels            #
-    ########################################
-
-    # Warmup the training kernels, then re-initialize the state so we aren't cheating
-    warmup_steps = 10
-    initial_state = dict(model=copy.deepcopy(model.state_dict()),
-                        optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-    for _ in range(warmup_steps):
-        inputs = targets = torch.randint(0, args.vocab_size, size=(args.train_seq_len,), device=device)
-        model(input_ids=inputs.to(torch.int32), target_seq= targets, sliding_window_num_blocks=get_window_size_blocks(0), position_ids=None).backward()
-        if device.type == "cuda":
-            for param in model.parameters():
-                if param.grad is not None:  # Check if grad exists before all_reduce
-                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-        for opt in optimizers:
-            opt.step()
-        model.zero_grad(set_to_none=True)
-    model.load_state_dict(initial_state["model"])
-    for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
-        opt.load_state_dict(opt_state)
-
-    del initial_state # Free up memory
-
-
-    ########################################
-    #        Training and validation       #
-    ########################################
 
     # Use correct data generator based on backend
     if device.type == "cuda":
         train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
         val_loader = distributed_data_generator(args.val_files, world_size * args.val_seq_len, rank, world_size)
     else:  # Use sequential loading on MPS
+        warmup_loader = sequential_data_generator(args.train_files, args.train_seq_len)
         train_loader = sequential_data_generator(args.train_files, args.train_seq_len)
         val_loader = sequential_data_generator(args.val_files, args.val_seq_len)
 
+
+    ########################################
+    #            Warmup kernels            #
+    ########################################
+
+    from neon.zig.bindings import get_token_to_id_mapping
+    from tools.tokenizer_utils import seg_inv_enc
+    import tiktoken
+    from tools.trainable_position_encoding import TrainableSegInvPositionalEncoding
+    tokenizer = tiktoken.get_encoding("gpt2")
+    token_dict = get_token_to_id_mapping(tokenizer)
+
+    # Initialize the trainable positional encoding
+    trainable_pe = TrainableSegInvPositionalEncoding(token_dict)
+    trainable_pe = trainable_pe.to(device)  # Move to the same device as your model
+
+    # Add the trainable_pe parameters to your optimizer
+    for opt in optimizers:
+        # Create a new parameter group for positional encoding
+        opt.add_param_group({'params': trainable_pe.parameters(), 
+                    'initial_lr': opt.param_groups[0]['initial_lr']})
+
+    warmup_steps = 10
+    initial_state = dict(
+        model=copy.deepcopy(model.state_dict()),
+        trainable_pe=copy.deepcopy(trainable_pe.state_dict()),
+        optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]
+    )
+    
+    for _ in range(warmup_steps):
+        inputs, targets = next(warmup_loader)
+        positions, attn_mask = seg_inv_enc(inputs, token_dict, max_seq_len=args.max_seq_len, trainable_pe=trainable_pe)
+        attn_mask = attn_mask.to(device)
+        model(input_ids=inputs.to(torch.int32),  target_seq= targets, sliding_window_num_blocks=get_window_size_blocks(0), position_ids=positions, attention_mask=attn_mask).backward()
+        if device.type == "cuda":
+            for param in model.parameters():
+                if param.grad is not None:
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+            # Also reduce gradients for trainable_pe
+            for param in trainable_pe.parameters():
+                if param.grad is not None:
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+        
+        for opt in optimizers:
+            opt.step()
+        
+        model.zero_grad(set_to_none=True)
+        trainable_pe.zero_grad(set_to_none=True)
+
+    # Restore initial state
+    model.load_state_dict(initial_state["model"])
+    trainable_pe.load_state_dict(initial_state["trainable_pe"])
+    for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
+        opt.load_state_dict(opt_state)
+
+    del initial_state  # Free up memory
+
+    ########################################
+    #        Training and validation       #
+    ########################################
     training_time_ms = 0
 
     # start the clock
@@ -1094,7 +1163,7 @@ def main():
     for step in range(train_steps + 1):
         last_step = (step == train_steps)
 
-            # --------------- VALIDATION SECTION -----------------
+        # --------------- VALIDATION SECTION -----------------
         if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
             if device.type == "cuda":
                 torch.cuda.synchronize()
@@ -1102,6 +1171,7 @@ def main():
 
             print0(f"Starting validation at step {step}/{train_steps}...", console=True)
             model.eval()
+            trainable_pe.eval()  # Set trainable_pe to evaluation mode too
             val_loss = 0
             val_steps = args.val_tokens // args.val_seq_len
             with torch.no_grad():
@@ -1109,7 +1179,14 @@ def main():
                     if val_step == 0:
                         print0(f"  Running validation step 1/{val_steps}...", console=True)
                     inputs, targets = next(val_loader)
-                    batch_loss = model(input_ids=inputs, target_seq=targets, sliding_window_num_blocks=get_window_size_blocks(step))
+                    # Generate positions using trainable_pe
+                    positions, attn_mask = seg_inv_enc(inputs, token_dict, 
+                                                    max_seq_len=args.max_seq_len, 
+                                                    trainable_pe=trainable_pe)
+                    attn_mask = attn_mask.to(device)
+                    batch_loss = model(input_ids=inputs, target_seq=targets, 
+                                    sliding_window_num_blocks=get_window_size_blocks(step),
+                                    position_ids=positions, attention_mask=attn_mask)
                     val_loss += batch_loss
                     if val_step == val_steps - 1:
                         print0(f"  Completed validation step {val_steps}/{val_steps}", console=True)
@@ -1122,6 +1199,7 @@ def main():
             # More detailed logging
             print0(f"RESULT - step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
             model.train()
+            trainable_pe.train()  # Set trainable_pe back to training mode
 
             if device.type == "cuda":
                 torch.cuda.synchronize()
@@ -1141,6 +1219,7 @@ def main():
                         step=step,
                         code=code,
                         model=model.state_dict(),
+                        trainable_pe=trainable_pe.state_dict(),  # Save trainable_pe state
                         optimizers=[opt.state_dict() for opt in optimizers]
                     )
 
@@ -1154,13 +1233,30 @@ def main():
 
         # --------------- TRAINING SECTION -----------------
         inputs, targets = next(train_loader)
-        model(input_ids=inputs, target_seq=targets, sliding_window_num_blocks=get_window_size_blocks(step)).backward()
+        
+        # Generate positions using trainable_pe
+        positions, attn_mask = seg_inv_enc(inputs, token_dict, 
+                                        max_seq_len=args.max_seq_len, 
+                                        trainable_pe=trainable_pe)
+        attn_mask = attn_mask.to(device)
+        
+        # Forward pass with positions and attention mask
+        model(input_ids=inputs, target_seq=targets, 
+            sliding_window_num_blocks=get_window_size_blocks(step),
+            position_ids=positions, attention_mask=attn_mask).backward()
 
         if device.type == "cuda":
+            # Reduce gradients for model parameters
             for param in model.parameters():
                 if param.grad is not None:  # Check if grad exists before all_reduce
                     dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
+            
+            # Reduce gradients for trainable_pe parameters
+            for param in trainable_pe.parameters():
+                if param.grad is not None:  # Check if grad exists
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
 
+        # Update learning rates
         for opt in optimizers:
             for group in opt.param_groups:
                 group["lr"] = group["initial_lr"] * get_lr(step)
@@ -1170,10 +1266,13 @@ def main():
                 frac = min(step / 300, 1)
                 group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
 
+        # Optimization step
         for opt in optimizers:
             opt.step()
 
+        # Zero gradients
         model.zero_grad(set_to_none=True)
+        trainable_pe.zero_grad(set_to_none=True)  # Zero trainable_pe gradients
 
         # Only print status periodically to avoid console flooding
         if step % 10 == 0:

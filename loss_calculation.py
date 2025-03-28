@@ -313,22 +313,36 @@ def calculate_optimized_apbpb(document, encoder, model, device):
     # Step 3: Build the ancestry relationships
     print("Building ancestry relationships...")
     ancestry = {}
-    
+    seen_tokens = set()  # Track tokens we've already processed
     separator_pos = (separator_id, 0)
-    
-    for prefix_len, segmentation in all_segmentations.items():
+
+    # Process prefixes in ascending order
+    for prefix_len in sorted(all_segmentations.keys()):
+        segmentation = all_segmentations[prefix_len]
+        
+        # For each token in this segmentation
         for i, (token_id, token_text, byte_pos) in enumerate(segmentation):
-            ancestors = []
+            token_key = (token_id, byte_pos)
             
-            if not (token_id == separator_id and byte_pos == 0):
+            # Skip if we've already calculated ancestors for this token
+            if token_key in seen_tokens:
+                continue
+            
+            # Mark this token as processed
+            seen_tokens.add(token_key)
+            
+            # Calculate ancestors
+            ancestors = []
+            if token_key != separator_pos:
                 ancestors.append(separator_pos)
                 
-            # Add preceding tokens in this segmentation as ancestors
-            for j in range(i):
-                ancestor_id, ancestor_text, ancestor_pos = segmentation[j]
-                ancestors.append((ancestor_id, ancestor_pos))
+                # Add preceding tokens in this segmentation as ancestors
+                for j in range(i):
+                    ancestor_id, _, ancestor_pos = segmentation[j]
+                    ancestors.append((ancestor_id, ancestor_pos))
             
-            ancestry[(token_id, byte_pos)] = ancestors
+            # Store the ancestors for this token
+            ancestry[token_key] = ancestors
             
     # Print ancestry relationships for debugging
     print("\nAncestry relationships:")
@@ -367,20 +381,35 @@ def calculate_optimized_apbpb(document, encoder, model, device):
             print(f"  ... and {remaining} more tokens (omitted for brevity)")
             break
     
-    # Step 4: Build attention mask
+    # Step 4: Build attention mask (optimized version)
     print("\nBuilding attention mask...")
     attn_mask = torch.zeros((len(token_positions), len(token_positions)), dtype=torch.float32)
-    
+
+    # 1. Fill the diagonal in a single operation (self-attention)
+    attn_mask.fill_diagonal_(1.0)
+
+    # 2. Collect indices for ancestral relationships
+    i_indices = []
+    j_indices = []
+
+    # Build lists of indices where mask should be 1 based on ancestry
     for i, (token_id, byte_pos, token_text) in enumerate(token_positions):
-        # Token can attend to itself
-        attn_mask[i, i] = 1
-        
-        # Token can attend to its ancestors
         if (token_id, byte_pos) in ancestry:
             for ancestor_id, ancestor_pos in ancestry[(token_id, byte_pos)]:
-                if (ancestor_id, ancestor_pos) in position_map:
-                    j = position_map[(ancestor_id, ancestor_pos)]
-                    attn_mask[i, j] = 1
+                # Skip self-attention (already handled by diagonal filling)
+                if (ancestor_id, ancestor_pos) != (token_id, byte_pos):
+                    if (ancestor_id, ancestor_pos) in position_map:
+                        j = position_map[(ancestor_id, ancestor_pos)]
+                        i_indices.append(i)
+                        j_indices.append(j)
+
+    # 3. Apply all ancestry-based updates in a single operation
+    if i_indices:  # Only proceed if we have indices to update
+        i_tensor = torch.tensor(i_indices, dtype=torch.long)
+        j_tensor = torch.tensor(j_indices, dtype=torch.long)
+        
+        # Set all mask values in a single operation
+        attn_mask[i_tensor, j_tensor] = 1.0
     
     # Print visualization of the attention mask
     print("\nAttention Mask Visualization:")
@@ -981,7 +1010,7 @@ def main():
             return
     else:
         print("No checkpoint provided. Using default model.")
-        model = load_model_from_checkpoint('logs/e4d007cc-b53b-42ee-90d4-75ad9d35dfa7/state_step001000.pt')
+        model = load_model_from_checkpoint('logs/53accdf8-47de-4874-b27d-afa1240c5b0e/state_step001000.pt')
     
     # Test model with a simple input
     print("Testing model inference...")
