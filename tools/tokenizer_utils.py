@@ -2,11 +2,36 @@ import tiktoken
 import torch
 import numpy as np
 
-def optimized_find_all_tokens(text, token_dict):
-    """Optimized token finder using length-based filtering."""
+def find_all_tokens(text, token_dict):
+    """
+    Optimized token finder using length-based filtering with special handling for <|endoftext|> tokens.
+    
+    Args:
+        text: Input text as string or bytes
+        token_dict: Dictionary mapping token bytes to token IDs
+        separator_id: The ID for the special <|endoftext|> token (default: 50256)
+        
+    Returns:
+        List of tokens with positions and IDs
+    """
     if isinstance(text, str):
         text = text.encode("utf-8")
     
+    separator_id=50256
+    # Find the byte representation of <|endoftext|> in the text
+    eot_pattern = b"<|endoftext|>"
+    eot_positions = []
+    
+    # Find all occurrences of <|endoftext|> in the text
+    pos = 0
+    while True:
+        pos = text.find(eot_pattern, pos)
+        if pos == -1:
+            break
+        eot_positions.append(pos)
+        pos += len(eot_pattern)
+    
+    # Process the text normally to find all tokens
     valid_tokens = []
     text_length = len(text)
     
@@ -22,11 +47,29 @@ def optimized_find_all_tokens(text, token_dict):
             tokens_by_first_byte[first_byte].append((token_bytes, token_id))
             max_token_length = max(max_token_length, len(token_bytes))
     
-    for start_pos in range(text_length):
+    # Track positions to skip (where <|endoftext|> tokens are)
+    skip_ranges = []
+    for pos in eot_positions:
+        skip_ranges.append((pos, pos + len(eot_pattern)))
+    
+    # Find all valid tokens, skipping the <|endoftext|> positions
+    start_pos = 0
+    while start_pos < text_length:
+        # Check if this position is inside an <|endoftext|> region
+        skip = False
+        for skip_start, skip_end in skip_ranges:
+            if skip_start <= start_pos < skip_end:
+                skip = True
+                start_pos = skip_end  # Skip to end of <|endoftext|>
+                break
+        
+        if skip:
+            continue
+            
+        # Get first byte at this position
         if start_pos >= text_length:
             break
             
-        # Get first byte at this position
         current_byte = text[start_pos:start_pos+1]
         
         # Only check tokens that start with this byte
@@ -39,6 +82,12 @@ def optimized_find_all_tokens(text, token_dict):
             for token_bytes, token_id in tokens_by_first_byte[current_byte]:
                 if current_text.startswith(token_bytes):
                     valid_tokens.append((start_pos+1, start_pos+len(token_bytes), token_id, token_bytes))
+        
+        start_pos += 1
+    
+    # Now add the <|endoftext|> tokens with the correct ID
+    for pos in eot_positions:
+        valid_tokens.append((pos+1, pos+len(eot_pattern), separator_id, eot_pattern))
     
     # Sort by position
     valid_tokens.sort(key=lambda x: (x[0], x[1]))
@@ -164,15 +213,8 @@ def seg_inv_enc(input_tensors, token_dict=None, debug=True, max_seq_len=None, tr
         print(f"Finding all tokens in: '{text}'")
     
     # Find all valid tokens in the text
-    valid_tokens = optimized_find_all_tokens(text, token_dict)
+    valid_tokens = find_all_tokens(text, token_dict)
 
-    # Add separator token at position 0
-
-    separator_id = 50256
-    separator_bytes = b"<|endoftext|>"  # Byte representation of the token
-
-    valid_tokens.insert(0, (0, 0, separator_id, separator_bytes))
-    
     if debug:
         print(f"Found {len(valid_tokens)} valid tokens")
     
@@ -373,5 +415,16 @@ def seg_inv_enc(input_tensors, token_dict=None, debug=True, max_seq_len=None, tr
             # Truncate to max_seq_len
             positions = positions[:max_seq_len]
             attn_mask = attn_mask[:max_seq_len, :max_seq_len]
+    
+    # Add this right after you calculate orig_positions and before any truncation
+    print("Original positions (last 10):", orig_positions[-10:].tolist())
+
+    # Add this right before returning the final positions
+    print("Final positions (last 10):", positions[-10:].tolist())
+
+    # For more detailed debugging, you could add this to show the total lengths
+    print(f"Original position tensor length: {len(orig_positions)}")
+    print(f"Final position tensor length: {len(positions)}")
+    print(f"Input tensor length: {len(input_tensors)}")
     
     return positions, final_mask
