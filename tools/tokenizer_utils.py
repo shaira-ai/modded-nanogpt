@@ -416,15 +416,4 @@ def seg_inv_enc(input_tensors, token_dict=None, debug=True, max_seq_len=None, tr
             positions = positions[:max_seq_len]
             attn_mask = attn_mask[:max_seq_len, :max_seq_len]
     
-    # Add this right after you calculate orig_positions and before any truncation
-    print("Original positions (last 10):", orig_positions[-10:].tolist())
-
-    # Add this right before returning the final positions
-    print("Final positions (last 10):", positions[-10:].tolist())
-
-    # For more detailed debugging, you could add this to show the total lengths
-    print(f"Original position tensor length: {len(orig_positions)}")
-    print(f"Final position tensor length: {len(positions)}")
-    print(f"Input tensor length: {len(input_tensors)}")
-    
     return positions, final_mask

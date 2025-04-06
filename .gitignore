@@ -5,3 +5,4 @@ logs/
 .DS_Store
 *.dylib
 *.dylib.o
+.zig-cache
