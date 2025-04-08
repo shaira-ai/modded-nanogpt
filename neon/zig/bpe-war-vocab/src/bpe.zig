@@ -186,19 +186,35 @@ pub const BPE = struct {
         // Add to vocabulary
         try self.id_to_token.put(new_id, new_token);
 
-        // Update all segmentations
-        var string_index: usize = 0;
+        // Create entry for the new token in the inverted index
+        try self.inverted_index.put(new_id, std.ArrayList(types.TokenCount).init(self.allocator));
 
-        var length_it = self.strings.strings_by_length.iterator();
-        while (length_it.next()) |length_entry| {
-            const strings = length_entry.value_ptr.*.items;
+        // Get affected strings using the inverted index
+        const first_occurrences = self.inverted_index.get(pair.first) orelse return;
+        const second_occurrences = self.inverted_index.get(pair.second) orelse return;
 
-            for (strings) |_| {
+        // Create map of string indices where first token appears
+        var first_strings = std.AutoHashMap(usize, void).init(self.allocator);
+        defer first_strings.deinit();
+
+        for (first_occurrences.items) |occurrence| {
+            try first_strings.put(occurrence.string_index, {});
+        }
+
+        // Process only strings that contain both tokens
+        for (second_occurrences.items) |occurrence| {
+            const string_index = occurrence.string_index;
+
+            if (first_strings.contains(string_index)) {
+                // This string contains both tokens - update its segmentation
                 const string_data = self.string_info.getPtr(string_index).?;
                 const old_seg = string_data.segmentation;
 
                 var new_seg = std.ArrayList(usize).init(self.allocator);
                 defer new_seg.deinit();
+
+                // Track how many times the new token appears
+                var new_token_count: usize = 0;
 
                 var i: usize = 0;
                 while (i < old_seg.len) {
@@ -207,6 +223,7 @@ pub const BPE = struct {
                         old_seg[i + 1] == pair.second)
                     {
                         try new_seg.append(new_id);
+                        new_token_count += 1;
                         i += 2;
                     } else {
                         try new_seg.append(old_seg[i]);
@@ -214,15 +231,86 @@ pub const BPE = struct {
                     }
                 }
 
-                // Update segmentation while keeping the FreqString pointer
+                // Only update the inverted index if the new token was actually used
+                if (new_token_count > 0) {
+                    try self.inverted_index.getPtr(new_id).?.append(.{
+                        .string_index = string_index,
+                        .count = new_token_count,
+                    });
+
+                    // Convert to signed integer before negation
+                    const count_delta = -@as(isize, @intCast(new_token_count));
+                    try self.updateTokenCountForString(pair.first, string_index, count_delta);
+                    try self.updateTokenCountForString(pair.second, string_index, count_delta);
+                }
+
+                // Update segmentation
                 self.allocator.free(old_seg);
                 const new_seg_slice = try self.allocator.alloc(usize, new_seg.items.len);
                 std.mem.copyForwards(usize, new_seg_slice, new_seg.items);
                 string_data.segmentation = new_seg_slice;
-
-                string_index += 1;
             }
         }
+    }
+
+    /// Helper function to update token count for a specific string
+    fn updateTokenCountForString(self: *BPE, token_id: usize, string_index: usize, count_delta: isize) !void {
+        // Skip byte tokens (0-255) - we never remove these
+        if (token_id < 256) {
+            return;
+        }
+
+        const token_counts = self.inverted_index.getPtr(token_id) orelse return;
+
+        for (token_counts.items, 0..) |*occurrence, i| {
+            if (occurrence.string_index == string_index) {
+                // Handle decreasing count
+                if (count_delta < 0) {
+                    const abs_delta = @as(usize, @intCast(@abs(count_delta)));
+                    if (occurrence.count <= abs_delta) {
+                        token_counts.items[i].count = 0;
+                    } else {
+                        token_counts.items[i].count -= abs_delta;
+                    }
+                } else {
+                    // Handle increasing count
+                    token_counts.items[i].count += @as(usize, @intCast(count_delta));
+                }
+
+                // If count went to zero, remove this entry
+                if (token_counts.items[i].count == 0) {
+                    _ = token_counts.swapRemove(i);
+                }
+
+                // Check if this token is now unused across ALL strings
+                if (token_counts.items.len == 0) {
+                    try self.pruneUnusedToken(token_id);
+                }
+
+                return;
+            }
+        }
+    }
+
+    /// Remove a token that's no longer used in any string
+    fn pruneUnusedToken(self: *BPE, token_id: usize) !void {
+        std.debug.print("Free pruning: Token {} is no longer used in any string\n", .{token_id});
+
+        // Get the token
+        const token = self.id_to_token.get(token_id) orelse return;
+
+        // Remove from vocabulary
+        self.allocator.free(token.bytes);
+        _ = self.id_to_token.remove(token_id);
+
+        // Remove from inverted index
+        self.inverted_index.getPtr(token_id).?.deinit();
+        _ = self.inverted_index.remove(token_id);
+
+        // Remove from WAR scores if present
+        _ = self.war_scores.remove(token_id);
+
+        std.debug.print("Token pruned. New vocabulary size: {}\n", .{self.id_to_token.count()});
     }
 
     fn findBestPair(self: *BPE) !?types.TokenPair {
@@ -329,19 +417,165 @@ pub const BPE = struct {
 
     /// Calculate WAR scores for all tokens in the vocabulary
     pub fn calculateWAR(self: *BPE) !void {
-        std.debug.print("Calculating WAR scores...\n", .{});
+        std.debug.print("Calculating WAR scores with optimal segmentation...\n", .{});
 
         // Initialize WAR scores map
         self.war_scores = std.AutoHashMap(usize, f64).init(self.allocator);
 
-        // Calculate WAR for each token
-        var token_it = self.id_to_token.valueIterator();
-        while (token_it.next()) |token| {
-            const war = try self.calculateTokenWAR(token.id);
-            try self.war_scores.put(token.id, war);
+        // 1. Quick-filter pass:
+        // Identify the most promising candidates for removal (lowest frequency tokens)
+        var candidates = std.ArrayList(usize).init(self.allocator);
+        defer candidates.deinit();
+
+        // Only consider non-byte tokens
+        var token_it = self.id_to_token.keyIterator();
+        while (token_it.next()) |token_id| {
+            if (token_id.* >= 256) {
+                try candidates.append(token_id.*);
+            }
+        }
+
+        // Sort by initial frequency estimate (ascending)
+        std.sort.heap(usize, candidates.items, self, struct {
+            fn compare(ctx: *BPE, a: usize, b: usize) bool {
+                const a_occurrences = ctx.inverted_index.get(a) orelse return false;
+                const b_occurrences = ctx.inverted_index.get(b) orelse return true;
+                return a_occurrences.items.len < b_occurrences.items.len;
+            }
+        }.compare);
+
+        // Limit to top N candidates
+        const max_candidates = @min(candidates.items.len, 100);
+        if (candidates.items.len > max_candidates) {
+            candidates.items.len = max_candidates;
+        }
+
+        // Cache for optimal segmentations
+        var segmentation_cache = std.AutoHashMap(u64, []usize).init(self.allocator);
+        defer {
+            var cache_it = segmentation_cache.valueIterator();
+            while (cache_it.next()) |seg| {
+                self.allocator.free(seg.*);
+            }
+            segmentation_cache.deinit();
+        }
+
+        // Process each candidate token
+        for (candidates.items) |token_id| {
+            const token_occurrences = self.inverted_index.get(token_id) orelse continue;
+            if (token_occurrences.items.len == 0) continue;
+
+            var total_savings: f64 = 0.0;
+
+            // Process each string where this token appears
+            for (token_occurrences.items) |token_count| {
+                const string_index = token_count.string_index;
+                const string_data = self.string_info.get(string_index) orelse continue;
+                const content = string_data.freq_string.content;
+                const frequency = string_data.freq_string.frequency;
+                const current_seg = string_data.segmentation;
+
+                // Generate cache key: (string_index << 32) | token_id
+                const cache_key = (@as(u64, string_index) << 32) | token_id;
+
+                // Try to get from cache first
+                var optimal_seg: []usize = undefined;
+                if (segmentation_cache.get(cache_key)) |cached_seg| {
+                    optimal_seg = cached_seg;
+                } else {
+                    // Find optimal segmentation without this token
+                    optimal_seg = try self.findOptimalSegmentation(content, token_id);
+
+                    // Cache it for future use
+                    try segmentation_cache.put(cache_key, optimal_seg);
+                }
+
+                // Calculate the token count difference
+                const current_tokens = current_seg.len;
+                const optimal_tokens = optimal_seg.len;
+                const diff = @as(isize, @intCast(optimal_tokens)) - @as(isize, @intCast(current_tokens));
+
+                // Fix type mismatch by converting frequency to isize before multiplication
+                const freq_isize = @as(isize, @intCast(frequency));
+                const token_diff = diff * freq_isize;
+                total_savings += @as(f64, @floatFromInt(token_diff));
+            }
+
+            // Add WAR score to map
+            try self.war_scores.put(token_id, total_savings);
         }
 
         std.debug.print("WAR calculation complete for {} tokens\n", .{self.war_scores.count()});
+    }
+
+    fn findOptimalSegmentation(self: *BPE, content: []const u8, excluded_token_id: usize) ![]usize {
+        const n = content.len;
+
+        // dp[i] = minimum number of tokens needed to segment content[0...i-1]
+        var dp = try self.allocator.alloc(usize, n + 1);
+        defer self.allocator.free(dp);
+
+        // backptr[i] = token id used for best segmentation ending at i
+        var backptr = try self.allocator.alloc(usize, n + 1);
+        defer self.allocator.free(backptr);
+
+        // split_pos[i] = position where best segmentation for i begins
+        var split_pos = try self.allocator.alloc(usize, n + 1);
+        defer self.allocator.free(split_pos);
+
+        // Base case: empty string requires 0 tokens
+        dp[0] = 0;
+
+        // Fill the DP table
+        var i: usize = 1;
+        while (i <= n) : (i += 1) {
+            // Default: if nothing works, use single-byte token
+            dp[i] = dp[i - 1] + 1;
+            backptr[i] = content[i - 1]; // byte token
+            split_pos[i] = i - 1;
+
+            // Try every possible token
+            var token_it = self.id_to_token.iterator();
+            while (token_it.next()) |entry| {
+                const token_id = entry.key_ptr.*;
+                const token = entry.value_ptr.*;
+
+                // Skip the excluded token
+                if (token_id == excluded_token_id) continue;
+
+                const token_len = token.bytes.len;
+
+                // Check if this token can be used here
+                if (token_len <= i and std.mem.eql(u8, token.bytes, content[i - token_len .. i])) {
+                    const new_cost = dp[i - token_len] + 1;
+
+                    if (new_cost < dp[i]) {
+                        dp[i] = new_cost;
+                        backptr[i] = token_id;
+                        split_pos[i] = i - token_len;
+                    }
+                }
+            }
+        }
+
+        // Reconstruct the segmentation using backtracking
+        var result = std.ArrayList(usize).init(self.allocator);
+        defer result.deinit();
+
+        var pos = n;
+        while (pos > 0) {
+            const token_id = backptr[pos];
+            try result.append(token_id);
+            pos = split_pos[pos];
+        }
+
+        // Reverse the result
+        std.mem.reverse(usize, result.items);
+
+        // Return the segmentation - changed var to const
+        const output = try self.allocator.alloc(usize, result.items.len);
+        std.mem.copyForwards(usize, output, result.items);
+        return output;
     }
 
     /// Find the token with the lowest WAR score
@@ -443,8 +677,6 @@ pub const BPE = struct {
     pub fn trainWithWAR(self: *BPE, target_vocab_size: usize) !void {
         try self.train(target_vocab_size);
 
-        try self.buildInvertedIndex();
-
         // Calculate WAR for all tokens
         try self.calculateWAR();
 
@@ -494,7 +726,7 @@ pub const BPE = struct {
     /// run the BPE algorithm to build a vocabulary of the target size
     pub fn train(self: *BPE, target_vocab_size: usize) !void {
         std.debug.print("Starting BPE training with target vocabulary size: {}\n", .{target_vocab_size});
-
+        try self.buildInvertedIndex();
         // run standard BPE until reaching target size
         while (self.id_to_token.count() < target_vocab_size) {
             const best_pair = try self.findBestPair();
@@ -614,6 +846,34 @@ pub fn testBPEWithWAR() !void {
         \\13,international,5
         \\13,comprehensive,3
         \\15,extraordinarily,2
+        \\5,apple,12
+        \\5,peach,9
+        \\6,orange,11
+        \\6,banana,8
+        \\7,avocado,6
+        \\7,penguin,4
+        \\8,kangaroo,3
+        \\8,dolphins,4
+        \\8,buffalos,2
+        \\9,blueberry,7
+        \\9,raspberry,5
+        \\10,blackberry,6
+        \\10,clementine,2
+        \\11,pomegranate,3
+        \\11,chimpanzees,1
+        \\12,architecture,4
+        \\12,philosopher,2
+        \\12,exploration,3
+        \\13,civilization,2
+        \\13,appreciation,1
+        \\14,sustainability,2
+        \\14,responsibility,3
+        \\15,microorganisms,1
+        \\15,misinterpretation,2
+        \\16,characterization,3
+        \\16,misrepresentation,1
+        \\17,counterintuitive,2
+        \\17,incompatibilities,1
     ;
 
     var strings = try input_parser.parseInput(allocator, test_input);
