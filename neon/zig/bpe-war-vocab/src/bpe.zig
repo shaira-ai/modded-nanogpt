@@ -7,50 +7,30 @@ const input_parser = @import("input_parser.zig");
 pub const BPE = struct {
     allocator: std.mem.Allocator,
     // single source of truth for tokens > _ <
-    vocabulary: types.Vocabulary,
-    // fast token lookup map remains essential for performance
     id_to_token: std.AutoHashMap(usize, types.Token),
-    segmentations: std.AutoHashMap(usize, []usize),
+    string_info: std.AutoHashMap(usize, types.StringInfo),
     strings: *input_parser.TopStringsByLength,
     next_token_id: usize,
     // enhanced inverted index with token counts
     inverted_index: std.AutoHashMap(usize, std.ArrayList(types.TokenCount)),
-    // string lookup for efficiency
-    string_index_to_freq_string: std.AutoHashMap(usize, *const types.FreqString),
     war_scores: std.AutoHashMap(usize, f64),
 
     /// Initialize the BPE algorithm with basic byte tokens
     pub fn init(allocator: std.mem.Allocator, strings: *input_parser.TopStringsByLength) !BPE {
         var bpe = BPE{
             .allocator = allocator,
-            .vocabulary = types.Vocabulary.init(allocator),
             .id_to_token = std.AutoHashMap(usize, types.Token).init(allocator),
-            .segmentations = std.AutoHashMap(usize, []usize).init(allocator),
+            .string_info = std.AutoHashMap(usize, types.StringInfo).init(allocator),
             .strings = strings,
             .next_token_id = 256,
             .inverted_index = std.AutoHashMap(usize, std.ArrayList(types.TokenCount)).init(allocator),
-            .string_index_to_freq_string = std.AutoHashMap(usize, *const types.FreqString).init(allocator),
             .war_scores = std.AutoHashMap(usize, f64).init(allocator),
         };
 
         try bpe.initializeByteTokens();
         try bpe.initializeSegmentations();
-        try bpe.buildStringIndexMap();
 
         return bpe;
-    }
-
-    /// Build a mapping from string indices to FreqString pointers for efficient lookup
-    fn buildStringIndexMap(self: *BPE) !void {
-        var string_index: usize = 0;
-        var length_it = self.strings.strings_by_length.iterator();
-        while (length_it.next()) |length_entry| {
-            const strings = length_entry.value_ptr.*.items;
-            for (strings) |*string| {
-                try self.string_index_to_freq_string.put(string_index, string);
-                string_index += 1;
-            }
-        }
     }
 
     pub fn deinit(self: *BPE) void {
@@ -58,14 +38,14 @@ pub const BPE = struct {
         while (token_it.next()) |token| {
             self.allocator.free(token.bytes);
         }
-        self.vocabulary.deinit();
         self.id_to_token.deinit();
-        var seg_it = self.segmentations.iterator();
-        while (seg_it.next()) |entry| {
-            self.allocator.free(entry.value_ptr.*);
+
+        var info_it = self.string_info.valueIterator();
+        while (info_it.next()) |info| {
+            self.allocator.free(info.segmentation);
         }
-        self.segmentations.deinit();
-        self.string_index_to_freq_string.deinit();
+        self.string_info.deinit();
+
         var idx_it = self.inverted_index.valueIterator();
         while (idx_it.next()) |list| {
             list.deinit();
@@ -86,7 +66,6 @@ pub const BPE = struct {
                 .id = i,
             };
 
-            try self.vocabulary.tokens.append(token);
             try self.id_to_token.put(i, token);
         }
     }
@@ -95,22 +74,23 @@ pub const BPE = struct {
     fn initializeSegmentations(self: *BPE) !void {
         var string_index: usize = 0;
 
-        // Iterate through all lengths
         var length_it = self.strings.strings_by_length.iterator();
         while (length_it.next()) |entry| {
             const strings = entry.value_ptr.*.items;
 
-            // Process each string
-            for (strings) |string| {
+            for (strings) |*string| {
                 // Each byte becomes a token
-                // Use actual content length instead of declared length
                 var segmentation = try self.allocator.alloc(usize, string.content.len);
 
                 for (string.content, 0..) |byte, i| {
                     segmentation[i] = byte; // Token ID = byte value initially
                 }
 
-                try self.segmentations.put(string_index, segmentation);
+                // Store both segmentation and string pointer together
+                try self.string_info.put(string_index, .{
+                    .segmentation = segmentation,
+                    .freq_string = string,
+                });
 
                 string_index += 1;
             }
@@ -128,8 +108,10 @@ pub const BPE = struct {
         while (length_it.next()) |length_entry| {
             const strings = length_entry.value_ptr.*.items;
 
-            for (strings) |string| {
-                const segmentation = self.segmentations.get(string_index).?;
+            for (strings) |_| {
+                const string_data = self.string_info.get(string_index).?;
+                const segmentation = string_data.segmentation;
+                const frequency = string_data.freq_string.frequency;
 
                 // Skip strings with fewer than 2 tokens
                 if (segmentation.len < 2) {
@@ -149,10 +131,10 @@ pub const BPE = struct {
                     // Update count
                     if (pair_counts.contains(pair_key)) {
                         // Update existing count
-                        pair_counts.getPtr(pair_key).?.* += string.frequency;
+                        pair_counts.getPtr(pair_key).?.* += frequency;
                     } else {
                         // Insert new count
-                        try pair_counts.put(pair_key, string.frequency);
+                        try pair_counts.put(pair_key, frequency);
                     }
                 }
 
@@ -202,7 +184,6 @@ pub const BPE = struct {
         self.next_token_id += 1;
 
         // Add to vocabulary
-        try self.vocabulary.tokens.append(new_token);
         try self.id_to_token.put(new_id, new_token);
 
         // Update all segmentations
@@ -213,7 +194,8 @@ pub const BPE = struct {
             const strings = length_entry.value_ptr.*.items;
 
             for (strings) |_| {
-                const old_seg = self.segmentations.get(string_index).?;
+                const string_data = self.string_info.getPtr(string_index).?;
+                const old_seg = string_data.segmentation;
 
                 var new_seg = std.ArrayList(usize).init(self.allocator);
                 defer new_seg.deinit();
@@ -232,10 +214,11 @@ pub const BPE = struct {
                     }
                 }
 
+                // Update segmentation while keeping the FreqString pointer
                 self.allocator.free(old_seg);
                 const new_seg_slice = try self.allocator.alloc(usize, new_seg.items.len);
                 std.mem.copyForwards(usize, new_seg_slice, new_seg.items);
-                try self.segmentations.put(string_index, new_seg_slice);
+                string_data.segmentation = new_seg_slice;
 
                 string_index += 1;
             }
@@ -262,7 +245,8 @@ pub const BPE = struct {
         self.inverted_index = std.AutoHashMap(usize, std.ArrayList(types.TokenCount)).init(self.allocator);
 
         // For each token, create an empty list
-        for (self.vocabulary.tokens.items) |token| {
+        var token_it = self.id_to_token.valueIterator();
+        while (token_it.next()) |token| {
             try self.inverted_index.put(token.id, std.ArrayList(types.TokenCount).init(self.allocator));
         }
 
@@ -273,7 +257,8 @@ pub const BPE = struct {
             const strings = length_entry.value_ptr.*.items;
 
             for (strings) |_| {
-                const segmentation = self.segmentations.get(string_index).?;
+                const string_data = self.string_info.get(string_index).?;
+                const segmentation = string_data.segmentation;
 
                 // Count occurrences of each token in this string
                 var token_counts = std.AutoHashMap(usize, usize).init(self.allocator);
@@ -306,9 +291,9 @@ pub const BPE = struct {
 
         // Print some stats about the inverted index
         var total_mappings: usize = 0;
-        var token_it = self.inverted_index.iterator();
-        while (token_it.next()) |entry| {
-            total_mappings += entry.value_ptr.*.items.len;
+        var token = self.inverted_index.iterator();
+        while (token.next()) |entry| {
+            total_mappings += entry.value_ptr.items.len;
         }
 
         std.debug.print("Inverted index built: {} tokens, {} total mappings\n", .{ self.inverted_index.count(), total_mappings });
@@ -331,12 +316,11 @@ pub const BPE = struct {
 
         // For each string where this token appears
         for (token_counts.items) |token_count| {
-            // Fast string lookup using our mapping
-            const string = self.string_index_to_freq_string.get(token_count.string_index) orelse continue;
+            const string_data = self.string_info.get(token_count.string_index) orelse continue;
 
             // Each occurrence adds one token when removed (our +1 model)
             const saving = @as(f64, @floatFromInt(token_count.count)) *
-                @as(f64, @floatFromInt(string.frequency));
+                @as(f64, @floatFromInt(string_data.freq_string.frequency));
             total_savings += saving;
         }
 
@@ -351,7 +335,8 @@ pub const BPE = struct {
         self.war_scores = std.AutoHashMap(usize, f64).init(self.allocator);
 
         // Calculate WAR for each token
-        for (self.vocabulary.tokens.items) |token| {
+        var token_it = self.id_to_token.valueIterator();
+        while (token_it.next()) |token| {
             const war = try self.calculateTokenWAR(token.id);
             try self.war_scores.put(token.id, war);
         }
@@ -398,7 +383,8 @@ pub const BPE = struct {
 
         for (affected_indices) |token_count| {
             const string_index = token_count.string_index;
-            const old_seg = self.segmentations.get(string_index).?;
+            const string_data = self.string_info.getPtr(string_index).?;
+            const old_seg = string_data.segmentation;
 
             // Create new segmentation, replacing the removed token
             var new_seg = std.ArrayList(usize).init(self.allocator);
@@ -419,7 +405,7 @@ pub const BPE = struct {
             self.allocator.free(old_seg);
             const new_seg_slice = try self.allocator.alloc(usize, new_seg.items.len);
             std.mem.copyForwards(usize, new_seg_slice, new_seg.items);
-            try self.segmentations.put(string_index, new_seg_slice);
+            string_data.segmentation = new_seg_slice;
         }
     }
 
@@ -442,19 +428,6 @@ pub const BPE = struct {
         try self.updateSegmentationsAfterRemoval(removed_id);
 
         // remove the token from vocabulary
-        var new_tokens = std.ArrayList(types.Token).init(self.allocator);
-
-        for (self.vocabulary.tokens.items) |token| {
-            if (token.id != removed_id) {
-                try new_tokens.append(token);
-            }
-        }
-
-        // update vocabulary
-        self.vocabulary.tokens.deinit();
-        self.vocabulary.tokens = new_tokens;
-
-        // remove from id_to_token map
         self.allocator.free(removed_token.bytes);
         _ = self.id_to_token.remove(removed_id);
 
@@ -463,7 +436,7 @@ pub const BPE = struct {
         _ = self.inverted_index.remove(removed_id);
         _ = self.war_scores.remove(removed_id);
 
-        std.debug.print("Token removed. New vocabulary size: {}\n", .{self.vocabulary.tokens.items.len});
+        std.debug.print("Token removed. New vocabulary size: {}\n", .{self.id_to_token.count()});
     }
 
     /// Execute the full BPE with WAR pipeline
@@ -515,7 +488,7 @@ pub const BPE = struct {
         try self.removeLowestWARToken();
 
         // Print final vocabulary size
-        std.debug.print("\nFinal vocabulary size after WAR pruning: {}\n", .{self.vocabulary.tokens.items.len});
+        std.debug.print("\nFinal vocabulary size after WAR pruning: {}\n", .{self.id_to_token.count()});
     }
 
     /// run the BPE algorithm to build a vocabulary of the target size
@@ -523,7 +496,7 @@ pub const BPE = struct {
         std.debug.print("Starting BPE training with target vocabulary size: {}\n", .{target_vocab_size});
 
         // run standard BPE until reaching target size
-        while (self.vocabulary.tokens.items.len < target_vocab_size) {
+        while (self.id_to_token.count() < target_vocab_size) {
             const best_pair = try self.findBestPair();
 
             if (best_pair == null) {
@@ -533,11 +506,11 @@ pub const BPE = struct {
 
             std.debug.print("Merging pair ({}, {}) with frequency {}\n", .{ best_pair.?.first, best_pair.?.second, best_pair.?.frequency });
             try self.mergePair(best_pair.?);
-            std.debug.print("Vocabulary size: {}\n", .{self.vocabulary.tokens.items.len});
+            std.debug.print("Vocabulary size: {}\n", .{self.id_to_token.count()});
         }
 
         // additional merge
-        if (self.vocabulary.tokens.items.len >= target_vocab_size) {
+        if (self.id_to_token.count() >= target_vocab_size) {
             std.debug.print("Performing one additional merge beyond target size\n", .{});
 
             const extra_pair = try self.findBestPair();
@@ -548,13 +521,13 @@ pub const BPE = struct {
             }
         }
 
-        std.debug.print("Final vocabulary size: {}\n", .{self.vocabulary.tokens.items.len});
+        std.debug.print("Final vocabulary size: {}\n", .{self.id_to_token.count()});
     }
 
     /// print statistics and examples from the vocabulary
     pub fn printVocabularyStats(self: *BPE) void {
         std.debug.print("\nVocabulary Statistics:\n", .{});
-        std.debug.print("  Total tokens: {}\n", .{self.vocabulary.tokens.items.len});
+        std.debug.print("  Total tokens: {}\n", .{self.id_to_token.count()});
 
         // print some example tokens
         std.debug.print("\nSample byte tokens:\n", .{});
@@ -591,7 +564,8 @@ pub const BPE = struct {
             // show first string of each length
             if (strings.len > 0) {
                 const string = strings[0];
-                const seg = self.segmentations.get(string_index).?;
+                const string_data = self.string_info.get(string_index).?;
+                const seg = string_data.segmentation;
 
                 std.debug.print("  '{s}' -> [", .{string.content});
 

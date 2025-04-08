@@ -11,20 +11,9 @@ pub const FreqString = struct {
     length: usize,
 };
 
-pub const Vocabulary = struct {
-    tokens: std.ArrayList(Token),
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) Vocabulary {
-        return .{
-            .tokens = std.ArrayList(Token).init(allocator),
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *Vocabulary) void {
-        self.tokens.deinit();
-    }
+pub const StringInfo = struct {
+    segmentation: []usize,
+    freq_string: *const FreqString,
 };
 
 pub const TokenCount = struct {
