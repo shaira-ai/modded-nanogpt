@@ -685,7 +685,7 @@ class GPT(nn.Module):
         return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
     def forward(self, input_ids=None, attention_mask=None, position_ids=None, sliding_window_num_blocks=None,
-                input_seq=None, target_seq=None):
+            input_seq=None, target_seq=None, return_early_embeddings=False, early_layer_idx=0):
         # Support both training and inference modes
         is_training = target_seq is not None
 
@@ -748,7 +748,8 @@ class GPT(nn.Module):
 
         # Get initial embeddings
         x = x0 = norm(self.embed(input_seq))
-
+        early_embeddings = None
+        
         # U-net design
         skip_connections = []
         n = len(self.skip_weights)
@@ -756,6 +757,11 @@ class GPT(nn.Module):
             if i >= n:
                 x = x + self.skip_weights[i - n] * skip_connections.pop()
             x = self.blocks[i](x, ve[i], x0, block_masks[i], position_ids=position_ids)
+            
+            # Capture embeddings from the specified early layer
+            if return_early_embeddings and i == early_layer_idx:
+                early_embeddings = x.clone()
+                
             if i < n:
                 skip_connections.append(x)
 
@@ -764,13 +770,23 @@ class GPT(nn.Module):
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
         logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
 
+        # For training with early embeddings
+        if is_training and return_early_embeddings:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq,
+                                reduction='sum' if self.training else 'mean')
+            return loss, early_embeddings
+        
         # For training, calculate loss and return it
         if is_training:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq,
                                   reduction='sum' if self.training else 'mean')
             return loss
-
-        # For inference, return just the logits
+            
+        # For inference with early embeddings
+        if return_early_embeddings:
+            return logits, early_embeddings
+            
+        # For standard inference
         return logits
 
 # -----------------------------------------------------------------------------
@@ -1232,6 +1248,7 @@ def main():
             break  # End training
 
         # --------------- TRAINING SECTION -----------------
+        id_to_token = {v: k for k, v in token_dict.items()}
         inputs, targets = next(train_loader)
         
         # Generate positions using trainable_pe
@@ -1239,11 +1256,25 @@ def main():
                                         max_seq_len=args.max_seq_len, 
                                         trainable_pe=trainable_pe)
         attn_mask = attn_mask.to(device)
-        
-        # Forward pass with positions and attention mask
-        model(input_ids=inputs, target_seq=targets, 
-            sliding_window_num_blocks=get_window_size_blocks(step),
-            position_ids=positions, attention_mask=attn_mask).backward()
+
+        # Forward pass with positions, attention mask, and return early embeddings
+        loss, early_embeddings = model(input_ids=inputs, target_seq=targets, 
+                                    sliding_window_num_blocks=get_window_size_blocks(step),
+                                    position_ids=positions, attention_mask=attn_mask, 
+                                    return_early_embeddings=True, early_layer_idx=0)  # Use first layer
+
+        # Calculate token end positions
+        from loss_calculation import calculate_token_end_positions, calculate_learn_to_spell_loss, combine_losses
+        token_end_positions = calculate_token_end_positions(inputs, token_dict, id_to_token)
+
+        # Calculate learn to spell loss
+        spell_loss = calculate_learn_to_spell_loss(early_embeddings, token_end_positions)
+
+        # Combine losses with a weight of 0.01 (adjust as needed)
+        total_loss = combine_losses(loss, spell_loss, spell_loss_weight=0.01)
+
+        # Backward pass
+        total_loss.backward()
 
         if device.type == "cuda":
             # Reduce gradients for model parameters
@@ -1274,10 +1305,8 @@ def main():
         model.zero_grad(set_to_none=True)
         trainable_pe.zero_grad(set_to_none=True)  # Zero trainable_pe gradients
 
-        # Only print status periodically to avoid console flooding
-        if step % 10 == 0:
-            approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-            print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+        approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
+        print0(f"step:{step+1}/{train_steps} orig_loss:{loss:.4f} spell_loss:{spell_loss:.4f} total_loss:{total_loss:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
     # Print final memory usage information
     if device.type == "cuda":

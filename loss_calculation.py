@@ -54,6 +54,73 @@ def find_valid_next_tokens(text, byte_position, tokenizer, max_length=None):
 
     return valid_tokens
 
+def calculate_token_end_positions(token_ids, token_dict, id_to_token):
+    seq_len = token_ids.size(0)
+    end_positions = torch.zeros_like(token_ids)
+    
+    separator_id = 50256
+    tokens_cpu = token_ids.cpu()
+    
+    # Track cumulative byte position
+    byte_pos = 0
+    for t in range(seq_len):
+        token_id = tokens_cpu[t].item()
+        
+        if token_id == separator_id:
+            end_positions[t] = 0
+            continue
+            
+        # Get token bytes and update byte position
+        if token_id in id_to_token:
+            token_bytes = id_to_token[token_id]
+            byte_pos += len(token_bytes)
+            end_positions[t] = byte_pos
+        else:
+            print(f"Warning: Unknown token ID {token_id}")
+            end_positions[t] = byte_pos
+    
+    return end_positions.to(token_ids.device)
+
+def calculate_learn_to_spell_loss(embeddings, token_end_positions):
+    seq_len = token_end_positions.size(0)
+    
+    # Group tokens by their end byte position
+    position_groups = {}
+    for i in range(seq_len):
+        pos = token_end_positions[i].item()
+        if pos not in position_groups:
+            position_groups[pos] = []
+        position_groups[pos].append(i)
+    
+    # Calculate average embedding for each position group
+    position_averages = {}
+    for pos, indices in position_groups.items():
+        if pos == 0:
+            continue
+            
+        if len(indices) > 1:
+            group_embeddings = embeddings[indices]
+            position_averages[pos] = torch.mean(group_embeddings, dim=0)
+    
+    # Calculate loss for each token
+    total_loss = 0.0
+    token_count = 0
+    
+    for pos, indices in position_groups.items():
+        if pos == 0 or pos not in position_averages:
+            continue
+            
+        avg_embedding = position_averages[pos]
+        for idx in indices:
+            token_embedding = embeddings[idx]
+            total_loss += torch.sum((token_embedding - avg_embedding) ** 2)
+            token_count += 1
+    
+    return total_loss / max(token_count, 1)
+
+def combine_losses(original_loss, spell_loss, spell_loss_weight=0.01):
+    return original_loss + spell_loss_weight * spell_loss
+
 def calculate_standard_bpb(document, encoder, model, device):
     """Calculate standard token-wise bits per byte"""
     if type(document) != bytes:
