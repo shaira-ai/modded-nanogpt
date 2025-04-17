@@ -31,3 +31,29 @@ pub const TokenPair = struct {
         return a.frequency > b.frequency;
     }
 };
+
+pub const TokenCandidate = struct {
+    token_id: usize,
+    lower_bound_war: f64,
+    upper_bound_war: f64,
+    doc_contributions: std.AutoHashMap(usize, f64),
+    extra_data: std.StringHashMap(f64), // Changed to StringHashMap
+
+    pub fn init(allocator: std.mem.Allocator, token_id: usize) !*TokenCandidate {
+        const self = try allocator.create(TokenCandidate);
+        self.* = .{
+            .token_id = token_id,
+            .lower_bound_war = 0,
+            .upper_bound_war = 0,
+            .doc_contributions = std.AutoHashMap(usize, f64).init(allocator),
+            .extra_data = std.StringHashMap(f64).init(allocator), // Initialize as StringHashMap
+        };
+        return self;
+    }
+
+    pub fn deinit(self: *TokenCandidate, allocator: std.mem.Allocator) void {
+        self.doc_contributions.deinit();
+        self.extra_data.deinit();
+        allocator.destroy(self);
+    }
+};

@@ -1,20 +1,32 @@
 const std = @import("std");
 const types = @import("types.zig");
+const time = std.time;
 
 pub const TopStringsByLength = struct {
     allocator: std.mem.Allocator,
     strings_by_length: std.AutoHashMap(usize, std.ArrayList(types.FreqString)),
+    // Store string to index mapping for deduplication
+    string_indexes: std.AutoHashMap(usize, std.StringHashMap(usize)),
     total_count: usize,
 
     pub fn init(allocator: std.mem.Allocator) TopStringsByLength {
         return .{
             .allocator = allocator,
             .strings_by_length = std.AutoHashMap(usize, std.ArrayList(types.FreqString)).init(allocator),
+            .string_indexes = std.AutoHashMap(usize, std.StringHashMap(usize)).init(allocator),
             .total_count = 0,
         };
     }
 
     pub fn deinit(self: *TopStringsByLength) void {
+        // Clean up string index maps
+        var index_it = self.string_indexes.iterator();
+        while (index_it.next()) |entry| {
+            entry.value_ptr.*.deinit();
+        }
+        self.string_indexes.deinit();
+
+        // Clean up string arrays
         var it = self.strings_by_length.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.*.items) |str| {
@@ -51,24 +63,45 @@ pub const TopStringsByLength = struct {
         return try lengths.toOwnedSlice();
     }
 
-    /// Add a string with its frequency to the appropriate length category
+    /// Simplified addString with direct deduplication
     pub fn addString(self: *TopStringsByLength, length: usize, str: []const u8, frequency: usize) !void {
-        // Create array for this length if it doesn't exist
+        const start_time = time.nanoTimestamp();
+
+        // Make sure we have a list for this length
         if (!self.strings_by_length.contains(length)) {
             try self.strings_by_length.put(length, std.ArrayList(types.FreqString).init(self.allocator));
+            try self.string_indexes.put(length, std.StringHashMap(usize).init(self.allocator));
         }
 
         var strings = self.strings_by_length.getPtr(length).?;
+        var indexes = self.string_indexes.getPtr(length).?;
 
-        const content_copy = try self.allocator.dupe(u8, str);
+        // Check if we've seen this string before
+        if (indexes.get(str)) |index| {
+            // Update existing string's frequency
+            strings.items[index].frequency += frequency;
+        } else {
+            // New string, make a copy and add it
+            const content_copy = try self.allocator.dupe(u8, str);
+            errdefer self.allocator.free(content_copy);
 
-        try strings.append(.{
-            .content = content_copy,
-            .frequency = frequency,
-            .length = length,
-        });
+            const new_index = strings.items.len;
+            try strings.append(.{
+                .content = content_copy,
+                .frequency = frequency,
+                .length = length,
+            });
 
-        self.total_count += 1;
+            // Remember the index for this string
+            try indexes.put(content_copy, new_index);
+
+            self.total_count += 1;
+        }
+
+        const elapsed = time.nanoTimestamp() - start_time;
+        if (elapsed > 1000000) { // Only report if it took more than 1ms
+            std.debug.print("[TIMING] addString for length {d}, string size {d}: {d:.2}ms\n", .{ length, str.len, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
+        }
     }
 
     fn freqDescending(context: void, a: types.FreqString, b: types.FreqString) bool {
@@ -78,34 +111,22 @@ pub const TopStringsByLength = struct {
 
     /// Sort all string lists by frequency (descending) to easily identify top strings
     pub fn sortByFrequency(self: *TopStringsByLength) void {
+        const start_time = time.nanoTimestamp();
+
         var it = self.strings_by_length.valueIterator();
         while (it.next()) |array| {
             std.sort.insertion(types.FreqString, array.items, {}, freqDescending);
         }
+
+        // After sorting, the indexes are no longer valid, so clear them
+        var index_it = self.string_indexes.valueIterator();
+        while (index_it.next()) |index_map| {
+            index_map.clearAndFree();
+        }
+
+        const elapsed = time.nanoTimestamp() - start_time;
+        std.debug.print("[TIMING] sortByFrequency: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
     }
-
-    // pub fn printSummary(self: *TopStringsByLength) void {
-    //     std.debug.print("TopStringsByLength Summary:\n", .{});
-    //     std.debug.print("  Total unique strings: {d}\n", .{self.total_count});
-    //     std.debug.print("  Distinct lengths: {d}\n", .{self.strings_by_length.count()});
-
-    //     var total_weighted_frequency: usize = 0;
-    //     var it = self.strings_by_length.iterator();
-    //     while (it.next()) |entry| {
-    //         const length = entry.key_ptr.*;
-    //         const strings = entry.value_ptr.*.items;
-
-    //         var length_frequency: usize = 0;
-    //         for (strings) |str| {
-    //             length_frequency += str.frequency;
-    //         }
-
-    //         total_weighted_frequency += length_frequency;
-    //         std.debug.print("  Length {d}: {d} strings, cumulative frequency: {d}\n", .{ length, strings.len, length_frequency });
-    //     }
-
-    //     std.debug.print("  Total weighted frequency: {d}\n", .{total_weighted_frequency});
-    // }
 };
 
 pub fn parseInput(allocator: std.mem.Allocator, input: []const u8) !TopStringsByLength {
@@ -175,50 +196,3 @@ pub fn parseFile(allocator: std.mem.Allocator, file_path: []const u8) !TopString
 
     return parseInput(allocator, buffer[0..bytes_read]);
 }
-
-// pub fn testParser() !void {
-//     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//     defer _ = gpa.deinit();
-//     var allocator = gpa.allocator();
-
-//     const test_input =
-//         \\1,a,1000
-//         \\1,b,900
-//         \\1,c,800
-//         \\2,aa,500
-//         \\2,ab,450
-//         \\2,bc,400
-//         \\3,abc,300
-//         \\3,def,250
-//         \\3,xyz,200
-//     ;
-
-//     var strings = try parseInput(allocator, test_input);
-//     defer strings.deinit();
-
-//     // strings.printSummary();
-
-//     if (strings.getStringsOfLength(1)) |length1_strings| {
-//         std.debug.print("\nTop strings of length 1:\n", .{});
-//         for (length1_strings) |str| {
-//             std.debug.print("  '{s}': {d}\n", .{ str.content, str.frequency });
-//         }
-//     }
-
-//     if (strings.getStringsOfLength(3)) |length3_strings| {
-//         std.debug.print("\nTop strings of length 3:\n", .{});
-//         for (length3_strings) |str| {
-//             std.debug.print("  '{s}': {d}\n", .{ str.content, str.frequency });
-//         }
-//     }
-
-//     // Get all available lengths
-//     const lengths = try strings.getAllLengths();
-//     defer allocator.free(lengths);
-
-//     std.debug.print("\nAvailable lengths: ", .{});
-//     for (lengths) |length| {
-//         std.debug.print("{d} ", .{length});
-//     }
-//     std.debug.print("\n", .{});
-// }
