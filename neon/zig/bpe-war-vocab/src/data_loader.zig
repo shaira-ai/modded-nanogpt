@@ -22,7 +22,7 @@ pub const FinewebDataLoader = struct {
     file_path: []const u8,
 
     // Buffered reader with large buffer
-    buffered_reader: std.io.BufferedReader(65536, std.fs.File.Reader),
+    buffered_reader: std.io.BufferedReader(2*1024*1024, std.fs.File.Reader),
 
     // Token handling
     token_map: std.AutoHashMap(usize, []const u8),
@@ -55,7 +55,7 @@ pub const FinewebDataLoader = struct {
             .allocator = allocator,
             .file = file,
             .file_path = try allocator.dupe(u8, file_path),
-            .buffered_reader = std.io.bufferedReaderSize(65536, file.reader()),
+            .buffered_reader = std.io.bufferedReaderSize(2*1024*1024, file.reader()),
             .token_map = std.AutoHashMap(usize, []const u8).init(allocator),
             .byte_to_token = std.StringHashMap(usize).init(allocator),
             .token_bytes = token_bytes,
@@ -340,7 +340,7 @@ pub const FinewebDataLoader = struct {
         }
 
         // Allocate buffer for binary data
-        const buffer = try self.allocator.alloc(u8, total_size);
+        const buffer = try self.allocator.alloc(u8, total_size + 1024);
         errdefer self.allocator.free(buffer);
 
         // Second pass - fill the buffer
@@ -356,6 +356,7 @@ pub const FinewebDataLoader = struct {
                 pos += 1;
             }
         }
+        @memset(buffer[pos..], 0);
 
         // Print timing information
         const elapsed = time.nanoTimestamp() - start_time;

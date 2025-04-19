@@ -100,7 +100,7 @@ pub fn StringFrequencyManager(
                 for (self.min_length..self.max_length + 1) |len| {
                     if (i + len <= document.len) {
                         const substring = document[i .. i + len];
-                        try self.cms.conservativeAdd(substring, 1);
+                        try self.cms.conservativeAdd(substring);
                     }
                 }
             }
