@@ -14,7 +14,7 @@ pub fn main() !void {
     const cms_depth = 5; // 5 hash functions
 
     // Create the manager
-    const manager = try SFM.init(allocator, min_length, max_length, top_k, cms_width, cms_depth);
+    const manager = try SFM(cms_width, cms_depth).init(allocator, min_length, max_length, top_k);
     defer manager.deinit();
 
     // Load documents and process them
