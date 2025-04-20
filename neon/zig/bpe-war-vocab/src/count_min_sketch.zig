@@ -138,9 +138,7 @@ pub fn CountMinSketch(
             const hash_indices = self.computeHashIndices(string);
             var min_value: usize = std.math.maxInt(usize);
             for (0..num_hashes) |i| {
-                // Add explicit masking here even if it's done elsewhere
-                const index = hash_indices[i] & width_mask;
-                min_value = @min(min_value, self.counters[i][index]);
+                min_value = @min(min_value, self.counters[i][hash_indices[i]]);
             }
             return min_value;
         }
