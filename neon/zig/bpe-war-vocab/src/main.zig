@@ -4,7 +4,7 @@ const SFM = @import("string_frequency_manager.zig").StringFrequencyManager;
 const fs = std.fs;
 
 pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+    const allocator = std.heap.c_allocator;
 
     // Configure parameters
     const min_length = 2;
@@ -14,7 +14,7 @@ pub fn main() !void {
     const cms_depth = 5; // 5 hash functions
 
     const saved_data_path = "fineweb_first_pass.bin";
-    var manager: *SFM(cms_width, cms_depth) = undefined;
+    var manager: *SFM(cms_width, cms_depth, min_length, max_length) = undefined;
 
     // Check if saved first pass data exists
     const saved_data_exists = blk: {
@@ -31,11 +31,11 @@ pub fn main() !void {
     if (saved_data_exists) {
         // Load the first pass data from disk
         std.debug.print("=== LOADING FIRST PASS DATA FROM DISK ===\n", .{});
-        manager = try SFM(cms_width, cms_depth).loadFirstPassFromDisk(allocator, saved_data_path);
+        manager = try SFM(cms_width, cms_depth, min_length, max_length).loadFirstPassFromDisk(allocator, saved_data_path);
         std.debug.print("First pass data loaded successfully.\n", .{});
     } else {
         // Create the manager
-        manager = try SFM(cms_width, cms_depth).init(allocator, min_length, max_length, top_k);
+        manager = try SFM(cms_width, cms_depth, min_length, max_length).init(allocator, top_k);
 
         // Load documents and process them
         var loader = try fineweb.init(allocator, "fineweb_train_000001.bin");

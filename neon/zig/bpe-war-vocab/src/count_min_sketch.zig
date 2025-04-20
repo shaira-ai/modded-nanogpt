@@ -98,7 +98,7 @@ pub fn CountMinSketch(
 
             // // Conservative update: only increment counters that are equal to the minimum
             inline for (0..depth) |i| {
-                self.counters[i][big_hashes[i]] = @min(self.counters[i][big_hashes[i]], min_value);
+                self.counters[i][big_hashes[i]] = @max(self.counters[i][big_hashes[i]], min_value);
             }
         }
 
@@ -134,7 +134,7 @@ pub fn CountMinSketch(
         }
 
         /// Query the approximate frequency of a string
-        pub fn query(self: *Self, string: []const u8) !u64 {
+        pub fn query(self: *Self, string: []const u8) u64 {
             const hashes = self.computeHashIndices(string);
             var big_hashes: [depth]u64 = undefined;
             inline for (0..depth) |i| {

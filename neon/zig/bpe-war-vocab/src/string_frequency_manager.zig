@@ -21,7 +21,7 @@ pub const CandidateString = struct {
 // File format version for serialization
 const FILE_FORMAT_VERSION: u32 = 1;
 
-const SerializationHeader = struct {
+const SerializationHeader = extern struct {
     magic: [4]u8, // "SFMF" --> String Frequency Manager File
     version: u32,
     cms_width: u32,
@@ -34,24 +34,24 @@ const SerializationHeader = struct {
 pub fn StringFrequencyManager(
     comptime cms_width: usize,
     comptime cms_depth: usize,
+    comptime min_length: usize,
+    comptime max_length: usize,
 ) type {
     return struct {
         allocator: std.mem.Allocator,
         cms: *CMS(cms_width, cms_depth),
-        min_length: usize,
-        max_length: usize,
         top_k: usize,
         length2_counters: []usize,
         length3_counters: []usize,
 
         // Min heaps for tracking top-K strings of each length
-        heaps: std.AutoHashMap(usize, std.PriorityQueue(CandidateString, void, CandidateString.lessThan)),
+        heaps: []std.PriorityQueue(CandidateString, void, CandidateString.lessThan),
         // Maps to track actual counts of candidate strings
-        actual_counts: std.AutoHashMap(usize, std.StringHashMap(usize)),
+        actual_counts: []std.StringHashMap(usize),
 
         const Self = @This();
 
-        pub fn init(allocator: std.mem.Allocator, min_length: usize, max_length: usize, top_k: usize) !*Self {
+        pub fn init(allocator: std.mem.Allocator, top_k: usize) !*Self {
             const start_time = time.nanoTimestamp();
 
             const self = try allocator.create(Self);
@@ -62,18 +62,22 @@ pub fn StringFrequencyManager(
             errdefer cms.deinit();
 
             // Initialize heaps and count maps
-            const heaps = std.AutoHashMap(usize, std.PriorityQueue(CandidateString, void, CandidateString.lessThan)).init(allocator);
-            const actual_counts = std.AutoHashMap(usize, std.StringHashMap(usize)).init(allocator);
-            const len2_counters = try allocator.alloc(usize, 65536); // 256^2
-            const len3_counters = try allocator.alloc(usize, 16777216); // 256^3
+            const heaps = try allocator.alloc(std.PriorityQueue(CandidateString, void, CandidateString.lessThan), max_length+1);
+            for (heaps) |*heap| {
+                heap.* = std.PriorityQueue(CandidateString, void, CandidateString.lessThan).init(allocator, {});
+            }
+            const actual_counts = try allocator.alloc(std.StringHashMap(usize), max_length+1);
+            for (actual_counts) |*map| {
+                map.* = std.StringHashMap(usize).init(allocator);
+            }
+            const len2_counters = try allocator.alloc(usize, 0x10000);
+            const len3_counters = try allocator.alloc(usize, 0x1000000);
             @memset(len2_counters, 0);
             @memset(len3_counters, 0);
 
             self.* = .{
                 .allocator = allocator,
                 .cms = cms,
-                .min_length = min_length,
-                .max_length = max_length,
                 .top_k = top_k,
                 .length2_counters = len2_counters,
                 .length3_counters = len3_counters,
@@ -93,22 +97,19 @@ pub fn StringFrequencyManager(
             self.cms.deinit();
             self.allocator.free(self.length2_counters);
             self.allocator.free(self.length3_counters);
-            var heap_it = self.heaps.valueIterator();
-            while (heap_it.next()) |heap_ptr| {
-                var heap = heap_ptr.*;
+            for (self.heaps) |*heap| {
                 while (heap.count() > 0) {
                     const item = heap.remove();
                     self.allocator.free(item.string);
                 }
                 heap.deinit();
             }
-            self.heaps.deinit();
+            self.allocator.free(self.heaps);
 
-            var count_it = self.actual_counts.valueIterator();
-            while (count_it.next()) |map_ptr| {
-                map_ptr.*.deinit();
+            for (self.actual_counts) |*map| {
+                map.deinit();
             }
-            self.actual_counts.deinit();
+            self.allocator.free(self.actual_counts);
             self.allocator.destroy(self);
 
             const elapsed = time.nanoTimestamp() - start_time;
@@ -140,7 +141,7 @@ pub fn StringFrequencyManager(
                     self.length3_counters[index] += 1;
                 }
 
-                const max_len = @min(self.max_length, document.len - i);
+                const max_len = @min(max_length, document.len - i);
                 if (max_len >= 4) {
                     self.cms.addPrefixes(@ptrCast(&document[i]), max_len);
                 }
@@ -156,19 +157,8 @@ pub fn StringFrequencyManager(
         pub fn processDocumentSecondPass(self: *Self, document: []const u8) !void {
             const start_time = time.nanoTimestamp();
 
-            // Make sure we have heaps and count maps for all lengths
-            for (self.min_length..self.max_length + 1) |len| {
-                if (!self.heaps.contains(len)) {
-                    try self.heaps.put(len, std.PriorityQueue(CandidateString, void, CandidateString.lessThan).init(self.allocator, {}));
-                }
-
-                if (!self.actual_counts.contains(len)) {
-                    try self.actual_counts.put(len, std.StringHashMap(usize).init(self.allocator));
-                }
-            }
-
             for (0..document.len) |i| {
-                for (self.min_length..self.max_length + 1) |len| {
+                for (min_length..max_length + 1) |len| {
                     if (i + len <= document.len) {
                         const substring = document[i .. i + len];
 
@@ -180,24 +170,27 @@ pub fn StringFrequencyManager(
                         } else if (len == 3) {
                             guess_count = self.length3_counters[length3ToIndex(substring)];
                         } else {
-                            guess_count = try self.cms.query(substring);
+                            //std.debug.print("Querying CMS for '{s}'\n", .{substring});
+                            guess_count = self.cms.query(substring);
                         }
 
-                        var heap = self.heaps.getPtr(len).?;
-                        var counts = self.actual_counts.getPtr(len).?;
+                        var heap = &self.heaps[len];
+                        var counts = &self.actual_counts[len];
 
                         // Check if we're already tracking this string
                         if (counts.contains(substring)) {
+                            //std.debug.print("Already tracking '{s}'\n", .{substring});
                             // Already tracking, just increment the actual count
                             counts.getPtr(substring).?.* += 1;
                         } else if (heap.count() < self.top_k) {
+                            //std.debug.print("Adding '{s}' to heap\n", .{substring});
                             // Haven't reached capacity yet, add the string
                             const str_copy = try self.allocator.dupe(u8, substring);
                             errdefer self.allocator.free(str_copy);
 
                             try heap.add(.{ .string = str_copy, .guess_count = guess_count });
                             try counts.put(str_copy, 1);
-                        } else if (heap.count() > 0 and heap.peek().?.guess_count < guess_count) {
+                        } else if (heap.count() == self.top_k and heap.peek().?.guess_count < guess_count) {
                             // Current string has higher estimated count than our minimum
                             const evicted = heap.remove();
                             _ = counts.remove(evicted.string);
@@ -234,8 +227,8 @@ pub fn StringFrequencyManager(
                 .version = FILE_FORMAT_VERSION,
                 .cms_width = @as(u32, @intCast(cms_width)),
                 .cms_depth = @as(u32, @intCast(cms_depth)),
-                .min_length = @as(u32, @intCast(self.min_length)),
-                .max_length = @as(u32, @intCast(self.max_length)),
+                .min_length = @as(u32, @intCast(min_length)),
+                .max_length = @as(u32, @intCast(max_length)),
                 .top_k = @as(u32, @intCast(self.top_k)),
             };
 
@@ -274,7 +267,7 @@ pub fn StringFrequencyManager(
                 return error.UnsupportedVersion;
             }
 
-            const self = try init(allocator, header.min_length, header.max_length, header.top_k);
+            const self = try init(allocator, header.top_k);
             errdefer self.deinit();
 
             for (0..cms_depth) |i| {
@@ -305,11 +298,8 @@ pub fn StringFrequencyManager(
             std.debug.print("\n=== FREQUENCY ANALYSIS RESULTS ===\n", .{});
 
             var total_strings: usize = 0;
-            var len_it = self.heaps.keyIterator();
-            while (len_it.next()) |len_ptr| {
-                const len = len_ptr.*;
-                var heap = self.heaps.getPtr(len).?;
-                var counts = self.actual_counts.getPtr(len).?;
+            for (self.heaps, 0..) |*heap, len| {
+                var counts = &self.actual_counts[len];
 
                 const count = heap.count();
                 total_strings += count;
