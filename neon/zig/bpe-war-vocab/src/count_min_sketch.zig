@@ -1,4 +1,5 @@
 const std = @import("std");
+const FakeXxHash = @import("xxhash.zig").XxHash3(2);
 const time = std.time;
 
 /// Count-Min Sketch implementation for efficiently approximating string frequencies
@@ -101,30 +102,35 @@ pub fn CountMinSketch(
             }
         }
 
-        /// Add a string with conservative updating
-        pub fn conservativeAdd(self: *Self, string: []const u8) !void {
-            if (self.hash_idx >= self.hashes.len) {
-                @setEvalBranchQuota(1_000_000);
-                inline for (16..17) |prefetch_ahead_amt| {
-                    const start_time = time.nanoTimestamp();
-                    for (0..prefetch_ahead_amt) |i| {
-                        self.prefetch(self.hashes[self.hash_idx - prefetch_ahead_amt + i]); 
-                    }
-                    for (0..self.hash_idx-prefetch_ahead_amt) |i| {
-                        self.addHashes(self.hashes[i]); 
-                        self.prefetch(self.hashes[i+prefetch_ahead_amt]);
-                    }
-                    for (self.hash_idx-prefetch_ahead_amt..self.hash_idx) |i| {
-                        self.addHashes(self.hashes[i]); 
-                    }
-                    const elapsed = time.nanoTimestamp() - start_time;
-                    std.debug.print("[TIMING] Added {} hashes with prefetch_ahead_amt={}: {d:.2}ms\n", .{ self.hash_idx, prefetch_ahead_amt, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
-                }
-                self.hash_idx = 0;
+        /// Add all prefixes of a string with conservative updating
+        pub fn addPrefixes(self: *Self, string: [*]const u8, len: usize) void {
+            const num_hashes_i_will_add = 253 * num_hashes;
+            if (self.hash_idx + num_hashes_i_will_add >= self.hashes.len) {
+                self.flush();
             }
-            const hash_indices = self.computeHashIndices(string);
-            self.hashes[self.hash_idx] = hash_indices;
-            self.hash_idx += 1;
+            FakeXxHash.hash(&self.hashes[self.hash_idx], self.hash_seeds, @as(*const [256]u8, @ptrCast(string)));
+            self.hash_idx += len * num_hashes;
+        }
+
+        /// Flush all remaining strings
+        pub fn flush(self: *Self) void {
+            @setEvalBranchQuota(1_000_000);
+            inline for (16..17) |prefetch_ahead_amt| {
+                const start_time = time.nanoTimestamp();
+                for (0..prefetch_ahead_amt) |i| {
+                    self.prefetch(self.hashes[self.hash_idx - prefetch_ahead_amt + i]);
+                }
+                for (0..self.hash_idx-|prefetch_ahead_amt) |i| {
+                    self.addHashes(self.hashes[i]);
+                    self.prefetch(self.hashes[i+prefetch_ahead_amt]);
+                }
+                for (self.hash_idx-|prefetch_ahead_amt..self.hash_idx) |i| {
+                    self.addHashes(self.hashes[i]);
+                }
+                const elapsed = time.nanoTimestamp() - start_time;
+                std.debug.print("[TIMING] Added {} hashes with prefetch_ahead_amt={}: {d:.2}ms\n", .{ self.hash_idx, prefetch_ahead_amt, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
+            }
+            self.hash_idx = 0;
         }
 
         /// Query the approximate frequency of a string

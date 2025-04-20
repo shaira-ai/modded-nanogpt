@@ -97,12 +97,8 @@ pub fn StringFrequencyManager(
 
             // Process all substrings of all lengths in one pass
             for (0..document.len) |i| {
-                for (self.min_length..self.max_length + 1) |len| {
-                    if (i + len <= document.len) {
-                        const substring = document[i .. i + len];
-                        try self.cms.conservativeAdd(substring);
-                    }
-                }
+                const len = @min(self.max_length, document.len - i);
+                self.cms.addPrefixes(@ptrCast(&document[i]), len);
             }
 
             const elapsed = time.nanoTimestamp() - start_time;
