@@ -11,7 +11,7 @@ pub fn CountMinSketch(
     return struct {
         allocator: std.mem.Allocator,
         hash_seeds: [num_hashes]u64, // Seeds for the hash functions
-        counters: [depth][width]usize, // 2D array of counters
+        counters: [depth][width]u64, // 2D array of counters
         hashes: [100 * 1024 * 1024][num_hashes]u64, // Pre-allocated hash buffer
         hash_idx: usize = 0, // Index into the hash buffer
 
@@ -134,26 +134,28 @@ pub fn CountMinSketch(
         }
 
         /// Query the approximate frequency of a string
-        pub fn query(self: *Self, string: []const u8) !usize {
-            const hash_indices = self.computeHashIndices(string);
-            var min_value: usize = std.math.maxInt(usize);
-            for (0..num_hashes) |i| {
-                min_value = @min(min_value, self.counters[i][hash_indices[i]]);
+        pub fn query(self: *Self, string: []const u8) !u64 {
+            const hashes = self.computeHashIndices(string);
+            var big_hashes: [depth]u64 = undefined;
+            inline for (0..depth) |i| {
+                big_hashes[i] = readHashFromHashes(hashes, i);
+            }
+            var min_value: u64 = std.math.maxInt(u64);
+            inline for (0..depth) |i| {
+                min_value = @min(min_value, self.counters[i][big_hashes[i]]);
             }
             return min_value;
         }
 
         /// Compute hash indices for a string using xxhash with different seeds
-        inline fn computeHashIndices(self: *Self, string: []const u8) [num_hashes]usize {
-            var indices: [num_hashes]usize = undefined;
-
+        inline fn computeHashIndices(self: *Self, string: []const u8) [num_hashes]u64 {
+            var ret: [num_hashes]u64 = undefined;
             // Use xxHash with different seeds as specified
             for (0..num_hashes) |i| {
                 const hash = std.hash.XxHash3.hash(self.hash_seeds[i], string);
-                indices[i] = hash & width_mask; // or hash % width
+                ret[i] = hash;
             }
-
-            return indices;
+            return ret;
         }
 
         /// Reset all counters to zero

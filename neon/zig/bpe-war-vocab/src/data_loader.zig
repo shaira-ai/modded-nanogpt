@@ -139,17 +139,17 @@ pub const FinewebDataLoader = struct {
             const token_str = entry.key_ptr.*;
 
             const token_id = @as(usize, @intCast(entry.value_ptr.integer));
-            const encoded_size = gpt_encode.get_encoded_len(token_str);
-            const bytes_buffer = try self.allocator.alloc(u8, encoded_size);
-            const encoded_bytes = try gpt_encode.encode(bytes_buffer, token_str);
+            const decoded_size = gpt_encode.get_decoded_len(token_str);
+            const bytes_buffer = try self.allocator.alloc(u8, decoded_size);
+            const decoded_bytes = try gpt_encode.decode(bytes_buffer, token_str);
 
-            try self.token_map.put(token_id, encoded_bytes);
+            try self.token_map.put(token_id, decoded_bytes);
             const str_copy = try self.allocator.dupe(u8, token_str);
             try self.byte_to_token.put(str_copy, token_id);
 
             // Store in direct lookup array
             if (token_id < self.token_bytes.len) {
-                self.token_bytes[token_id] = encoded_bytes;
+                self.token_bytes[token_id] = decoded_bytes;
             }
         }
 
