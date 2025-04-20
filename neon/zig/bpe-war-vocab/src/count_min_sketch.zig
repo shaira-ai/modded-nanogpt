@@ -64,13 +64,17 @@ pub fn CountMinSketch(
         }
 
         inline fn readHashFromHashes(hashes: [num_hashes]u64, comptime i: usize) u64 {
-            const stoopid: [*]const u8 = @ptrCast(&hashes);
-            if (@ctz(width) != 24) {
-                @compileError("Width must be a power of 2");
-            }
-            var ret: u24 = undefined;
-            @memcpy(@as(*[3]u8, @ptrCast(&ret)), stoopid+i*3);
-            return ret;
+            const SmallHashType = std.meta.Int(.unsigned, @ctz(width));
+            const WholeHashesType = std.meta.Int(.unsigned, num_hashes * 64);
+            //if (@ctz(width) != 24) {
+            //    @compileError("Width must be a power of 2");
+            //}
+            const whole_hashes: WholeHashesType = @bitCast(hashes);
+            const shift = @ctz(width) * i;
+            return @as(SmallHashType, @truncate(whole_hashes >> shift));
+            //var ret: SmallHashType = undefined;
+            //@memcpy(@as(*[3]u8, @ptrCast(&ret)), stoopid+i*3);
+            //return ret;
         }
 
         inline fn prefetch(self: *Self, hashes: [num_hashes]u64) void {
@@ -142,9 +146,7 @@ pub fn CountMinSketch(
             // Use xxHash with different seeds as specified
             for (0..num_hashes) |i| {
                 const hash = std.hash.XxHash3.hash(self.hash_seeds[i], string);
-
-                // Truncate hash to fit the width using mask
-                indices[i] = @as(usize, @intCast(hash)) & width_mask;
+                indices[i] = hash;
             }
 
             return indices;
