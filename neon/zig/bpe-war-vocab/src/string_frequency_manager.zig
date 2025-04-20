@@ -1,6 +1,7 @@
 const std = @import("std");
 const time = std.time;
 const CMS = @import("count_min_sketch.zig").CountMinSketch;
+const fs = std.fs;
 
 pub const CandidateString = struct {
     string: []const u8,
@@ -17,6 +18,19 @@ pub const CandidateString = struct {
     }
 };
 
+// File format version for serialization
+const FILE_FORMAT_VERSION: u32 = 1;
+
+const SerializationHeader = struct {
+    magic: [4]u8, // "SFMF" --> String Frequency Manager File
+    version: u32,
+    cms_width: u32,
+    cms_depth: u32,
+    min_length: u32,
+    max_length: u32,
+    top_k: u32,
+};
+
 pub fn StringFrequencyManager(
     comptime cms_width: usize,
     comptime cms_depth: usize,
@@ -27,6 +41,8 @@ pub fn StringFrequencyManager(
         min_length: usize,
         max_length: usize,
         top_k: usize,
+        length2_counters: []usize,
+        length3_counters: []usize,
 
         // Min heaps for tracking top-K strings of each length
         heaps: std.AutoHashMap(usize, std.PriorityQueue(CandidateString, void, CandidateString.lessThan)),
@@ -48,6 +64,10 @@ pub fn StringFrequencyManager(
             // Initialize heaps and count maps
             const heaps = std.AutoHashMap(usize, std.PriorityQueue(CandidateString, void, CandidateString.lessThan)).init(allocator);
             const actual_counts = std.AutoHashMap(usize, std.StringHashMap(usize)).init(allocator);
+            const len2_counters = try allocator.alloc(usize, 65536); // 256^2
+            const len3_counters = try allocator.alloc(usize, 16777216); // 256^3
+            @memset(len2_counters, 0);
+            @memset(len3_counters, 0);
 
             self.* = .{
                 .allocator = allocator,
@@ -55,6 +75,8 @@ pub fn StringFrequencyManager(
                 .min_length = min_length,
                 .max_length = max_length,
                 .top_k = top_k,
+                .length2_counters = len2_counters,
+                .length3_counters = len3_counters,
                 .heaps = heaps,
                 .actual_counts = actual_counts,
             };
@@ -69,6 +91,8 @@ pub fn StringFrequencyManager(
             const start_time = time.nanoTimestamp();
 
             self.cms.deinit();
+            self.allocator.free(self.length2_counters);
+            self.allocator.free(self.length3_counters);
             var heap_it = self.heaps.valueIterator();
             while (heap_it.next()) |heap_ptr| {
                 var heap = heap_ptr.*;
@@ -91,15 +115,38 @@ pub fn StringFrequencyManager(
             std.debug.print("[TIMING] StringFrequencyManager.deinit: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
         }
 
+        inline fn length2ToIndex(substring: []const u8) usize {
+            return (@as(usize, substring[0]) << 8) | substring[1];
+        }
+        inline fn length3ToIndex(substring: []const u8) usize {
+            return (@as(usize, substring[0]) << 16) | (@as(usize, substring[1]) << 8) | substring[2];
+        }
+
         // PASS 1: Build the Count-Min Sketch
         pub fn buildCMS(self: *Self, document: []const u8) !void {
             const start_time = time.nanoTimestamp();
 
             // Process all substrings of all lengths in one pass
             for (0..document.len) |i| {
-                const len = @min(self.max_length, document.len - i);
-                self.cms.addPrefixes(@ptrCast(&document[i]), len);
+                if (i + 2 <= document.len) {
+                    const substring = document[i .. i + 2];
+                    const index = length2ToIndex(substring);
+                    self.length2_counters[index] += 1;
+                }
+
+                if (i + 3 <= document.len) {
+                    const substring = document[i .. i + 3];
+                    const index = length3ToIndex(substring);
+                    self.length3_counters[index] += 1;
+                }
+
+                const max_len = @min(self.max_length, document.len - i);
+                if (max_len >= 4) {
+                    self.cms.addPrefixes(@ptrCast(&document[i]), max_len);
+                }
             }
+
+            self.cms.flush();
 
             const elapsed = time.nanoTimestamp() - start_time;
             std.debug.print("[TIMING] buildCMS ({d} bytes): {d:.2}ms\n", .{ document.len, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
@@ -125,8 +172,16 @@ pub fn StringFrequencyManager(
                     if (i + len <= document.len) {
                         const substring = document[i .. i + len];
 
-                        // Get estimated count from CMS
-                        const guess_count = try self.cms.query(substring);
+                        // Get estimated count - either from direct counters or CMS
+                        var guess_count: usize = 0;
+
+                        if (len == 2) {
+                            guess_count = self.length2_counters[length2ToIndex(substring)];
+                        } else if (len == 3) {
+                            guess_count = self.length3_counters[length3ToIndex(substring)];
+                        } else {
+                            guess_count = try self.cms.query(substring);
+                        }
 
                         var heap = self.heaps.getPtr(len).?;
                         var counts = self.actual_counts.getPtr(len).?;
@@ -164,6 +219,85 @@ pub fn StringFrequencyManager(
             std.debug.print("[TIMING] processDocumentSecondPass ({d} bytes): {d:.2}ms\n", .{ document.len, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
         }
 
+        // Save the first pass results to a file
+        pub fn saveFirstPassToDisk(self: *Self, file_path: []const u8) !void {
+            const start_time = time.nanoTimestamp();
+
+            const file = try fs.cwd().createFile(file_path, .{});
+            defer file.close();
+
+            var buffered_writer = std.io.bufferedWriter(file.writer());
+            var writer = buffered_writer.writer();
+
+            const header = SerializationHeader{
+                .magic = "SFMF".*,
+                .version = FILE_FORMAT_VERSION,
+                .cms_width = @as(u32, @intCast(cms_width)),
+                .cms_depth = @as(u32, @intCast(cms_depth)),
+                .min_length = @as(u32, @intCast(self.min_length)),
+                .max_length = @as(u32, @intCast(self.max_length)),
+                .top_k = @as(u32, @intCast(self.top_k)),
+            };
+
+            try writer.writeAll(std.mem.asBytes(&header));
+
+            for (0..cms_depth) |i| {
+                try writer.writeAll(std.mem.sliceAsBytes(self.cms.counters[i][0..]));
+            }
+            try writer.writeAll(std.mem.sliceAsBytes(self.length2_counters));
+            try writer.writeAll(std.mem.sliceAsBytes(self.length3_counters));
+            try buffered_writer.flush();
+
+            const elapsed = time.nanoTimestamp() - start_time;
+            std.debug.print("[TIMING] saveFirstPassToDisk: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
+        }
+
+        pub fn loadFirstPassFromDisk(allocator: std.mem.Allocator, file_path: []const u8) !*Self {
+            const start_time = time.nanoTimestamp();
+
+            const file = try fs.cwd().openFile(file_path, .{});
+            defer file.close();
+
+            var buffered_reader = std.io.bufferedReader(file.reader());
+            var reader = buffered_reader.reader();
+
+            var header: SerializationHeader = undefined;
+            const header_bytes = try reader.readAll(std.mem.asBytes(&header));
+
+            if (header_bytes < @sizeOf(SerializationHeader)) {
+                return error.InvalidFileFormat;
+            }
+            if (!std.mem.eql(u8, &header.magic, "SFMF")) {
+                return error.InvalidMagicNumber;
+            }
+            if (header.version != FILE_FORMAT_VERSION) {
+                return error.UnsupportedVersion;
+            }
+
+            const self = try init(allocator, header.min_length, header.max_length, header.top_k);
+            errdefer self.deinit();
+
+            for (0..cms_depth) |i| {
+                const counters_bytes = try reader.readAll(std.mem.sliceAsBytes(self.cms.counters[i][0..]));
+                if (counters_bytes < cms_width * @sizeOf(usize)) {
+                    return error.InvalidFileFormat;
+                }
+            }
+            const len2_counters_bytes = try reader.readAll(std.mem.sliceAsBytes(self.length2_counters));
+            if (len2_counters_bytes < 65536 * @sizeOf(usize)) {
+                return error.InvalidFileFormat;
+            }
+            const len3_counters_bytes = try reader.readAll(std.mem.sliceAsBytes(self.length3_counters));
+            if (len3_counters_bytes < 16777216 * @sizeOf(usize)) {
+                return error.InvalidFileFormat;
+            }
+
+            const elapsed = time.nanoTimestamp() - start_time;
+            std.debug.print("[TIMING] loadFirstPassFromDisk: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
+
+            return self;
+        }
+
         // Get results and calculate error statistics
         pub fn getResults(self: *Self) !void {
             const start_time = time.nanoTimestamp();
@@ -183,7 +317,7 @@ pub fn StringFrequencyManager(
                 std.debug.print("\nLength {d}: {d} strings\n", .{ len, count });
 
                 // Only print details for a few sample lengths to keep output manageable
-                if (len == self.min_length or len == self.max_length or len == (self.min_length + self.max_length) / 2) {
+                if (true) {
                     // Extract top strings (in reverse order)
                     var results = std.ArrayList(CandidateString).init(self.allocator);
                     defer results.deinit();

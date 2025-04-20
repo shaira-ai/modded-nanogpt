@@ -12,7 +12,7 @@ pub fn CountMinSketch(
         allocator: std.mem.Allocator,
         hash_seeds: [num_hashes]u64, // Seeds for the hash functions
         counters: [depth][width]usize, // 2D array of counters
-        hashes: [100*1024*1024][num_hashes]u64, // Pre-allocated hash buffer
+        hashes: [100 * 1024 * 1024][num_hashes]u64, // Pre-allocated hash buffer
         hash_idx: usize = 0, // Index into the hash buffer
 
         const depth = _depth;
@@ -120,11 +120,11 @@ pub fn CountMinSketch(
                 for (0..prefetch_ahead_amt) |i| {
                     self.prefetch(self.hashes[self.hash_idx - prefetch_ahead_amt + i]);
                 }
-                for (0..self.hash_idx-|prefetch_ahead_amt) |i| {
+                for (0..self.hash_idx -| prefetch_ahead_amt) |i| {
                     self.addHashes(self.hashes[i]);
-                    self.prefetch(self.hashes[i+prefetch_ahead_amt]);
+                    self.prefetch(self.hashes[i + prefetch_ahead_amt]);
                 }
-                for (self.hash_idx-|prefetch_ahead_amt..self.hash_idx) |i| {
+                for (self.hash_idx -| prefetch_ahead_amt..self.hash_idx) |i| {
                     self.addHashes(self.hashes[i]);
                 }
                 const elapsed = time.nanoTimestamp() - start_time;
@@ -136,13 +136,12 @@ pub fn CountMinSketch(
         /// Query the approximate frequency of a string
         pub fn query(self: *Self, string: []const u8) !usize {
             const hash_indices = self.computeHashIndices(string);
-
-            // Return the minimum counter value as the frequency estimate
             var min_value: usize = std.math.maxInt(usize);
             for (0..num_hashes) |i| {
-                min_value = @min(min_value, self.counters[i][hash_indices[i]]);
+                // Add explicit masking here even if it's done elsewhere
+                const index = hash_indices[i] & width_mask;
+                min_value = @min(min_value, self.counters[i][index]);
             }
-
             return min_value;
         }
 
@@ -153,7 +152,7 @@ pub fn CountMinSketch(
             // Use xxHash with different seeds as specified
             for (0..num_hashes) |i| {
                 const hash = std.hash.XxHash3.hash(self.hash_seeds[i], string);
-                indices[i] = hash;
+                indices[i] = hash & width_mask; // or hash % width
             }
 
             return indices;
@@ -168,7 +167,6 @@ pub fn CountMinSketch(
 
         /// Merge another Count-Min Sketch into this one
         pub fn merge(self: *Self, other: *Self) !void {
-
             for (0..depth) |i| {
                 for (0..width) |j| {
                     self.counters[i][j] += other.counters[i][j];
