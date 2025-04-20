@@ -109,13 +109,13 @@ pub fn CountMinSketch(
                 self.flush();
             }
             FakeXxHash.hash(&self.hashes[self.hash_idx], self.hash_seeds, @as(*const [256]u8, @ptrCast(string)));
-            self.hash_idx += len * num_hashes;
+            self.hash_idx += len;
         }
 
         /// Flush all remaining strings
-        pub fn flush(self: *Self) void {
+        pub noinline fn flush(self: *Self) void {
             @setEvalBranchQuota(1_000_000);
-            inline for (16..17) |prefetch_ahead_amt| {
+            inline for (14..15) |prefetch_ahead_amt| {
                 const start_time = time.nanoTimestamp();
                 for (0..prefetch_ahead_amt) |i| {
                     self.prefetch(self.hashes[self.hash_idx - prefetch_ahead_amt + i]);
