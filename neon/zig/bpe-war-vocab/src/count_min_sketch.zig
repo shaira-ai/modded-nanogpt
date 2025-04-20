@@ -46,6 +46,7 @@ pub fn CountMinSketch(
             }
 
             self.allocator = allocator;
+            self.hash_idx = 0;
 
             const elapsed = time.nanoTimestamp() - start_time;
             std.debug.print("[TIMING] CountMinSketch.init: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
