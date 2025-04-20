@@ -118,7 +118,7 @@ pub fn CountMinSketch(
             inline for (14..15) |prefetch_ahead_amt| {
                 const start_time = time.nanoTimestamp();
                 for (0..prefetch_ahead_amt) |i| {
-                    self.prefetch(self.hashes[self.hash_idx - prefetch_ahead_amt + i]);
+                    self.prefetch(self.hashes[i]);
                 }
                 for (0..self.hash_idx -| prefetch_ahead_amt) |i| {
                     self.addHashes(self.hashes[i]);
