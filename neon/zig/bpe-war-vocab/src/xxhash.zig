@@ -22,7 +22,20 @@ pub const XxHash32 = struct {
     const prime_5: u32 = 0x165667B1; // 0b00010110010101100110011110110001
 };
 
-pub fn XxHash3(comptime VEC_WIDTH: comptime_int) type {
+pub fn XxHash3(
+    comptime min_length: usize,
+    comptime max_length: usize,
+    comptime VEC_WIDTH: comptime_int
+) type {
+    if (min_length < 4) {
+        @compileError("min_length must be >= 4");
+    }
+    if (max_length > 256) {
+        @compileError("max_length must be <= 256");
+    }
+    if (max_length < min_length) {
+        @compileError("max_length must be >= min_length");
+    }
     return struct {
         const V = @Vector(VEC_WIDTH, u64);
         const V32 = @Vector(VEC_WIDTH, u32);
@@ -187,7 +200,7 @@ pub fn XxHash3(comptime VEC_WIDTH: comptime_int) type {
             @setEvalBranchQuota(1_000_000);
             const secret = &default_secret;
             var dst = dst_;
-            {
+            if (min_length < 9) {
                 // hash8 for 4<=len<9
                 const flip: [2]u64 = @bitCast(secret[8..24].*);
                 var blk: [5]u32 = undefined;
@@ -212,12 +225,17 @@ pub fn XxHash3(comptime VEC_WIDTH: comptime_int) type {
                         ret[i*VEC_WIDTH+j] = avalanche(.{ .rrmxmx = i+4 }, key[j] ^ combined[i]);
                     }
                 }
-                inline for (0..5*VEC_WIDTH) |i| {
-                    dst[i] = ret[i];
+                inline for (0..5) |i| {
+                    const this_len = i + 4;
+                    if (min_length <= this_len and this_len <= max_length) {
+                        inline for (0..VEC_WIDTH) |j| {
+                            dst[j] = ret[i*VEC_WIDTH+j];
+                        }
+                        dst += VEC_WIDTH;
+                    }
                 }
-                dst += 5*VEC_WIDTH;
             }
-            {
+            if (min_length < 17 and max_length > 8) {
                 // hash16 for 9<=len<17
                 const flip: [4]u64 = @bitCast(secret[24..56].*);
                 var blk: [9]u64 = undefined;
@@ -260,12 +278,17 @@ pub fn XxHash3(comptime VEC_WIDTH: comptime_int) type {
                         ret[i*VEC_WIDTH+j] = avalanche(.h3, combined[i][j]);
                     }
                 }
-                inline for (0..8*VEC_WIDTH) |i| {
-                    dst[i] = ret[i];
+                inline for (0..8) |i| {
+                    const this_len = i + 9;
+                    if (min_length <= this_len and this_len <= max_length) {
+                        inline for (0..VEC_WIDTH) |j| {
+                            dst[j] = ret[i*VEC_WIDTH+j];
+                        }
+                        dst += VEC_WIDTH;
+                    }
                 }
-                dst += 8*VEC_WIDTH;
             }
-            {
+            if (min_length < 129 and max_length > 16) {
                 // hash128 for 17<=len<129
                 var acc: [112][VEC_WIDTH]u64 = undefined;
                 var prime1_acc: u64 = XxHash64.prime_1 *% 17;
@@ -290,13 +313,16 @@ pub fn XxHash3(comptime VEC_WIDTH: comptime_int) type {
                     }
                 }
                 for (0..112) |i| {
-                    inline for (0..VEC_WIDTH) |j| {
-                        dst[j] = avalanche(.h3, acc[i][j]);
+                    const this_len = i + 17;
+                    if (min_length <= this_len and this_len <= max_length) {
+                        inline for (0..VEC_WIDTH) |j| {
+                            dst[j] = avalanche(.h3, acc[i][j]);
+                        }
+                        dst += VEC_WIDTH;
                     }
-                    dst += VEC_WIDTH;
                 }
             }
-            {
+            if (min_length < 241 and max_length > 128) {
                 // hash240 for 129<=len<241
                 var acc: [VEC_WIDTH]u64 = .{0}**VEC_WIDTH;
                 inline for (0..8) |ii| {
@@ -307,48 +333,54 @@ pub fn XxHash3(comptime VEC_WIDTH: comptime_int) type {
                 var acc_end_acc: [VEC_WIDTH]u64 = .{0}**VEC_WIDTH;
                 var prime_acc: u64 = XxHash64.prime_1 *% 129;
                 for (0..15) |i| {
-                    var acc_endi: [VEC_WIDTH]u64 = undefined;
-                    var acci: [VEC_WIDTH]u64 = undefined;
-                    inline for (0..VEC_WIDTH) |j| {
-                        acci[j] = prime_acc +% acc[j];
-                    }
-                    prime_acc +%= XxHash64.prime_1;
-                    inline for (0..VEC_WIDTH) |j| {
-                        acc_endi[j] = mix16(seed[j], input[(129+i) - 16 ..], secret[136 - 17 ..]);
-                    }
-                    inline for (0..VEC_WIDTH) |j| {
-                        acci[j] = avalanche(.h3, acci[j]) +% acc_endi[j];
-                    }
-                    inline for (0..VEC_WIDTH) |j| {
-                        dst[j] = avalanche(.h3, acci[j]);
-                    }
-                    dst += VEC_WIDTH;
-                }
-                for (8..14) |ii| {
-                    inline for (0..VEC_WIDTH) |j| {
-                        acc_end_acc[j] +%= mix16(seed[j], input[(ii*16)..], secret[((ii-8)*16)+3..]);
-                    }
-                    for (0..16) |i| {
+                    const this_len = i + 129;
+                    if (min_length <= this_len and this_len <= max_length) {
                         var acc_endi: [VEC_WIDTH]u64 = undefined;
                         var acci: [VEC_WIDTH]u64 = undefined;
                         inline for (0..VEC_WIDTH) |j| {
                             acci[j] = prime_acc +% acc[j];
                         }
-                        prime_acc +%= XxHash64.prime_1;
                         inline for (0..VEC_WIDTH) |j| {
-                            acc_endi[j] = mix16(seed[j], input[(16 * ii + i) ..], secret[136 - 17 ..]);
+                            acc_endi[j] = mix16(seed[j], input[(129+i) - 16 ..], secret[136 - 17 ..]);
                         }
                         inline for (0..VEC_WIDTH) |j| {
-                            acci[j] = avalanche(.h3, acci[j]) +% acc_endi[j] +% acc_end_acc[j];
+                            acci[j] = avalanche(.h3, acci[j]) +% acc_endi[j];
                         }
                         inline for (0..VEC_WIDTH) |j| {
                             dst[j] = avalanche(.h3, acci[j]);
                         }
                         dst += VEC_WIDTH;
                     }
+                    prime_acc +%= XxHash64.prime_1;
+                }
+                for (8..14) |ii| {
+                    inline for (0..VEC_WIDTH) |j| {
+                        acc_end_acc[j] +%= mix16(seed[j], input[(ii*16)..], secret[((ii-8)*16)+3..]);
+                    }
+                    for (0..16) |i| {
+                        const this_len = 144 + (ii-8) * 16 + i;
+                        if (min_length <= this_len and this_len <= max_length) {
+                            var acc_endi: [VEC_WIDTH]u64 = undefined;
+                            var acci: [VEC_WIDTH]u64 = undefined;
+                            inline for (0..VEC_WIDTH) |j| {
+                                acci[j] = prime_acc +% acc[j];
+                            }
+                            inline for (0..VEC_WIDTH) |j| {
+                                acc_endi[j] = mix16(seed[j], input[(16 * ii + i) ..], secret[136 - 17 ..]);
+                            }
+                            inline for (0..VEC_WIDTH) |j| {
+                                acci[j] = avalanche(.h3, acci[j]) +% acc_endi[j] +% acc_end_acc[j];
+                            }
+                            inline for (0..VEC_WIDTH) |j| {
+                                dst[j] = avalanche(.h3, acci[j]);
+                            }
+                            dst += VEC_WIDTH;
+                        }
+                        prime_acc +%= XxHash64.prime_1;
+                    }
                 }
                 // length exactly 240
-                {
+                if (min_length <= 240 and max_length >= 240) {
                     inline for (0..VEC_WIDTH) |j| {
                         acc_end_acc[j] +%= mix16(seed[j], input[224 ..], secret[((14-8)*16)+3..]);
                     }
@@ -369,7 +401,7 @@ pub fn XxHash3(comptime VEC_WIDTH: comptime_int) type {
                     dst += VEC_WIDTH;
                 }
             }
-            {
+            if (max_length > 240) {
                 // hashLong for 241<=len<=256
                 var base_accs: [VEC_WIDTH]Accumulator = undefined;
                 inline for (0..VEC_WIDTH) |j| {
@@ -383,12 +415,14 @@ pub fn XxHash3(comptime VEC_WIDTH: comptime_int) type {
                     base_states[j] = base_accs[j].state;
                 }
                 for (241..257) |i| {
-                    inline for (0..VEC_WIDTH) |j| {
-                        dst[j] = base_accs[j].digest(i, @ptrCast(&input[i-64]));
-                    }
-                    dst += VEC_WIDTH;
-                    inline for (0..VEC_WIDTH) |j| {
-                        base_accs[j].state = base_states[j];
+                    if (min_length <= i and i <= max_length) {
+                        inline for (0..VEC_WIDTH) |j| {
+                            dst[j] = base_accs[j].digest(i, @ptrCast(&input[i-64]));
+                        }
+                        dst += VEC_WIDTH;
+                        inline for (0..VEC_WIDTH) |j| {
+                            base_accs[j].state = base_states[j];
+                        }
                     }
                 }
             }

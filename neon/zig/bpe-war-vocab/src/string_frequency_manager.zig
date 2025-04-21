@@ -194,27 +194,27 @@ pub fn StringFrequencyManager(
 
             for (0..document.len) |i| {
                 const max_len = @min(max_length, document.len - i);
-                if (max_len < 2) {
-                    continue;
-                }
+                // if (max_len < 2) {
+                //     continue;
+                // }
 
-                const guess_count_2 = self.length2_counters[length2ToIndex(document[i .. i + 2])];
-                try self.processString(document[i .. i + 2], guess_count_2);
+                // const guess_count_2 = self.length2_counters[length2ToIndex(document[i .. i + 2])];
+                // try self.processString(document[i .. i + 2], guess_count_2);
 
-                if (max_len < 3) {
-                    continue;
-                }
+                // if (max_len < 3) {
+                //     continue;
+                // }
 
-                const guess_count_3 = self.length3_counters[length3ToIndex(document[i .. i + 3])];
-                try self.processString(document[i .. i + 3], guess_count_3);
+                // const guess_count_3 = self.length3_counters[length3ToIndex(document[i .. i + 3])];
+                // try self.processString(document[i .. i + 3], guess_count_3);
                 
-                if (max_len < 4) {
+                if (max_len < 10) {
                     continue;
                 }
 
                 var scratch: [N_LENGTHS]u64 = undefined;
                 self.cms.query(&scratch, @ptrCast(&document[i]));
-                for (scratch, 4..max_len) |guess_count, len| {
+                for (scratch[0..1], 10..11) |guess_count, len| {
                     try self.processString(document[i .. i + len], guess_count);
                 }
             }
