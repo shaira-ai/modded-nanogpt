@@ -36,7 +36,7 @@ pub fn CountMinSketch(
         const num_hashes = (depth * @ctz(width) + 63) / 64;
         const width_mask: usize = width - 1; // Mask for efficient modulo (width - 1)
         const Self = @This();
-        const FakeXxHash = @import("xxhash.zig").XxHash3(10, 10, num_hashes);
+        const FakeXxHash = @import("xxhash.zig").XxHash3(MY_LEN, MY_LEN, num_hashes);
 
         /// Initialize a new Count-Min Sketch with the given parameters
         pub fn init(allocator: std.mem.Allocator) !*Self {
