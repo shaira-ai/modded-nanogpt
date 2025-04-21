@@ -1,25 +1,41 @@
 const std = @import("std");
-const FakeXxHash = @import("xxhash.zig").XxHash3(2);
 const time = std.time;
+
+pub const N_LENGTHS = 253;
 
 /// Count-Min Sketch implementation for efficiently approximating string frequencies
 /// Uses xxhash for fast hashing and implements conservative updating
 pub fn CountMinSketch(
-    comptime _width: usize,
-    comptime _depth: usize,
+    comptime width: usize,
+    comptime depth: usize,
 ) type {
     return struct {
+        const seeds: [12]u64 = .{
+            0xafe2fa70575ec43d,
+            0x7fca6b0ddd27e948,
+            0xd858097e82fb9342,
+            0xa53c3de53f1daec2,
+            0x97a5f9a012f82955,
+            0x9af2ffee17c43b83,
+            0x7020e7c9fcd727f1,
+            0x18469637a034de86,
+            0x36a42e718aff893d,
+            0x17ba09373d5503c0,
+            0x2b11dd16d215db7c,
+            0x6c9a257217884407,
+        };
+
+
         allocator: std.mem.Allocator,
         hash_seeds: [num_hashes]u64, // Seeds for the hash functions
-        counters: [depth][width]u64, // 2D array of counters
-        hashes: [100 * 1024 * 1024][num_hashes]u64, // Pre-allocated hash buffer
+        counters: *[depth][width]u64, // 2D array of counters
+        hashes: [4 * 1024 * 1024][num_hashes]u64, // Pre-allocated hash buffer
         hash_idx: usize = 0, // Index into the hash buffer
 
-        const depth = _depth;
-        const width = _width;
         const num_hashes = (depth * @ctz(width) + 63) / 64;
         const width_mask: usize = width - 1; // Mask for efficient modulo (width - 1)
         const Self = @This();
+        const FakeXxHash = @import("xxhash.zig").XxHash3(num_hashes);
 
         /// Initialize a new Count-Min Sketch with the given parameters
         pub fn init(allocator: std.mem.Allocator) !*Self {
@@ -32,6 +48,8 @@ pub fn CountMinSketch(
 
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
+            self.counters = try allocator.create([depth][width]u64);
+            errdefer allocator.destroy(self.counters);
 
             var i: usize = 0;
             while (i < depth) : (i += 1) {
@@ -41,9 +59,11 @@ pub fn CountMinSketch(
             // Generate seeds for hash functions
 
             // Use different seeds for each hash function
-            const base_seed: u64 = 0xdeadbeef;
+            if (num_hashes > seeds.len) {
+                return error.TooManyHashes;
+            }
             for (0..num_hashes) |j| {
-                self.hash_seeds[j] = base_seed ^ @as(u64, @intCast(j * 0x9e3779b9));
+                self.hash_seeds[j] = seeds[j];
             }
 
             self.allocator = allocator;
@@ -68,15 +88,9 @@ pub fn CountMinSketch(
         inline fn readHashFromHashes(hashes: [num_hashes]u64, comptime i: usize) u64 {
             const SmallHashType = std.meta.Int(.unsigned, @ctz(width));
             const WholeHashesType = std.meta.Int(.unsigned, num_hashes * 64);
-            //if (@ctz(width) != 24) {
-            //    @compileError("Width must be a power of 2");
-            //}
             const whole_hashes: WholeHashesType = @bitCast(hashes);
             const shift = @ctz(width) * i;
             return @as(SmallHashType, @truncate(whole_hashes >> shift));
-            //var ret: SmallHashType = undefined;
-            //@memcpy(@as(*[3]u8, @ptrCast(&ret)), stoopid+i*3);
-            //return ret;
         }
 
         inline fn prefetch(self: *Self, hashes: [num_hashes]u64) void {
@@ -86,7 +100,7 @@ pub fn CountMinSketch(
         }
 
         inline fn addHashes(self: *Self, hashes: [num_hashes]u64) void {
-            var min_value: usize = std.math.maxInt(usize);
+            var min_value: u64 = std.math.maxInt(u64);
             var big_hashes: [depth]u64 = undefined;
             inline for (0..depth) |i| {
                 big_hashes[i] = readHashFromHashes(hashes, i);
@@ -103,19 +117,20 @@ pub fn CountMinSketch(
         }
 
         /// Add all prefixes of a string with conservative updating
-        pub fn addPrefixes(self: *Self, string: [*]const u8, len: usize) void {
-            const num_hashes_i_will_add = 253 * num_hashes;
+        pub noinline fn addPrefixes(self: *Self, string: [*]const u8, len: usize) void {
+            const num_hashes_i_will_add = N_LENGTHS * num_hashes;
             if (self.hash_idx + num_hashes_i_will_add >= self.hashes.len) {
                 self.flush();
             }
             FakeXxHash.hash(&self.hashes[self.hash_idx], self.hash_seeds, @as(*const [256]u8, @ptrCast(string)));
-            self.hash_idx += len;
+            self.hash_idx += (len - 3);
         }
 
         /// Flush all remaining strings
         pub noinline fn flush(self: *Self) void {
             @setEvalBranchQuota(1_000_000);
-            inline for (14..15) |prefetch_ahead_amt| {
+            const guess_prefetch_amt = 60 / depth;
+            inline for (guess_prefetch_amt..guess_prefetch_amt+1) |prefetch_ahead_amt| {
                 const start_time = time.nanoTimestamp();
                 for (0..prefetch_ahead_amt) |i| {
                     self.prefetch(self.hashes[i]);
@@ -133,18 +148,33 @@ pub fn CountMinSketch(
             self.hash_idx = 0;
         }
 
-        /// Query the approximate frequency of a string
-        pub fn query(self: *Self, string: []const u8) u64 {
-            const hashes = self.computeHashIndices(string);
+        inline fn queryOne(self: *Self, hashes: [num_hashes]u64) u64 {
+            var min_value: u64 = std.math.maxInt(u64);
             var big_hashes: [depth]u64 = undefined;
             inline for (0..depth) |i| {
                 big_hashes[i] = readHashFromHashes(hashes, i);
             }
-            var min_value: u64 = std.math.maxInt(u64);
             inline for (0..depth) |i| {
                 min_value = @min(min_value, self.counters[i][big_hashes[i]]);
             }
             return min_value;
+        }
+
+        /// Query the approximate frequency of a string
+        pub noinline fn query(self: *Self, dst: [*]u64, string: [*]const u8) void {
+            var hashes: [N_LENGTHS][num_hashes]u64 = undefined;
+            FakeXxHash.hash(@ptrCast(&hashes), self.hash_seeds, @as(*const [256]u8, @ptrCast(string)));
+            const prefetch_ahead_amt = 16 * 5 / depth;
+            for (0..prefetch_ahead_amt) |i| {
+                self.prefetch(hashes[i]);
+            }
+            for (0..N_LENGTHS - prefetch_ahead_amt) |i| {
+                dst[i] = self.queryOne(hashes[i]);
+                self.prefetch(hashes[i + prefetch_ahead_amt]);
+            }
+            for (N_LENGTHS - prefetch_ahead_amt..N_LENGTHS) |i| {
+                dst[i] = self.queryOne(hashes[i]);
+            }
         }
 
         /// Compute hash indices for a string using xxhash with different seeds
@@ -153,7 +183,7 @@ pub fn CountMinSketch(
             // Use xxHash with different seeds as specified
             for (0..num_hashes) |i| {
                 const hash = std.hash.XxHash3.hash(self.hash_seeds[i], string);
-                ret[i] = hash;
+                ret[i] = @truncate(hash);
             }
             return ret;
         }

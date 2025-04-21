@@ -1,6 +1,7 @@
 const std = @import("std");
 const time = std.time;
-const CMS = @import("count_min_sketch.zig").CountMinSketch;
+const CMS_F = @import("count_min_sketch.zig").CountMinSketch;
+const N_LENGTHS = @import("count_min_sketch.zig").N_LENGTHS;
 const fs = std.fs;
 
 pub const CandidateString = struct {
@@ -37,9 +38,10 @@ pub fn StringFrequencyManager(
     comptime min_length: usize,
     comptime max_length: usize,
 ) type {
+    const CMS = CMS_F(cms_width, cms_depth);
     return struct {
         allocator: std.mem.Allocator,
-        cms: *CMS(cms_width, cms_depth),
+        cms: *CMS,
         top_k: usize,
         length2_counters: []usize,
         length3_counters: []usize,
@@ -58,7 +60,7 @@ pub fn StringFrequencyManager(
             errdefer allocator.destroy(self);
 
             // Create the Count-Min Sketch
-            const cms = try CMS(cms_width, cms_depth).init(allocator);
+            const cms = try CMS.init(allocator);
             errdefer cms.deinit();
 
             // Initialize heaps and count maps
@@ -117,10 +119,10 @@ pub fn StringFrequencyManager(
         }
 
         inline fn length2ToIndex(substring: []const u8) usize {
-            return (@as(usize, substring[0]) << 8) | substring[1];
+            return @as(u16, @bitCast(substring[0..2].*));
         }
         inline fn length3ToIndex(substring: []const u8) usize {
-            return (@as(usize, substring[0]) << 16) | (@as(usize, substring[1]) << 8) | substring[2];
+            return @as(u24, @bitCast(substring[0..3].*));
         }
 
         // PASS 1: Build the Count-Min Sketch
@@ -153,58 +155,67 @@ pub fn StringFrequencyManager(
             std.debug.print("[TIMING] buildCMS ({d} bytes): {d:.2}ms\n", .{ document.len, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
         }
 
+        fn processString(self: *Self, substring: []const u8, guess_count: u64) !void {
+            const len = substring.len;
+            var heap = &self.heaps[len];
+            var counts = &self.actual_counts[len];
+
+            // Check if we're already tracking this string
+            if (counts.contains(substring)) {
+                //std.debug.print("Already tracking '{s}'\n", .{substring});
+                // Already tracking, just increment the actual count
+                counts.getPtr(substring).?.* += 1;
+            } else if (heap.count() < self.top_k) {
+                //std.debug.print("Adding '{s}' to heap\n", .{substring});
+                // Haven't reached capacity yet, add the string
+                const str_copy = try self.allocator.dupe(u8, substring);
+                errdefer self.allocator.free(str_copy);
+
+                try heap.add(.{ .string = str_copy, .guess_count = guess_count });
+                try counts.put(str_copy, 1);
+            } else if (heap.count() == self.top_k and heap.peek().?.guess_count < guess_count) {
+                // Current string has higher estimated count than our minimum
+                const evicted = heap.remove();
+                _ = counts.remove(evicted.string);
+                self.allocator.free(evicted.string);
+
+                // Add the new string
+                const str_copy = try self.allocator.dupe(u8, substring);
+                errdefer self.allocator.free(str_copy);
+
+                try heap.add(.{ .string = str_copy, .guess_count = guess_count });
+                try counts.put(str_copy, 1);
+            }
+        }
+
         // PASS 2: Identify top-K strings and calculate actual counts
         pub fn processDocumentSecondPass(self: *Self, document: []const u8) !void {
             const start_time = time.nanoTimestamp();
 
             for (0..document.len) |i| {
-                for (min_length..max_length + 1) |len| {
-                    if (i + len <= document.len) {
-                        const substring = document[i .. i + len];
+                const max_len = @min(max_length, document.len - i);
+                if (max_len < 2) {
+                    continue;
+                }
 
-                        // Get estimated count - either from direct counters or CMS
-                        var guess_count: usize = 0;
+                const guess_count_2 = self.length2_counters[length2ToIndex(document[i .. i + 2])];
+                try self.processString(document[i .. i + 2], guess_count_2);
 
-                        if (len == 2) {
-                            guess_count = self.length2_counters[length2ToIndex(substring)];
-                        } else if (len == 3) {
-                            guess_count = self.length3_counters[length3ToIndex(substring)];
-                        } else {
-                            //std.debug.print("Querying CMS for '{s}'\n", .{substring});
-                            guess_count = self.cms.query(substring);
-                        }
+                if (max_len < 3) {
+                    continue;
+                }
 
-                        var heap = &self.heaps[len];
-                        var counts = &self.actual_counts[len];
+                const guess_count_3 = self.length3_counters[length3ToIndex(document[i .. i + 3])];
+                try self.processString(document[i .. i + 3], guess_count_3);
+                
+                if (max_len < 4) {
+                    continue;
+                }
 
-                        // Check if we're already tracking this string
-                        if (counts.contains(substring)) {
-                            //std.debug.print("Already tracking '{s}'\n", .{substring});
-                            // Already tracking, just increment the actual count
-                            counts.getPtr(substring).?.* += 1;
-                        } else if (heap.count() < self.top_k) {
-                            //std.debug.print("Adding '{s}' to heap\n", .{substring});
-                            // Haven't reached capacity yet, add the string
-                            const str_copy = try self.allocator.dupe(u8, substring);
-                            errdefer self.allocator.free(str_copy);
-
-                            try heap.add(.{ .string = str_copy, .guess_count = guess_count });
-                            try counts.put(str_copy, 1);
-                        } else if (heap.count() == self.top_k and heap.peek().?.guess_count < guess_count) {
-                            // Current string has higher estimated count than our minimum
-                            const evicted = heap.remove();
-                            _ = counts.remove(evicted.string);
-                            self.allocator.free(evicted.string);
-
-                            // Add the new string
-                            const str_copy = try self.allocator.dupe(u8, substring);
-                            errdefer self.allocator.free(str_copy);
-
-                            try heap.add(.{ .string = str_copy, .guess_count = guess_count });
-                            try counts.put(str_copy, 1);
-                        }
-                        // Else: Not in top-K, ignore
-                    }
+                var scratch: [N_LENGTHS]u64 = undefined;
+                self.cms.query(&scratch, @ptrCast(&document[i]));
+                for (scratch, 4..max_len) |guess_count, len| {
+                    try self.processString(document[i .. i + len], guess_count);
                 }
             }
 
@@ -322,7 +333,7 @@ pub fn StringFrequencyManager(
                     var total_error: f64 = 0;
                     var total_error_pct: f64 = 0;
 
-                    const display_count = @min(10, results.items.len);
+                    const display_count = @min(1000, results.items.len);
 
                     // Display in descending order (highest frequency first)
                     var i: usize = results.items.len;

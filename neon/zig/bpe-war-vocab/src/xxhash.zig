@@ -184,6 +184,7 @@ pub fn XxHash3(comptime VEC_WIDTH: comptime_int) type {
         // Public API - Oneshot
 
         pub noinline fn hash(noalias dst_: [*]u64, seed: [VEC_WIDTH]u64, noalias input: *const [256]u8) void {
+            @setEvalBranchQuota(1_000_000);
             const secret = &default_secret;
             var dst = dst_;
             {

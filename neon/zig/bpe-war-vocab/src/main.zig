@@ -9,9 +9,9 @@ pub fn main() !void {
     // Configure parameters
     const min_length = 2;
     const max_length = 256;
-    const top_k = 100_000; // Track top 100k strings per length
+    const top_k = 10000; // Track top 100k strings per length
     const cms_width = 1 << 24; // ~16 million counters per hash function
-    const cms_depth = 5; // 5 hash functions
+    const cms_depth = 10; // 10 hash functions
 
     const saved_data_path = "fineweb_first_pass.bin";
     var manager: *SFM(cms_width, cms_depth, min_length, max_length) = undefined;
@@ -32,6 +32,7 @@ pub fn main() !void {
         // Load the first pass data from disk
         std.debug.print("=== LOADING FIRST PASS DATA FROM DISK ===\n", .{});
         manager = try SFM(cms_width, cms_depth, min_length, max_length).loadFirstPassFromDisk(allocator, saved_data_path);
+        manager.top_k = top_k;
         std.debug.print("First pass data loaded successfully.\n", .{});
     } else {
         // Create the manager
