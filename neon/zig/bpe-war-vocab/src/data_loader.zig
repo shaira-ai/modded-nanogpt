@@ -244,15 +244,17 @@ pub const FinewebDataLoader = struct {
         // Keep reading tokens until we find a separator
         var found_document = false;
         var token_count: usize = 0;
-        const CHUNK_SIZE = 4096;
+        const CHUNK_SIZE = 1;
+
+
+        var byte_buffer = try self.allocator.alloc(u8, CHUNK_SIZE * 2);
+        defer self.allocator.free(byte_buffer);
+
 
         // Read chunks directly into our document_tokens
         while (!found_document) {
             // Ensure we have capacity for the next chunk
             try document_tokens.ensureUnusedCapacity(CHUNK_SIZE);
-
-            var byte_buffer = try self.allocator.alloc(u8, CHUNK_SIZE * 2);
-            defer self.allocator.free(byte_buffer);
 
             const bytes_read = try self.buffered_reader.reader().readAll(byte_buffer);
             if (bytes_read == 0) {
