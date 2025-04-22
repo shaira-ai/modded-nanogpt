@@ -158,13 +158,13 @@ pub const FinewebDataLoader = struct {
         reportFunctionTime("loadVocabulary", elapsed);
     }
 
-    /// Skip the file header (first 32 bytes)
+    /// Skip the file header (first 1024 bytes)
     fn skipHeader(self: *FinewebDataLoader) !void {
         const start_time = time.nanoTimestamp();
 
         if (self.header_skipped) return;
 
-        const HEADER_SIZE = 32; // Based on our examination of the file
+        const HEADER_SIZE = 1024; // Based on our examination of the file
 
         // Use BufferedReader to skip bytes
         var skip_buffer: [HEADER_SIZE]u8 = undefined;
