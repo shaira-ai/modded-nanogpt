@@ -2,6 +2,7 @@ const std = @import("std");
 const time = std.time;
 const CMS_F = @import("count_min_sketch.zig").CountMinSketch;
 const N_LENGTHS = @import("count_min_sketch.zig").N_LENGTHS;
+const MY_LEN = @import("count_min_sketch.zig").MY_LEN;
 const fs = std.fs;
 
 pub const CandidateString = struct {
@@ -208,13 +209,13 @@ pub fn StringFrequencyManager(
                 // const guess_count_3 = self.length3_counters[length3ToIndex(document[i .. i + 3])];
                 // try self.processString(document[i .. i + 3], guess_count_3);
                 
-                if (max_len < 10) {
+                if (max_len < MY_LEN) {
                     continue;
                 }
 
                 var scratch: [N_LENGTHS]u64 = undefined;
                 self.cms.query(&scratch, @ptrCast(&document[i]));
-                for (scratch[0..1], 10..11) |guess_count, len| {
+                for (scratch[0..1], MY_LEN..MY_LEN + 1) |guess_count, len| {
                     try self.processString(document[i .. i + len], guess_count);
                 }
             }
