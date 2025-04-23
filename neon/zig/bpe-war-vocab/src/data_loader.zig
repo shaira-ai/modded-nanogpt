@@ -22,7 +22,7 @@ pub const FinewebDataLoader = struct {
     file_path: []const u8,
 
     // Buffered reader with large buffer
-    buffered_reader: std.io.BufferedReader(2*1024*1024, std.fs.File.Reader),
+    buffered_reader: std.io.BufferedReader(2 * 1024 * 1024, std.fs.File.Reader),
 
     // Token handling
     token_map: std.AutoHashMap(usize, []const u8),
@@ -36,6 +36,9 @@ pub const FinewebDataLoader = struct {
     added_fake_separator: bool,
     reached_end: bool,
     header_skipped: bool,
+
+    // Vocabulary information for rewinding
+    vocab_path: ?[]const u8,
 
     pub fn init(allocator: std.mem.Allocator, file_path: []const u8) !*FinewebDataLoader {
         const start_time = time.nanoTimestamp();
@@ -55,7 +58,7 @@ pub const FinewebDataLoader = struct {
             .allocator = allocator,
             .file = file,
             .file_path = try allocator.dupe(u8, file_path),
-            .buffered_reader = std.io.bufferedReaderSize(2*1024*1024, file.reader()),
+            .buffered_reader = std.io.bufferedReaderSize(2 * 1024 * 1024, file.reader()),
             .token_map = std.AutoHashMap(usize, []const u8).init(allocator),
             .byte_to_token = std.StringHashMap(usize).init(allocator),
             .token_bytes = token_bytes,
@@ -63,6 +66,7 @@ pub const FinewebDataLoader = struct {
             .added_fake_separator = false,
             .reached_end = false,
             .header_skipped = false,
+            .vocab_path = null,
         };
 
         // Print timing information
@@ -95,6 +99,11 @@ pub const FinewebDataLoader = struct {
             self.allocator.free(doc);
         }
 
+        // Free vocab path if it exists
+        if (self.vocab_path) |path| {
+            self.allocator.free(path);
+        }
+
         self.allocator.destroy(self);
 
         // Print timing information
@@ -107,6 +116,11 @@ pub const FinewebDataLoader = struct {
     /// Load GPT-2 vocabulary from a JSON file
     pub fn loadVocabulary(self: *FinewebDataLoader, vocab_path: []const u8) !void {
         const start_time = time.nanoTimestamp();
+
+        // Store the vocabulary path for potential rewinding
+        if (self.vocab_path == null) {
+            self.vocab_path = try self.allocator.dupe(u8, vocab_path);
+        }
 
         const vocab_file = try std.fs.cwd().openFile(vocab_path, .{});
         defer vocab_file.close();
@@ -156,6 +170,35 @@ pub const FinewebDataLoader = struct {
         // Print timing information
         const elapsed = time.nanoTimestamp() - start_time;
         reportFunctionTime("loadVocabulary", elapsed);
+    }
+
+    /// Rewind the data loader to start from the beginning
+    pub fn rewind(self: *FinewebDataLoader) !void {
+        const start_time = time.nanoTimestamp();
+
+        // Close the current file
+        self.file.close();
+
+        // Re-open the file
+        self.file = try std.fs.cwd().openFile(self.file_path, .{});
+
+        // Re-initialize the buffered reader
+        self.buffered_reader = std.io.bufferedReaderSize(2 * 1024 * 1024, self.file.reader());
+
+        // Reset tracking state
+        self.header_skipped = false;
+        self.reached_end = false;
+
+        // Free the current document if any
+        if (self.current_document) |doc| {
+            self.allocator.free(doc);
+            self.current_document = null;
+        }
+
+        // No need to reload vocabulary - it's already loaded
+
+        const elapsed = time.nanoTimestamp() - start_time;
+        reportFunctionTime("rewind", elapsed);
     }
 
     /// Skip the file header (first 1024 bytes)
@@ -246,10 +289,8 @@ pub const FinewebDataLoader = struct {
         var token_count: usize = 0;
         const CHUNK_SIZE = 1;
 
-
         var byte_buffer = try self.allocator.alloc(u8, CHUNK_SIZE * 2);
         defer self.allocator.free(byte_buffer);
-
 
         // Read chunks directly into our document_tokens
         while (!found_document) {

@@ -1,101 +1,133 @@
 const std = @import("std");
-const fineweb = @import("data_loader.zig").FinewebDataLoader;
-const SFM = @import("string_frequency_manager.zig").StringFrequencyManager;
+const Allocator = std.mem.Allocator;
 const fs = std.fs;
+const time = std.time;
+
+const parallel = @import("parallel.zig");
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
+    var timer = try std.time.Timer.start();
 
     // Configure parameters
     const min_length = 2;
     const max_length = 256;
-    const top_k = 10000; // Track top 100k strings per length
+    const top_k = 10000; // Track top 10000 strings per length
     const cms_width = 1 << 24; // ~16 million counters per hash function
-    const cms_depth = 10; // 10 hash functions
+    const cms_depth = 10;
 
-    const saved_data_path = "fineweb_first_pass.bin";
-    var manager: *SFM(cms_width, cms_depth, min_length, max_length) = undefined;
+    const available_cores = try std.Thread.getCpuCount();
+    const num_threads = 3;
 
-    // Check if saved first pass data exists
-    const saved_data_exists = blk: {
-        const file = fs.cwd().openFile(saved_data_path, .{}) catch |err| {
-            if (err == error.FileNotFound) {
-                break :blk false;
-            }
-            return err;
-        };
-        file.close();
-        break :blk true;
-    };
+    const debug = true;
+
+    // Flag to skip disk I/O and keep data in memory between passes
+    const skip_disk_io = true;
+
+    std.debug.print("=== Parallel String Frequency Analysis ===\n", .{});
+    std.debug.print("Parameters:\n", .{});
+    std.debug.print("  - CMS width: {d} counters\n", .{cms_width});
+    std.debug.print("  - CMS depth: {d} hash functions\n", .{cms_depth});
+    std.debug.print("  - Min length: {d}\n", .{min_length});
+    std.debug.print("  - Max length: {d}\n", .{max_length});
+    std.debug.print("  - Top K: {d} strings per length\n", .{top_k});
+    std.debug.print("  - Worker threads: {d} (of {d} cores)\n", .{ num_threads, available_cores });
+    std.debug.print("  - Skip disk I/O: {}\n", .{skip_disk_io});
+
+    // Create the parallel analyzer
+    const ParallelAnalyzer = parallel.ParallelAnalyzer(cms_width, cms_depth, min_length, max_length);
+
+    const data_file = "fineweb_train_000001.bin";
+    const vocab_file = "vocab.json";
+    const saved_data_path = "fineweb_first_pass_parallel.bin";
+
+    var analyzer = try ParallelAnalyzer.init(allocator, num_threads, data_file, vocab_file, saved_data_path, top_k, debug);
+    defer analyzer.deinit();
+
+    // Check if saved data exists
+    const saved_data_exists = try analyzer.hasSavedData();
 
     if (saved_data_exists) {
         // Load the first pass data from disk
-        std.debug.print("=== LOADING FIRST PASS DATA FROM DISK ===\n", .{});
-        manager = try SFM(cms_width, cms_depth, min_length, max_length).loadFirstPassFromDisk(allocator, saved_data_path);
-        manager.top_k = top_k;
-        std.debug.print("First pass data loaded successfully.\n", .{});
+        std.debug.print("\n=== LOADING FIRST PASS DATA FROM DISK ===\n", .{});
+        _ = timer.lap(); // Start loading timer
+
+        try analyzer.loadFirstPassData();
+
+        const load_time = timer.lap();
+        const load_ms = @as(f64, @floatFromInt(load_time)) / time.ns_per_ms;
+        std.debug.print("Data loaded in {d:.2}ms\n", .{load_ms});
+
+        // Run second pass
+        std.debug.print("\n=== PASS 2: Finding Top Strings (Parallel) ===\n", .{});
+        _ = timer.lap();
+
+        try analyzer.runSecondPass();
+
+        const second_pass_time = timer.lap();
+        const second_pass_ms = @as(f64, @floatFromInt(second_pass_time)) / time.ns_per_ms;
+        std.debug.print("Pass 2 completed in {d:.2}ms\n", .{second_pass_ms});
     } else {
-        // Create the manager
-        manager = try SFM(cms_width, cms_depth, min_length, max_length).init(allocator, top_k);
+        // Run first pass
+        std.debug.print("\n=== PASS 1: Building Count-Min Sketch (Parallel) ===\n", .{});
+        _ = timer.lap();
 
-        // Load documents and process them
-        var loader = try fineweb.init(allocator, "fineweb_train_000001.bin");
-        defer loader.deinit();
-        try loader.loadVocabulary("vocab.json");
+        try analyzer.runFirstPass();
 
-        // Pass 1: Build CMS and direct counters for length 2 and 3
-        std.debug.print("=== PASS 1: Building Count-Min Sketch and Direct Counters ===\n", .{});
-        var doc_count: usize = 0;
-        const start_time = std.time.nanoTimestamp();
+        const first_pass_time = timer.lap();
+        const first_pass_ms = @as(f64, @floatFromInt(first_pass_time)) / time.ns_per_ms;
+        std.debug.print("Pass 1 completed in {d:.2}ms\n", .{first_pass_ms});
 
-        while (true) {
-            const doc = try loader.nextDocumentString();
-            if (doc == null) break;
-            defer allocator.free(doc.?);
+        if (skip_disk_io) {
+            // Keep data in memory for second pass (skip disk I/O)
+            std.debug.print("\nPreparing data for second pass in memory...\n", .{});
+            _ = timer.lap();
 
-            try manager.buildCMS(doc.?);
-            doc_count += 1;
+            try analyzer.prepareSecondPassInMemory();
 
-            if (doc_count % 20 == 0) {
-                std.debug.print("Processed {d} documents in pass 1\n", .{doc_count});
-            }
+            const prep_time = timer.lap();
+            const prep_ms = @as(f64, @floatFromInt(prep_time)) / time.ns_per_ms;
+            std.debug.print("Data prepared in {d:.2}ms\n", .{prep_ms});
+        } else {
+            // Save first pass data to disk
+            std.debug.print("\nSaving first pass data to disk...\n", .{});
+            _ = timer.lap();
+
+            try analyzer.saveFirstPassData();
+
+            const save_time = timer.lap();
+            const save_ms = @as(f64, @floatFromInt(save_time)) / time.ns_per_ms;
+            std.debug.print("Data saved in {d:.2}ms\n", .{save_ms});
+
+            // Load saved data for second pass
+            std.debug.print("\nLoading saved data for second pass...\n", .{});
+            _ = timer.lap();
+
+            try analyzer.loadFirstPassData();
+
+            const load_time = timer.lap();
+            const load_ms = @as(f64, @floatFromInt(load_time)) / time.ns_per_ms;
+            std.debug.print("Data loaded in {d:.2}ms\n", .{load_ms});
         }
 
-        const elapsed = std.time.nanoTimestamp() - start_time;
-        std.debug.print("Pass 1 completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / std.time.ns_per_ms});
+        // Run second pass
+        std.debug.print("\n=== PASS 2: Finding Top Strings (Parallel) ===\n", .{});
+        _ = timer.lap();
 
-        // Save first pass data for future runs
-        std.debug.print("Saving first pass data to disk...\n", .{});
-        try manager.saveFirstPassToDisk(saved_data_path);
-        std.debug.print("First pass data saved successfully.\n", .{});
+        try analyzer.runSecondPass();
+
+        const second_pass_time = timer.lap();
+        const second_pass_ms = @as(f64, @floatFromInt(second_pass_time)) / time.ns_per_ms;
+        std.debug.print("Pass 2 completed in {d:.2}ms\n", .{second_pass_ms});
     }
 
-    defer manager.deinit();
+    // Get and display results
+    std.debug.print("\n=== RESULTS ===\n", .{});
+    try analyzer.getResults();
 
-    var loader = try fineweb.init(allocator, "fineweb_train_000001.bin");
-    defer loader.deinit();
-    try loader.loadVocabulary("vocab.json");
-
-    // Pass 2: Find top strings and track counts
-    std.debug.print("\n=== PASS 2: Finding Top Strings ===\n", .{});
-    var doc_count: usize = 0;
-    const start_time = std.time.nanoTimestamp();
-
-    while (true) {
-        const doc = try loader.nextDocumentString();
-        if (doc == null) break;
-        defer allocator.free(doc.?);
-
-        try manager.processDocumentSecondPass(doc.?);
-        doc_count += 1;
-
-        if (doc_count % 20 == 0) {
-            std.debug.print("Processed {d} documents in pass 2\n", .{doc_count});
-        }
-    }
-
-    const elapsed = std.time.nanoTimestamp() - start_time;
-    std.debug.print("Pass 2 completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / std.time.ns_per_ms});
-
-    try manager.getResults();
+    // Display overall statistics
+    const total_time = timer.read();
+    const total_ms = @as(f64, @floatFromInt(total_time)) / time.ns_per_ms;
+    std.debug.print("\n=== Processing Complete ===\n", .{});
+    std.debug.print("Total execution time: {d:.2}ms\n", .{total_ms});
 }

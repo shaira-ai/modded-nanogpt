@@ -46,7 +46,7 @@ pub fn StringFrequencyManager(
         top_k: usize,
         length2_counters: []usize,
         length3_counters: []usize,
-
+        cms_is_owned: bool = true,
         // Min heaps for tracking top-K strings of each length
         heaps: []std.PriorityQueue(CandidateString, void, CandidateString.lessThan),
         // Maps to track actual counts of candidate strings
@@ -65,11 +65,11 @@ pub fn StringFrequencyManager(
             errdefer cms.deinit();
 
             // Initialize heaps and count maps
-            const heaps = try allocator.alloc(std.PriorityQueue(CandidateString, void, CandidateString.lessThan), max_length+1);
+            const heaps = try allocator.alloc(std.PriorityQueue(CandidateString, void, CandidateString.lessThan), max_length + 1);
             for (heaps) |*heap| {
                 heap.* = std.PriorityQueue(CandidateString, void, CandidateString.lessThan).init(allocator, {});
             }
-            const actual_counts = try allocator.alloc(std.StringHashMap(usize), max_length+1);
+            const actual_counts = try allocator.alloc(std.StringHashMap(usize), max_length + 1);
             for (actual_counts) |*map| {
                 map.* = std.StringHashMap(usize).init(allocator);
             }
@@ -96,8 +96,9 @@ pub fn StringFrequencyManager(
 
         pub fn deinit(self: *Self) void {
             const start_time = time.nanoTimestamp();
-
-            self.cms.deinit();
+            if (self.cms_is_owned) {
+                self.cms.deinit();
+            }
             self.allocator.free(self.length2_counters);
             self.allocator.free(self.length3_counters);
             for (self.heaps) |*heap| {
@@ -208,7 +209,7 @@ pub fn StringFrequencyManager(
 
                 // const guess_count_3 = self.length3_counters[length3ToIndex(document[i .. i + 3])];
                 // try self.processString(document[i .. i + 3], guess_count_3);
-                
+
                 if (max_len < MY_LEN) {
                     continue;
                 }
