@@ -7,8 +7,8 @@ pub const CoordinatorMessageType = enum {
     ProcessDocument,
     /// Find the top K strings based on current CMS data
     FindTopK,
-    /// Merge this worker's CMS into the global CMS
-    MergeCMS,
+    /// Request worker's CMS data (replaces MergeCMS)
+    RequestCMS,
     /// Dump the worker's state to a file
     DumpState,
     /// Shutdown the worker thread
@@ -21,8 +21,8 @@ pub const WorkerMessageType = enum {
     DocumentProcessed,
     /// Top K strings have been found
     TopKComplete,
-    /// CMS has been merged with the global CMS
-    CMSMergeComplete,
+    /// Worker is providing its CMS for merging (replaces CMSMergeComplete)
+    ProvideCMS,
     /// State has been dumped to a file
     StateDumped,
     /// Error occurred during processing
@@ -46,10 +46,10 @@ pub const CoordinatorMessage = struct {
 
     /// Pass number (1 or 2) for ProcessDocument
     pass: ?u8 = null,
-
-    /// Pointer to globally merged CMS (only used for MergeCMS)
-    global_cms: ?*anyopaque = null,
 };
+
+/// Fixed-size error message buffer to avoid heap allocations
+pub const MAX_ERROR_MSG_LEN = 256;
 
 /// Message sent from a worker to the coordinator
 pub const WorkerMessage = struct {
@@ -64,13 +64,23 @@ pub const WorkerMessage = struct {
     document: ?[]const u8 = null,
 
     /// Error message (only used for Error)
-    error_msg: ?[]const u8 = null,
-
-    /// Error memory is allocated by the worker and must be freed by the coordinator
-    error_needs_free: bool = false,
+    /// Using a stack-allocated buffer instead of heap-allocated string
+    error_buffer: [MAX_ERROR_MSG_LEN]u8 = undefined,
+    error_len: usize = 0,
 
     /// Pass number (1 or 2) for DocumentProcessed
     pass: ?u8 = null,
+
+    /// Worker's CMS pointer (only used for ProvideCMS)
+    worker_cms: ?*anyopaque = null,
+
+    /// Get error message as a slice
+    pub fn getErrorMessage(self: *const WorkerMessage) ?[]const u8 {
+        if (self.msg_type != .Error or self.error_len == 0) {
+            return null;
+        }
+        return self.error_buffer[0..self.error_len];
+    }
 };
 
 /// Create a new CoordinatorMessage for processing a document
@@ -91,12 +101,11 @@ pub fn createFindTopKMessage(worker_id: usize) CoordinatorMessage {
     };
 }
 
-/// Create a new CoordinatorMessage for merging CMS
-pub fn createMergeCMSMessage(worker_id: usize, global_cms: *anyopaque) CoordinatorMessage {
+/// Create a new CoordinatorMessage for requesting CMS data
+pub fn createRequestCMSMessage(worker_id: usize) CoordinatorMessage {
     return CoordinatorMessage{
-        .msg_type = .MergeCMS,
+        .msg_type = .RequestCMS,
         .worker_id = worker_id,
-        .global_cms = global_cms,
     };
 }
 
@@ -135,11 +144,12 @@ pub fn createTopKCompleteMessage(worker_id: usize) WorkerMessage {
     };
 }
 
-/// Create a new WorkerMessage for CMS merge complete
-pub fn createCMSMergeCompleteMessage(worker_id: usize) WorkerMessage {
+/// Create a new WorkerMessage for providing CMS data
+pub fn createProvideCMSMessage(worker_id: usize, worker_cms: *anyopaque) WorkerMessage {
     return WorkerMessage{
-        .msg_type = .CMSMergeComplete,
+        .msg_type = .ProvideCMS,
         .worker_id = worker_id,
+        .worker_cms = worker_cms,
     };
 }
 
@@ -152,20 +162,25 @@ pub fn createStateDumpedMessage(worker_id: usize) WorkerMessage {
 }
 
 /// Create a new WorkerMessage for error
-pub fn createErrorMessage(worker_id: usize, error_msg: []const u8, error_needs_free: bool) WorkerMessage {
-    return WorkerMessage{
+pub fn createErrorMessage(worker_id: usize, error_msg: []const u8) WorkerMessage {
+    var msg = WorkerMessage{
         .msg_type = .Error,
         .worker_id = worker_id,
-        .error_msg = error_msg,
-        .error_needs_free = error_needs_free,
+        .error_len = 0,
     };
+
+    // Copy error message to fixed buffer, truncating if necessary
+    const copy_len = @min(error_msg.len, MAX_ERROR_MSG_LEN);
+    @memcpy(msg.error_buffer[0..copy_len], error_msg[0..copy_len]);
+    msg.error_len = copy_len;
+
+    return msg;
 }
 
-/// Free any memory owned by a WorkerMessage
+/// No memory to free in WorkerMessage anymore - kept for API compatibility
 pub fn freeWorkerMessage(allocator: Allocator, message: *const WorkerMessage) void {
-    if (message.msg_type == .Error and message.error_needs_free and message.error_msg != null) {
-        allocator.free(message.error_msg.?);
-    }
+    _ = allocator;
+    _ = message;
 }
 
 /// Free any memory owned by a CoordinatorMessage

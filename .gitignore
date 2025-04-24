@@ -6,3 +6,4 @@ logs/
 *.dylib
 *.dylib.o
 .zig-cache
+*.bin

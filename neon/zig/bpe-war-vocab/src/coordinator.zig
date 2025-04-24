@@ -49,14 +49,14 @@ pub fn Coordinator(
         /// Number of worker threads
         num_workers: usize,
 
-        /// Worker threads
-        workers: []?*Worker,
+        /// Worker threads - using non-nullable array
+        workers: []*Worker,
 
-        /// Input queues for workers
-        input_queues: []?*message_queue.CoordinatorMessageQueue,
+        /// Input queues for workers - using value-based arrays
+        input_queues: []message_queue.CoordinatorMessageQueue,
 
-        /// Output queues from workers
-        output_queues: []?*message_queue.WorkerMessageQueue,
+        /// Output queues from workers - using value-based arrays
+        output_queues: []message_queue.WorkerMessageQueue,
 
         /// Data loader
         data_loader: *fineweb,
@@ -78,9 +78,6 @@ pub fn Coordinator(
 
         /// Top-K strings to track per length
         top_k: usize,
-
-        /// Coordinator thread
-        thread: ?Thread = null,
 
         /// Running flag
         running: bool = false,
@@ -121,24 +118,19 @@ pub fn Coordinator(
             errdefer allocator.destroy(self);
 
             // Allocate arrays
-            const workers = try allocator.alloc(?*Worker, num_workers);
+            const workers = try allocator.alloc(*Worker, num_workers);
             errdefer allocator.free(workers);
 
-            const input_queues = try allocator.alloc(?*message_queue.CoordinatorMessageQueue, num_workers);
+            const input_queues = try allocator.alloc(message_queue.CoordinatorMessageQueue, num_workers);
             errdefer allocator.free(input_queues);
 
-            const output_queues = try allocator.alloc(?*message_queue.WorkerMessageQueue, num_workers);
+            const output_queues = try allocator.alloc(message_queue.WorkerMessageQueue, num_workers);
             errdefer allocator.free(output_queues);
-
-            // Initialize arrays to null
-            @memset(workers, null);
-            @memset(input_queues, null);
-            @memset(output_queues, null);
 
             // Create pending documents list
             const pending_documents = std.ArrayList([]const u8).init(allocator);
 
-            // Initialize the coordinator
+            // Initialize the coordinator with placeholder values
             self.* = .{
                 .allocator = allocator,
                 .num_workers = num_workers,
@@ -169,30 +161,14 @@ pub fn Coordinator(
         pub fn deinit(self: *Self) void {
             const start_time = time.nanoTimestamp();
 
-            // Stop any running thread
-            if (self.thread != null) {
-                self.running = false;
-                self.thread.?.join();
-                self.thread = null;
-            }
-
             // Clean up workers
             for (0..self.num_workers) |i| {
-                if (self.workers[i]) |worker| {
-                    worker.stop();
-                    worker.deinit();
-                    self.workers[i] = null;
-                }
+                self.workers[i].stop();
+                self.workers[i].deinit();
 
-                if (self.input_queues[i]) |queue| {
-                    queue.deinit();
-                    self.input_queues[i] = null;
-                }
-
-                if (self.output_queues[i]) |queue| {
-                    queue.deinit();
-                    self.output_queues[i] = null;
-                }
+                // Clean up queues
+                self.input_queues[i].deinit();
+                self.output_queues[i].deinit();
             }
 
             // Free the arrays
@@ -231,30 +207,23 @@ pub fn Coordinator(
         pub fn start(self: *Self) !void {
             const start_time = time.nanoTimestamp();
 
-            // Check if we're already running
-            if (self.thread != null) {
-                // If we have a thread, wait for it to finish
-                self.thread.?.join();
-                self.thread = null;
-            }
-
-            // Create workers if needed (they might have been shut down)
-            if (self.workers[0] == null) {
-                try self.initWorkers();
-            }
+            // Always initialize workers - since we're making a single pass through the code
+            try self.initWorkers();
 
             // Reset end-of-documents flag when starting a new pass
             self.end_of_documents_reached = false;
             self.cms_merge_completions = 0;
 
-            // Start the coordinator thread
+            // Set running flag
             self.running = true;
-            self.thread = try Thread.spawn(.{}, Self.run, .{self});
 
             if (self.debug) {
                 const elapsed = time.nanoTimestamp() - start_time;
                 std.debug.print("[Coordinator] start: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
             }
+
+            // Instead of spawning a thread, run the coordinator logic directly
+            try self.run();
         }
 
         /// Initialize the workers
@@ -263,20 +232,15 @@ pub fn Coordinator(
 
             // Create and start each worker
             for (0..self.num_workers) |i| {
-                // Create message queues
-                const input_queue = try message_queue.CoordinatorMessageQueue.init(self.allocator);
-                const output_queue = try message_queue.WorkerMessageQueue.init(self.allocator);
+                // Create message queues as values
+                self.input_queues[i] = try message_queue.CoordinatorMessageQueue.init(self.allocator);
+                self.output_queues[i] = try message_queue.WorkerMessageQueue.init(self.allocator);
 
-                self.input_queues[i] = input_queue;
-                self.output_queues[i] = output_queue;
-
-                // Create worker
-                const worker = try Worker.init(self.allocator, i, input_queue, output_queue, self.top_k, self.debug);
-
-                self.workers[i] = worker;
+                // Create worker with references to the queues
+                self.workers[i] = try Worker.init(self.allocator, i, &self.input_queues[i], &self.output_queues[i], self.top_k, self.debug);
 
                 // Start worker
-                try worker.start();
+                try self.workers[i].start();
             }
 
             if (self.debug) {
@@ -294,77 +258,21 @@ pub fn Coordinator(
             }
         }
 
-        /// Wait for the coordinator to complete
+        /// Wait for the coordinator to complete - now a no-op since we run directly
         pub fn wait(self: *Self) void {
-            if (self.thread) |thread| {
-                thread.join();
-                self.thread = null;
-            }
-        }
-
-        /// Monitor worker responses and handle them
-        fn handleWorkerResponses(self: *Self) !void {
-            var all_workers_idle = true;
-            var queued_work = false;
-            var active_workers: usize = 0;
-
-            // Check each worker's output queue
-            for (0..self.num_workers) |i| {
-                if (self.output_queues[i]) |queue| {
-                    // Process all available messages
-                    while (queue.pop()) |msg| {
-                        all_workers_idle = false;
-
-                        // Handle the message
-                        try self.handleWorkerMessage(msg);
-                    }
-
-                    // Check if this worker has queued work
-                    const input_queue = self.input_queues[i].?;
-                    if (input_queue.count() > 0) {
-                        queued_work = true;
-                        all_workers_idle = false;
-                        active_workers += 1;
-                    }
-                }
-            }
-
-            self.active_workers = active_workers;
-
-            // Check if we should transition state
-            // Either all workers are idle and no pending documents, OR we've hit the document limit
-            // OR we've processed a very large number of documents (safeguard)
-            const at_document_limit = (self.max_documents > 0) and
-                ((self.state == .FirstPass and self.first_pass_count >= self.max_documents) or
-                    (self.state == .SecondPass and self.second_pass_count >= self.max_documents));
-
-            const force_transition = (self.state == .FirstPass and self.first_pass_count > 500000) or
-                (self.state == .SecondPass and self.second_pass_count > 500000);
-
-            // Additional conditions to detect end of documents:
-            // 1. We have reached end of documents AND
-            // 2. Either all workers are idle OR pending documents list is empty
-            const end_of_phase = self.end_of_documents_reached and
-                (all_workers_idle or (active_workers == 0 and self.pending_documents.items.len == 0));
-
-            if (end_of_phase and self.debug) {
-                std.debug.print("[Coordinator] Detected end of documents - all {d} documents processed. Transitioning to next phase.\n", .{if (self.state == .FirstPass) self.first_pass_count else self.second_pass_count});
-            }
-
-            if ((all_workers_idle and !queued_work and self.pending_documents.items.len == 0) or
-                at_document_limit or
-                force_transition or
-                end_of_phase)
-            {
-                if (force_transition and self.debug) {
-                    std.debug.print("[Coordinator] Forcing state transition after processing {d} documents\n", .{if (self.state == .FirstPass) self.first_pass_count else self.second_pass_count});
-                }
-                try self.transitionStateIfNeeded();
-            }
+            // Previously would join the thread, now we run directly
+            _ = self;
         }
 
         /// Handle a message from a worker
         fn handleWorkerMessage(self: *Self, msg: message.WorkerMessage) !void {
+            const start_time = time.nanoTimestamp();
+
+            // Add detailed message info logging
+            if (self.debug) {
+                std.debug.print("[Coordinator] [DEBUG] Handling message from Worker {d}, type: {s}\n", .{ msg.worker_id, @tagName(msg.msg_type) });
+            }
+
             defer message.freeWorkerMessage(self.allocator, &msg);
 
             switch (msg.msg_type) {
@@ -373,30 +281,37 @@ pub fn Coordinator(
                     if (msg.document != null and msg.pass != null) {
                         const pass = msg.pass.?;
 
+                        // Check pending documents array
+                        var found_pending_doc = false;
+                        for (self.pending_documents.items, 0..) |doc, i| {
+                            if (doc.ptr == msg.document.?.ptr) {
+                                // Remove this document from pending
+                                _ = self.pending_documents.swapRemove(i);
+                                found_pending_doc = true;
+
+                                if (self.debug) {
+                                    std.debug.print("[Coordinator] [DEBUG] Removed document from pending list, {d} remaining\n", .{self.pending_documents.items.len});
+                                }
+                                break;
+                            }
+                        }
+
+                        if (!found_pending_doc and self.debug) {
+                            std.debug.print("[Coordinator] [DEBUG] Warning: Could not find document in pending list\n", .{});
+                        }
+
                         // Count processed documents
                         if (pass == 1) {
                             self.first_pass_count += 1;
 
-                            if (self.debug and self.first_pass_count % 10000 == 0) {
+                            if (self.debug and (self.first_pass_count % 1000 == 0 or self.first_pass_count < 10)) {
                                 std.debug.print("[Coordinator] First pass processed: {d} documents\n", .{self.first_pass_count});
                             }
                         } else if (pass == 2) {
                             self.second_pass_count += 1;
 
-                            if (self.debug and self.second_pass_count % 10000 == 0) {
+                            if (self.debug and (self.second_pass_count % 1000 == 0 or self.second_pass_count < 10)) {
                                 std.debug.print("[Coordinator] Second pass processed: {d} documents\n", .{self.second_pass_count});
-                            }
-                        }
-
-                        // Attempt to feed another document to the worker
-                        const fed_document = try self.feedWorkerIfNeeded(msg.worker_id);
-
-                        // If we couldn't feed a document and this is the first time,
-                        // log that we've reached the end of the data stream
-                        if (!fed_document and !self.end_of_documents_reached) {
-                            self.end_of_documents_reached = true;
-                            if (self.debug) {
-                                std.debug.print("[Coordinator] End of document stream reached after {d} documents\n", .{if (self.state == .FirstPass) self.first_pass_count else self.second_pass_count});
                             }
                         }
                     }
@@ -409,12 +324,22 @@ pub fn Coordinator(
 
                     // Check if all workers are done
                     var all_complete = true;
+                    var active_workers: usize = 0;
+
+                    // Detailed logging of worker status
+                    if (self.debug) {
+                        std.debug.print("[Coordinator] [DEBUG] Checking if all workers are done with TopK...\n", .{});
+                    }
+
                     for (0..self.num_workers) |i| {
-                        if (self.workers[i]) |_| {
-                            // Check if this worker has pending messages
-                            if (self.input_queues[i].?.count() > 0) {
-                                all_complete = false;
-                                break;
+                        // Check if this worker has pending messages
+                        const queue_count = self.input_queues[i].count();
+                        if (queue_count > 0) {
+                            all_complete = false;
+                            active_workers += 1;
+
+                            if (self.debug) {
+                                std.debug.print("[Coordinator] [DEBUG] Worker {d} still has {d} messages in queue\n", .{ i, queue_count });
                             }
                         }
                     }
@@ -429,23 +354,30 @@ pub fn Coordinator(
 
                         // Stop the coordinator
                         self.running = false;
+                    } else if (self.debug) {
+                        std.debug.print("[Coordinator] [DEBUG] Not all workers complete or not in MergingResults state. State: {s}, active workers: {d}\n", .{ @tagName(self.state), active_workers });
                     }
                 },
-                .CMSMergeComplete => {
-                    // Worker has completed merging its CMS
-                    self.cms_merge_completions += 1;
+                .ProvideCMS => {
+                    // Worker has provided its CMS data for merging
+                    if (msg.worker_cms != null) {
+                        const worker_cms = @as(*CMS, @ptrCast(@alignCast(msg.worker_cms.?)));
 
-                    if (self.debug) {
-                        std.debug.print("[Coordinator] Worker {d} completed CMS merge ({d}/{d} workers done)\n", .{ msg.worker_id, self.cms_merge_completions, self.num_workers });
-                    }
+                        // Merge the worker's CMS into the global CMS
+                        try self.global_cms.?.merge(worker_cms);
 
-                    // If all workers are done with CMS merge, transition to second pass
-                    if (self.cms_merge_completions == self.num_workers and self.state == .MergingCMS) {
-                        if (self.debug) {
-                            std.debug.print("[Coordinator] All workers completed CMS merge, transitioning to Second Pass\n", .{});
+                        // Increment completion counter
+                        self.cms_merge_completions += 1;
+
+                        // If all workers have provided their CMS data, skip second pass and go to Complete
+                        if (self.cms_merge_completions == self.num_workers and self.state == .MergingCMS) {
+                            if (self.debug) {
+                                std.debug.print("[Coordinator] All workers provided CMS data, transitioning to Complete (skipping Second Pass)\n", .{});
+                            }
+                            // Skip the second pass since ParallelAnalyzer will handle it
+                            self.state = .Complete;
+                            self.running = false;
                         }
-
-                        try self.startSecondPass();
                     }
                 },
                 .StateDumped => {
@@ -456,21 +388,26 @@ pub fn Coordinator(
                 },
                 .Error => {
                     // Worker encountered an error
-                    if (msg.error_msg != null) {
-                        const error_text = try std.fmt.allocPrint(self.allocator, "Worker {d} error: {s}", .{ msg.worker_id, msg.error_msg.? });
+                    if (msg.getErrorMessage()) |error_text| {
+                        const error_copy = try std.fmt.allocPrint(self.allocator, "Worker {d} error: {s}", .{ msg.worker_id, error_text });
 
                         if (self.error_msg) |old_error| {
                             self.allocator.free(old_error);
                         }
 
-                        self.error_msg = error_text;
+                        self.error_msg = error_copy;
                         self.state = .Error;
 
                         if (self.debug) {
-                            std.debug.print("[Coordinator] {s}\n", .{error_text});
+                            std.debug.print("[Coordinator] {s}\n", .{error_copy});
                         }
                     }
                 },
+            }
+
+            const elapsed = time.nanoTimestamp() - start_time;
+            if (self.debug and elapsed > 50 * time.ns_per_ms) { // Log if handling took more than 50ms
+                std.debug.print("[Coordinator] [DEBUG] handleWorkerMessage for {s} took {d:.2}ms\n", .{ @tagName(msg.msg_type), @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
             }
         }
 
@@ -496,51 +433,7 @@ pub fn Coordinator(
             self.second_pass_count = 0;
             self.end_of_documents_reached = false;
 
-            // Feed initial documents to workers
-            for (0..self.num_workers) |i| {
-                for (0..self.queue_depth) |_| {
-                    _ = try self.feedWorkerIfNeeded(i);
-                }
-            }
-        }
-
-        /// Feed a document to a worker if one is available
-        /// Returns true if a document was fed, false if no more documents available
-        fn feedWorkerIfNeeded(self: *Self, worker_id: usize) !bool {
-            // Only feed in first or second pass
-            if (self.state != .FirstPass and self.state != .SecondPass) {
-                return false;
-            }
-
-            const input_queue = self.input_queues[worker_id].?;
-
-            // Check if the worker needs documents
-            if (input_queue.count() >= self.queue_depth) {
-                return false;
-            }
-
-            // Get the next document
-            const doc = try self.getNextDocument();
-            if (doc == null) {
-                // No more documents
-                return false;
-            }
-
-            // Add to pending documents
-            try self.pending_documents.append(doc.?);
-
-            // Create a message for the worker
-            const pass: u8 = if (self.state == .FirstPass) 1 else 2;
-            const msg = message.createProcessDocumentMessage(worker_id, doc.?, pass);
-
-            // Send the message
-            _ = input_queue.push(msg);
-
-            if (self.debug) {
-                std.debug.print("[Coordinator] Sent document to worker {d} (pass {d}, {d} bytes)\n", .{ worker_id, pass, doc.?.len });
-            }
-
-            return true;
+            // Note: Initial document feeding happens in the main run loop
         }
 
         /// Get the next document from the data loader
@@ -571,6 +464,67 @@ pub fn Coordinator(
             return doc;
         }
 
+        fn transitionToMergingCMS(self: *Self) !void {
+            const start_time = time.nanoTimestamp();
+
+            if (self.debug) {
+                std.debug.print("[Coordinator] [DEBUG] Starting transition to MergingCMS state\n", .{});
+            }
+
+            // All documents processed in first pass, transition to merging CMS
+            self.state = .MergingCMS;
+
+            if (self.debug) {
+                std.debug.print("[Coordinator] First pass complete ({d} documents), requesting CMS data from workers\n", .{self.first_pass_count});
+                std.debug.print("[Coordinator] [DEBUG] Pending documents: {d}, State: {s}\n", .{ self.pending_documents.items.len, @tagName(self.state) });
+            }
+
+            // Create the global CMS
+            if (self.debug) {
+                std.debug.print("[Coordinator] [DEBUG] Creating global CMS...\n", .{});
+            }
+
+            if (self.global_cms != null) {
+                std.debug.print("[Coordinator] [WARNING] global_cms already exists during transition to MergingCMS\n", .{});
+                self.global_cms.?.deinit();
+            }
+
+            self.global_cms = try CMS.init(self.allocator);
+            if (self.debug) {
+                std.debug.print("[Coordinator] [DEBUG] Global CMS created successfully\n", .{});
+            }
+
+            // Send request CMS messages to all workers
+            if (self.debug) {
+                std.debug.print("[Coordinator] [DEBUG] Sending RequestCMS messages to all {d} workers...\n", .{self.num_workers});
+            }
+
+            var sent_count: usize = 0;
+            for (0..self.num_workers) |i| {
+                const msg = message.createRequestCMSMessage(i);
+                const result = self.input_queues[i].push(msg);
+                sent_count += if (result) 1 else 0;
+
+                if (self.debug) {
+                    if (result) {
+                        std.debug.print("[Coordinator] [DEBUG] Sent RequestCMS to worker {d}\n", .{i});
+                    } else {
+                        std.debug.print("[Coordinator] [ERROR] Failed to send RequestCMS to worker {d}! Queue full?\n", .{i});
+                    }
+                }
+            }
+
+            // Reset the CMS merge completions counter
+            self.cms_merge_completions = 0;
+
+            if (self.debug) {
+                std.debug.print("[Coordinator] [DEBUG] Sent CMS requests to {d}/{d} workers\n", .{ sent_count, self.num_workers });
+
+                const elapsed = time.nanoTimestamp() - start_time;
+                std.debug.print("[Coordinator] [DEBUG] Transition to MergingCMS completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
+            }
+        }
+
         /// Transition to the next state if needed
         fn transitionStateIfNeeded(self: *Self) !void {
             const old_state = self.state;
@@ -586,34 +540,12 @@ pub fn Coordinator(
                 },
                 .FirstPass => {
                     // All documents processed in first pass, transition to merging CMS
-                    self.state = .MergingCMS;
-
-                    if (self.debug) {
-                        std.debug.print("[Coordinator] First pass complete ({d} documents), merging CMS\n", .{self.first_pass_count});
-                    }
-
-                    // Create the global CMS
-                    self.global_cms = try CMS.init(self.allocator);
-
-                    // Send merge CMS messages to all workers
-                    for (0..self.num_workers) |i| {
-                        const input_queue = self.input_queues[i].?;
-                        const msg = message.createMergeCMSMessage(i, @as(*anyopaque, @ptrCast(self.global_cms.?)));
-                        _ = input_queue.push(msg);
-                    }
-
-                    // Reset the CMS merge completions counter
-                    self.cms_merge_completions = 0;
-
-                    // Set a reminder to check for all workers completing
-                    if (self.debug) {
-                        std.debug.print("[Coordinator] Sent CMS merge messages to all workers\n", .{});
-                    }
+                    try self.transitionToMergingCMS();
                 },
                 .MergingCMS => {
                     // In MergingCMS state we don't transition automatically - we wait for all
-                    // workers to complete their merge operations which is handled via the
-                    // CMSMergeComplete message handler
+                    // workers to provide their CMS data which is handled via the
+                    // ProvideCMS message handler
                     if (self.debug) {
                         std.debug.print("[Coordinator] CMS merging in progress ({d}/{d} workers completed)\n", .{ self.cms_merge_completions, self.num_workers });
                     }
@@ -628,9 +560,8 @@ pub fn Coordinator(
 
                     // Send find top-K messages to all workers
                     for (0..self.num_workers) |i| {
-                        const input_queue = self.input_queues[i].?;
                         const msg = message.createFindTopKMessage(i);
-                        _ = input_queue.push(msg);
+                        _ = self.input_queues[i].push(msg);
                     }
                 },
                 .MergingResults => {
@@ -677,80 +608,145 @@ pub fn Coordinator(
                 try self.transitionStateIfNeeded();
             }
 
-            // Initial document feed for first or second pass
+            // Initial document feed for first or second pass - push K documents to each worker
             if (self.state == .FirstPass or self.state == .SecondPass) {
+                // Push K documents to each worker initially
                 for (0..self.num_workers) |i| {
-                    for (0..self.queue_depth) |_| {
-                        _ = try self.feedWorkerIfNeeded(i);
+                    const documents_to_push = self.queue_depth;
+                    var pushed: usize = 0;
+
+                    while (pushed < documents_to_push) {
+                        const doc = try self.getNextDocument();
+                        if (doc == null) {
+                            // No more documents to push
+                            self.end_of_documents_reached = true;
+                            break;
+                        }
+
+                        // Add to pending documents
+                        try self.pending_documents.append(doc.?);
+
+                        // Create a message for the worker
+                        const pass: u8 = if (self.state == .FirstPass) 1 else 2;
+                        const msg = message.createProcessDocumentMessage(i, doc.?, pass);
+
+                        // Send the message
+                        _ = self.input_queues[i].push(msg);
+
+                        pushed += 1;
+
+                        if (self.debug and pushed == 1) {
+                            std.debug.print("[Coordinator] Initial document push: sent document to worker {d} (pass {d})\n", .{ i, pass });
+                        }
+                    }
+
+                    if (self.debug) {
+                        std.debug.print("[Coordinator] Initially pushed {d} documents to worker {d}\n", .{ pushed, i });
                     }
                 }
             }
 
-            // Main loop with timeout and stuck-detection
+            // Main loop with improved worker feeding logic
             const start_time = std.time.nanoTimestamp();
             const max_runtime_ms: u64 = 60 * 60 * 1000; // 1 hour max runtime
             var last_progress_time = start_time;
             var last_progress_count: usize = 0;
-            var consecutive_no_message_count: usize = 0;
-            const max_no_message_iterations: usize = 1000; // Force transition after 1000 iterations with no progress
 
             while (self.running) {
-                var had_messages = false;
+                var any_messages_processed = false;
 
-                // Process messages from all output queues
+                // Loop through each worker's output queue
                 for (0..self.num_workers) |i| {
-                    if (self.output_queues[i]) |queue| {
-                        if (queue.count() > 0) {
-                            had_messages = true;
-                            break;
+                    // Process all available messages from this worker
+                    while (self.output_queues[i].pop()) |msg| {
+                        any_messages_processed = true;
+
+                        // Handle the message (documents processed, errors, etc.)
+                        try self.handleWorkerMessage(msg);
+
+                        // If this was a document processed message, immediately feed another document
+                        // to the same worker to keep it busy
+                        if (msg.msg_type == .DocumentProcessed and
+                            (self.state == .FirstPass or self.state == .SecondPass))
+                        {
+                            const worker_id = msg.worker_id;
+
+                            // Only feed if the worker's queue isn't already full
+                            if (self.input_queues[worker_id].count() < self.queue_depth and !self.end_of_documents_reached) {
+                                const doc = try self.getNextDocument();
+                                if (doc) |document| {
+                                    // Add to pending documents
+                                    try self.pending_documents.append(document);
+
+                                    // Create a message for the worker
+                                    const pass: u8 = if (self.state == .FirstPass) 1 else 2;
+                                    const new_msg = message.createProcessDocumentMessage(worker_id, document, pass);
+
+                                    // Send the message
+                                    _ = self.input_queues[worker_id].push(new_msg);
+
+                                    if (self.debug and (self.first_pass_count + self.second_pass_count) % 10000 == 0) {
+                                        std.debug.print("[Coordinator] Fed another document to worker {d} (pass {d})\n", .{ worker_id, pass });
+                                    }
+                                } else {
+                                    // No more documents
+                                    self.end_of_documents_reached = true;
+
+                                    if (self.debug) {
+                                        std.debug.print("[Coordinator] No more documents to process\n", .{});
+                                    }
+                                }
+                            }
                         }
                     }
                 }
 
-                // Handle worker responses
-                try self.handleWorkerResponses();
+                // If we're in first or second pass, check if we should transition to the next state
+                if ((self.state == .FirstPass or self.state == .SecondPass) and self.end_of_documents_reached) {
+                    // Check if all workers are idle (no more documents to process)
+                    var all_workers_idle = true;
+                    var active_workers: usize = 0;
 
-                // If we had no messages, increment counter
-                if (!had_messages) {
-                    consecutive_no_message_count += 1;
-                } else {
-                    consecutive_no_message_count = 0;
-                }
-
-                // If we've gone many iterations with no messages, force state transition
-                if (consecutive_no_message_count > max_no_message_iterations) {
-                    if (self.debug) {
-                        std.debug.print("[Coordinator] No activity for {d} iterations, forcing state transition from {s}\n", .{ consecutive_no_message_count, @tagName(self.state) });
+                    for (0..self.num_workers) |i| {
+                        if (self.input_queues[i].count() > 0) {
+                            all_workers_idle = false;
+                            active_workers += 1;
+                        }
                     }
-                    try self.transitionStateIfNeeded();
-                    consecutive_no_message_count = 0;
+
+                    if (all_workers_idle and self.pending_documents.items.len == 0) {
+                        // All documents have been processed and acknowledged, transition to next state
+                        if (self.debug) {
+                            std.debug.print("[Coordinator] All documents processed, transitioning to next phase\n", .{});
+                        }
+                        try self.transitionStateIfNeeded();
+                    } else if (self.debug and (self.first_pass_count + self.second_pass_count) % 10000 == 0) {
+                        std.debug.print("[Coordinator] Waiting for {d} workers to finish, {d} pending documents\n", .{ active_workers, self.pending_documents.items.len });
+                    }
                 }
 
-                // Check for timeout
-                const elapsed = std.time.nanoTimestamp() - start_time;
-                const elapsed_ms = @as(u64, @intCast(@divFloor(elapsed, std.time.ns_per_ms)));
-
-                // Detect if we're stuck (no progress for 30 seconds)
+                // Update progress tracking
                 const current_count = if (self.state == .FirstPass) self.first_pass_count else self.second_pass_count;
-                const since_last_progress = std.time.nanoTimestamp() - last_progress_time;
-                const since_last_progress_ms = @as(u64, @intCast(@divFloor(since_last_progress, std.time.ns_per_ms)));
-
                 if (current_count > last_progress_count) {
                     last_progress_count = current_count;
                     last_progress_time = std.time.nanoTimestamp();
-                } else if (since_last_progress_ms > 30 * 1000) { // 30 seconds with no progress
-                    std.debug.print("[Coordinator] No progress for {d} seconds in state {s}, forcing state transition\n", .{ since_last_progress_ms / 1000, @tagName(self.state) });
-
-                    // If we've reached the end of documents, this is likely the cause
-                    if (self.end_of_documents_reached) {
-                        std.debug.print("[Coordinator] End of documents already reached - this is likely why no progress is being made\n", .{});
-                    }
-
-                    try self.transitionStateIfNeeded();
-                    last_progress_time = std.time.nanoTimestamp(); // Reset timer
                 }
 
-                // Check if we've been running too long
+                // Check for timeout or stuck condition
+                const elapsed = std.time.nanoTimestamp() - start_time;
+                const elapsed_ms = @as(u64, @intCast(@divFloor(elapsed, std.time.ns_per_ms)));
+
+                // Check for stuck condition - no progress for 30 seconds
+                const since_last_progress = std.time.nanoTimestamp() - last_progress_time;
+                const since_last_progress_ms = @as(u64, @intCast(@divFloor(since_last_progress, std.time.ns_per_ms)));
+
+                if (!any_messages_processed and since_last_progress_ms > 30 * 1000) {
+                    std.debug.print("[Coordinator] No progress for {d} seconds in state {s}, forcing state transition\n", .{ since_last_progress_ms / 1000, @tagName(self.state) });
+                    try self.transitionStateIfNeeded();
+                    last_progress_time = std.time.nanoTimestamp();
+                }
+
+                // Check for timeout
                 if (elapsed_ms > max_runtime_ms) {
                     std.debug.print("[Coordinator] Maximum runtime exceeded ({d} ms), forcing completion\n", .{elapsed_ms});
                     self.state = .Complete;
@@ -758,16 +754,16 @@ pub fn Coordinator(
                     break;
                 }
 
-                // Sleep a bit to avoid spinning
-                std.time.sleep(1 * std.time.ns_per_ms);
+                // If we didn't process any messages, sleep a bit to avoid spinning
+                if (!any_messages_processed) {
+                    std.time.sleep(1 * std.time.ns_per_ms);
+                }
             }
 
             // Shut down workers
             for (0..self.num_workers) |i| {
-                if (self.input_queues[i]) |queue| {
-                    const msg = message.createShutdownMessage(i);
-                    _ = queue.push(msg);
-                }
+                const msg = message.createShutdownMessage(i);
+                _ = self.input_queues[i].push(msg);
             }
 
             if (self.debug) {

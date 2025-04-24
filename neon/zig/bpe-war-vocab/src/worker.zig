@@ -51,8 +51,8 @@ pub fn Worker(
         pub fn init(
             allocator: Allocator,
             id: usize,
-            input_queue: *message_queue.CoordinatorMessageQueue,
-            output_queue: *message_queue.WorkerMessageQueue,
+            input_queue: *message_queue.CoordinatorMessageQueue, // Keep as pointer
+            output_queue: *message_queue.WorkerMessageQueue, // Keep as pointer
             top_k: usize,
             debug: bool,
         ) !*Self {
@@ -66,13 +66,13 @@ pub fn Worker(
             const sfm = try SFMType.init(allocator, top_k);
             errdefer sfm.deinit();
 
-            // Initialize the worker
+            // Initialize the worker with pointers to the queues
             self.* = .{
                 .id = id,
                 .allocator = allocator,
                 .sfm = sfm,
-                .input_queue = input_queue,
-                .output_queue = output_queue,
+                .input_queue = input_queue, // Store the pointer
+                .output_queue = output_queue, // Store the pointer
                 .debug = debug,
             };
 
@@ -184,6 +184,11 @@ pub fn Worker(
 
         /// Handle a coordinator message
         fn handleCoordinatorMessage(self: *Self, msg: message.CoordinatorMessage) !void {
+            const start_time = time.nanoTimestamp();
+
+            if (self.debug) {
+                std.debug.print("[Worker {d}] [DEBUG] Received {s} message from coordinator\n", .{ self.id, @tagName(msg.msg_type) });
+            }
             switch (msg.msg_type) {
                 .ProcessDocument => {
                     if (msg.document == null or msg.pass == null) {
@@ -217,20 +222,25 @@ pub fn Worker(
                     const response = message.createTopKCompleteMessage(self.id);
                     _ = self.output_queue.push(response);
                 },
-                .MergeCMS => {
-                    if (msg.global_cms == null) {
-                        if (self.debug) {
-                            std.debug.print("[Worker {d}] Warning: Received MergeCMS message with null global_cms\n", .{self.id});
-                        }
-                        return;
+                .RequestCMS => {
+                    // New message type that replaces MergeCMS
+                    // Instead of modifying the global CMS, we just provide our local CMS
+                    if (self.debug) {
+                        std.debug.print("[Worker {d}] Received request for CMS data\n", .{self.id});
+                        std.debug.print("[Worker {d}] [DEBUG] Preparing to send CMS at address {*}\n", .{ self.id, self.sfm.cms });
                     }
 
-                    const global_cms = @as(*CMS, @ptrCast(@alignCast(msg.global_cms.?)));
-                    try self.mergeCMS(global_cms);
+                    // Create a response that includes a pointer to our local CMS
+                    const response = message.createProvideCMSMessage(self.id, @as(*anyopaque, @ptrCast(self.sfm.cms)));
+                    const push_result = self.output_queue.push(response);
 
-                    // Send the CMS merge complete message
-                    const response = message.createCMSMergeCompleteMessage(self.id);
-                    _ = self.output_queue.push(response);
+                    if (self.debug) {
+                        if (push_result) {
+                            std.debug.print("[Worker {d}] Sent CMS data to coordinator\n", .{self.id});
+                        } else {
+                            std.debug.print("[Worker {d}] [ERROR] Failed to send CMS data to coordinator! Queue full?\n", .{self.id});
+                        }
+                    }
                 },
                 .DumpState => {
                     if (msg.dump_path == null) {
@@ -255,6 +265,10 @@ pub fn Worker(
                     // No response needed
                 },
             }
+            const elapsed = time.nanoTimestamp() - start_time;
+            if (self.debug and elapsed > 10 * time.ns_per_ms) { // Log if handling took more than 10ms
+                std.debug.print("[Worker {d}] [DEBUG] handleCoordinatorMessage for {s} took {d:.2}ms\n", .{ self.id, @tagName(msg.msg_type), @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
+            }
         }
 
         /// Main worker loop
@@ -275,7 +289,7 @@ pub fn Worker(
                         // Create an error message
                         var buf: [256]u8 = undefined;
                         const error_msg = try std.fmt.bufPrintZ(&buf, "Error handling message: {any}", .{err});
-                        const error_response = message.createErrorMessage(self.id, error_msg, false);
+                        const error_response = message.createErrorMessage(self.id, error_msg);
                         _ = self.output_queue.push(error_response);
                     };
                 } else {

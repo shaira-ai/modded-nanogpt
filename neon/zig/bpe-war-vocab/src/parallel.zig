@@ -159,21 +159,19 @@ pub fn ParallelAnalyzer(
                 @memset(new_manager.length3_counters, 0);
 
                 // Sum counters from all workers
-                for (self.coordinator.workers) |worker_opt| {
-                    if (worker_opt) |worker| {
-                        // Add each worker's length2 counters
-                        for (0..new_manager.length2_counters.len) |i| {
-                            new_manager.length2_counters[i] += worker.sfm.length2_counters[i];
-                        }
+                for (self.coordinator.workers) |worker| {
+                    // Add each worker's length2 counters
+                    for (0..new_manager.length2_counters.len) |i| {
+                        new_manager.length2_counters[i] += worker.sfm.length2_counters[i];
+                    }
 
-                        // Add each worker's length3 counters
-                        for (0..new_manager.length3_counters.len) |i| {
-                            new_manager.length3_counters[i] += worker.sfm.length3_counters[i];
-                        }
+                    // Add each worker's length3 counters
+                    for (0..new_manager.length3_counters.len) |i| {
+                        new_manager.length3_counters[i] += worker.sfm.length3_counters[i];
+                    }
 
-                        if (self.debug) {
-                            std.debug.print("[ParallelAnalyzer] Merged counters from worker {d}\n", .{worker.id});
-                        }
+                    if (self.debug) {
+                        std.debug.print("[ParallelAnalyzer] Merged counters from worker {d}\n", .{worker.id});
                     }
                 }
 
@@ -213,21 +211,19 @@ pub fn ParallelAnalyzer(
                 @memset(temp_sfm.length3_counters, 0);
 
                 // Sum counters from all workers instead of just copying from worker 0
-                for (self.coordinator.workers) |worker_opt| {
-                    if (worker_opt) |worker| {
-                        // Add each worker's length2 counters
-                        for (0..temp_sfm.length2_counters.len) |i| {
-                            temp_sfm.length2_counters[i] += worker.sfm.length2_counters[i];
-                        }
+                for (self.coordinator.workers) |worker| {
+                    // Add each worker's length2 counters
+                    for (0..temp_sfm.length2_counters.len) |i| {
+                        temp_sfm.length2_counters[i] += worker.sfm.length2_counters[i];
+                    }
 
-                        // Add each worker's length3 counters
-                        for (0..temp_sfm.length3_counters.len) |i| {
-                            temp_sfm.length3_counters[i] += worker.sfm.length3_counters[i];
-                        }
+                    // Add each worker's length3 counters
+                    for (0..temp_sfm.length3_counters.len) |i| {
+                        temp_sfm.length3_counters[i] += worker.sfm.length3_counters[i];
+                    }
 
-                        if (self.debug) {
-                            std.debug.print("[ParallelAnalyzer] Merged counters from worker {d}\n", .{worker.id});
-                        }
+                    if (self.debug) {
+                        std.debug.print("[ParallelAnalyzer] Merged counters from worker {d}\n", .{worker.id});
                     }
                 }
 

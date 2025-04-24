@@ -6,26 +6,22 @@ const Allocator = std.mem.Allocator;
 /// SPSC queue capacity - must be a power of 2
 pub const QUEUE_CAPACITY = 32;
 
-/// Queue for coordinator messages
+/// Queue for coordinator messages - now value-based instead of pointer-based
 pub const CoordinatorMessageQueue = struct {
     queue: spsc.BoundedQueue(message.CoordinatorMessage, QUEUE_CAPACITY),
     allocator: Allocator,
 
     /// Initialize a new queue
-    pub fn init(allocator: Allocator) !*CoordinatorMessageQueue {
-        const self = try allocator.create(CoordinatorMessageQueue);
-        errdefer allocator.destroy(self);
-
-        self.queue = try spsc.BoundedQueue(message.CoordinatorMessage, QUEUE_CAPACITY).init(allocator);
-        self.allocator = allocator;
-
-        return self;
+    pub fn init(allocator: Allocator) !CoordinatorMessageQueue {
+        return CoordinatorMessageQueue{
+            .queue = try spsc.BoundedQueue(message.CoordinatorMessage, QUEUE_CAPACITY).init(allocator),
+            .allocator = allocator,
+        };
     }
 
     /// Clean up resources
     pub fn deinit(self: *CoordinatorMessageQueue) void {
         self.queue.deinit(self.allocator);
-        self.allocator.destroy(self);
     }
 
     /// Push a message to the queue
@@ -50,14 +46,11 @@ pub const WorkerMessageQueue = struct {
     allocator: Allocator,
 
     /// Initialize a new queue
-    pub fn init(allocator: Allocator) !*WorkerMessageQueue {
-        const self = try allocator.create(WorkerMessageQueue);
-        errdefer allocator.destroy(self);
-
-        self.queue = try spsc.BoundedQueue(message.WorkerMessage, QUEUE_CAPACITY).init(allocator);
-        self.allocator = allocator;
-
-        return self;
+    pub fn init(allocator: Allocator) !WorkerMessageQueue {
+        return WorkerMessageQueue{
+            .queue = try spsc.BoundedQueue(message.WorkerMessage, QUEUE_CAPACITY).init(allocator),
+            .allocator = allocator,
+        };
     }
 
     /// Clean up resources
@@ -68,7 +61,6 @@ pub const WorkerMessageQueue = struct {
         }
 
         self.queue.deinit(self.allocator);
-        self.allocator.destroy(self);
     }
 
     /// Push a message to the queue
