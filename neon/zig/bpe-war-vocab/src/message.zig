@@ -49,7 +49,7 @@ pub const CoordinatorMessage = struct {
 };
 
 /// Fixed-size error message buffer to avoid heap allocations
-pub const MAX_ERROR_MSG_LEN = 256;
+pub const MAX_ERROR_MSG_LEN = 0;
 
 /// Message sent from a worker to the coordinator
 pub const WorkerMessage = struct {
@@ -163,16 +163,17 @@ pub fn createStateDumpedMessage(worker_id: usize) WorkerMessage {
 
 /// Create a new WorkerMessage for error
 pub fn createErrorMessage(worker_id: usize, error_msg: []const u8) WorkerMessage {
-    var msg = WorkerMessage{
+    const msg = WorkerMessage{
         .msg_type = .Error,
         .worker_id = worker_id,
         .error_len = 0,
     };
+    _ = error_msg;
 
     // Copy error message to fixed buffer, truncating if necessary
-    const copy_len = @min(error_msg.len, MAX_ERROR_MSG_LEN);
-    @memcpy(msg.error_buffer[0..copy_len], error_msg[0..copy_len]);
-    msg.error_len = copy_len;
+    //const copy_len = @min(error_msg.len, MAX_ERROR_MSG_LEN);
+    //@memcpy(msg.error_buffer[0..copy_len], error_msg[0..copy_len]);
+    //msg.error_len = copy_len;
 
     return msg;
 }

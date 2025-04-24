@@ -226,7 +226,7 @@ pub const FinewebDataLoader = struct {
 
     /// Read token IDs from the file (using 2-byte tokens)
     pub fn readTokenIds(self: *FinewebDataLoader, count: usize) ![]usize {
-        const start_time = time.nanoTimestamp();
+        //const start_time = time.nanoTimestamp();
 
         const result = try self.allocator.alloc(usize, count);
         errdefer self.allocator.free(result);
@@ -256,15 +256,15 @@ pub const FinewebDataLoader = struct {
         }
 
         // Print timing information
-        const elapsed = time.nanoTimestamp() - start_time;
-        reportFunctionTime("readTokenIds", elapsed);
+        //const elapsed = time.nanoTimestamp() - start_time;
+        //reportFunctionTime("readTokenIds", elapsed);
 
         return result[0..tokens_read];
     }
 
     /// Find the next document in the token stream
     pub fn nextDocument(self: *FinewebDataLoader) !?[]usize {
-        const start_time = time.nanoTimestamp();
+        //const start_time = time.nanoTimestamp();
 
         if (self.current_document) |doc| {
             self.allocator.free(doc);
@@ -334,20 +334,20 @@ pub const FinewebDataLoader = struct {
             }
         }
 
-        std.debug.print("Processed a single document with tokens {}\n", .{token_count});
+        //std.debug.print("Processed a single document with tokens {}\n", .{token_count});
 
         // Create the result
         if (document_tokens.items.len > 0) {
             const result = try document_tokens.toOwnedSlice();
             self.current_document = result;
 
-            const elapsed = time.nanoTimestamp() - start_time;
-            reportFunctionTime("nextDocument", elapsed);
+            //const elapsed = time.nanoTimestamp() - start_time;
+            //reportFunctionTime("nextDocument", elapsed);
 
             return result;
         } else {
-            const elapsed = time.nanoTimestamp() - start_time;
-            reportFunctionTime("nextDocument", elapsed);
+            //const elapsed = time.nanoTimestamp() - start_time;
+            //reportFunctionTime("nextDocument", elapsed);
 
             return null;
         }
@@ -355,22 +355,22 @@ pub const FinewebDataLoader = struct {
 
     /// Get the next document as a string
     pub fn nextDocumentString(self: *FinewebDataLoader) !?[]u8 {
-        const start_time = time.nanoTimestamp();
+        //const start_time = time.nanoTimestamp();
 
         const document = try self.nextDocument();
         if (document == null) return null;
         const result = try self.documentToString(document.?);
 
         // Print timing information
-        const elapsed = time.nanoTimestamp() - start_time;
-        reportFunctionTime("nextDocumentString", elapsed);
+        //const elapsed = time.nanoTimestamp() - start_time;
+        //reportFunctionTime("nextDocumentString", elapsed);
 
         return result;
     }
 
     /// Convert a document (as token IDs) to a string
     pub fn documentToString(self: *FinewebDataLoader, document: []const usize) ![]u8 {
-        const start_time = time.nanoTimestamp();
+        //const start_time = time.nanoTimestamp();
 
         // First pass - calculate total size needed
         var total_size: usize = 0;
@@ -402,8 +402,8 @@ pub const FinewebDataLoader = struct {
         @memset(buffer[pos..], 0);
 
         // Print timing information
-        const elapsed = time.nanoTimestamp() - start_time;
-        reportFunctionTime("documentToString", elapsed);
+        //const elapsed = time.nanoTimestamp() - start_time;
+        //reportFunctionTime("documentToString", elapsed);
 
         return buffer[0..pos];
     }

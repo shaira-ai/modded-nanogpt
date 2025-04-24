@@ -17,7 +17,7 @@ pub fn main() !void {
     const cms_depth = 10;
 
     const available_cores = try std.Thread.getCpuCount();
-    const num_threads = 3;
+    const num_threads = 10;
 
     const debug = true;
 

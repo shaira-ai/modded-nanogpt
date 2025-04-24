@@ -40,7 +40,7 @@ pub fn CountMinSketch(
 
         /// Initialize a new Count-Min Sketch with the given parameters
         pub fn init(allocator: std.mem.Allocator) !*Self {
-            const start_time = time.nanoTimestamp();
+            //const start_time = time.nanoTimestamp();
 
             // Ensure width is a power of 2 for efficient modulo
             if (width & (width - 1) != 0) {
@@ -70,20 +70,22 @@ pub fn CountMinSketch(
             self.allocator = allocator;
             self.hash_idx = 0;
 
-            const elapsed = time.nanoTimestamp() - start_time;
-            std.debug.print("[TIMING] CountMinSketch.init: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
+            //const elapsed = time.nanoTimestamp() - start_time;
+            //_ = elapsed;
+            //std.debug.print("[TIMING] CountMinSketch.init: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
             return self;
         }
 
         /// Free all allocated memory for the Count-Min Sketch
         pub fn deinit(self: *Self) void {
-            const start_time = time.nanoTimestamp();
+            //const start_time = time.nanoTimestamp();
 
             // Free counters array
             self.allocator.destroy(self);
 
-            const elapsed = time.nanoTimestamp() - start_time;
-            std.debug.print("[TIMING] CountMinSketch.deinit: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
+            //const elapsed = time.nanoTimestamp() - start_time;
+            //_ = elapsed;
+            //std.debug.print("[TIMING] CountMinSketch.deinit: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
         }
 
         inline fn readHashFromHashes(hashes: [num_hashes]u64, comptime i: usize) u64 {
@@ -135,7 +137,7 @@ pub fn CountMinSketch(
             @setEvalBranchQuota(1_000_000);
             const guess_prefetch_amt = 60 / depth;
             inline for (guess_prefetch_amt..guess_prefetch_amt+1) |prefetch_ahead_amt| {
-                const start_time = time.nanoTimestamp();
+                //const start_time = time.nanoTimestamp();
                 for (0..prefetch_ahead_amt) |i| {
                     self.prefetch(self.hashes[i]);
                 }
@@ -146,8 +148,8 @@ pub fn CountMinSketch(
                 for (self.hash_idx -| prefetch_ahead_amt..self.hash_idx) |i| {
                     self.addHashes(self.hashes[i]);
                 }
-                const elapsed = time.nanoTimestamp() - start_time;
-                std.debug.print("[TIMING] Added {} hashes with prefetch_ahead_amt={}: {d:.2}ms\n", .{ self.hash_idx, prefetch_ahead_amt, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
+                //const elapsed = time.nanoTimestamp() - start_time;
+                //std.debug.print("[TIMING] Added {} hashes with prefetch_ahead_amt={}: {d:.2}ms\n", .{ self.hash_idx, prefetch_ahead_amt, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
             }
             self.hash_idx = 0;
         }

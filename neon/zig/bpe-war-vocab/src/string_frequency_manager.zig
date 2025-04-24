@@ -129,7 +129,7 @@ pub fn StringFrequencyManager(
 
         // PASS 1: Build the Count-Min Sketch
         pub fn buildCMS(self: *Self, document: []const u8) !void {
-            const start_time = time.nanoTimestamp();
+            //const start_time = time.nanoTimestamp();
 
             // Process all substrings of all lengths in one pass
             for (0..document.len) |i| {
@@ -153,8 +153,8 @@ pub fn StringFrequencyManager(
 
             self.cms.flush();
 
-            const elapsed = time.nanoTimestamp() - start_time;
-            std.debug.print("[TIMING] buildCMS ({d} bytes): {d:.2}ms\n", .{ document.len, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
+            //const elapsed = time.nanoTimestamp() - start_time;
+            //std.debug.print("[TIMING] buildCMS ({d} bytes): {d:.2}ms\n", .{ document.len, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
         }
 
         fn processString(self: *Self, substring: []const u8, guess_count: u64) !void {
@@ -192,7 +192,7 @@ pub fn StringFrequencyManager(
 
         // PASS 2: Identify top-K strings and calculate actual counts
         pub fn processDocumentSecondPass(self: *Self, document: []const u8) !void {
-            const start_time = time.nanoTimestamp();
+            //const start_time = time.nanoTimestamp();
 
             for (0..document.len) |i| {
                 const max_len = @min(max_length, document.len - i);
@@ -221,8 +221,8 @@ pub fn StringFrequencyManager(
                 }
             }
 
-            const elapsed = time.nanoTimestamp() - start_time;
-            std.debug.print("[TIMING] processDocumentSecondPass ({d} bytes): {d:.2}ms\n", .{ document.len, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
+            //const elapsed = time.nanoTimestamp() - start_time;
+            //std.debug.print("[TIMING] processDocumentSecondPass ({d} bytes): {d:.2}ms\n", .{ document.len, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
         }
 
         // Save the first pass results to a file

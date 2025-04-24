@@ -15,6 +15,7 @@ pub fn Worker(
     comptime cms_depth: usize,
     comptime min_length: usize,
     comptime max_length: usize,
+    comptime debug: bool,
 ) type {
     // Get the CMS type
     const CMS = CMS_F(cms_width, cms_depth);
@@ -44,9 +45,6 @@ pub fn Worker(
         /// Worker state
         running: bool = false,
 
-        /// Debug flag
-        debug: bool,
-
         /// Initialize a new worker
         pub fn init(
             allocator: Allocator,
@@ -54,7 +52,6 @@ pub fn Worker(
             input_queue: *message_queue.CoordinatorMessageQueue, // Keep as pointer
             output_queue: *message_queue.WorkerMessageQueue, // Keep as pointer
             top_k: usize,
-            debug: bool,
         ) !*Self {
             const start_time = time.nanoTimestamp();
 
@@ -73,7 +70,6 @@ pub fn Worker(
                 .sfm = sfm,
                 .input_queue = input_queue, // Store the pointer
                 .output_queue = output_queue, // Store the pointer
-                .debug = debug,
             };
 
             if (debug) {
@@ -99,7 +95,7 @@ pub fn Worker(
             // Free the worker itself
             self.allocator.destroy(self);
 
-            if (self.debug) {
+            if (debug) {
                 const elapsed = time.nanoTimestamp() - start_time;
                 std.debug.print("[Worker {d}] deinit: {d:.2}ms\n", .{ self.id, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
             }
@@ -112,7 +108,7 @@ pub fn Worker(
             self.running = true;
             self.thread = try Thread.spawn(.{}, Self.run, .{self});
 
-            if (self.debug) {
+            if (debug) {
                 std.debug.print("[Worker {d}] started\n", .{self.id});
             }
         }
@@ -121,7 +117,7 @@ pub fn Worker(
         pub fn stop(self: *Self) void {
             self.running = false;
 
-            if (self.debug) {
+            if (debug) {
                 std.debug.print("[Worker {d}] stopping\n", .{self.id});
             }
         }
@@ -133,7 +129,7 @@ pub fn Worker(
             // Build CMS for this document
             try self.sfm.buildCMS(document);
 
-            if (self.debug) {
+            if (debug) {
                 const elapsed = time.nanoTimestamp() - start_time;
                 std.debug.print("[Worker {d}] processDocumentFirstPass ({d} bytes): {d:.2}ms\n", .{ self.id, document.len, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
             }
@@ -146,7 +142,7 @@ pub fn Worker(
             // Process document with shared CMS
             try self.sfm.processDocumentSecondPass(document);
 
-            if (self.debug) {
+            if (debug) {
                 const elapsed = time.nanoTimestamp() - start_time;
                 std.debug.print("[Worker {d}] processDocumentSecondPass ({d} bytes): {d:.2}ms\n", .{ self.id, document.len, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
             }
@@ -159,7 +155,7 @@ pub fn Worker(
             // Get the CMS from our SFM and merge it into the global CMS
             try global_cms.merge(self.sfm.cms);
 
-            if (self.debug) {
+            if (debug) {
                 const elapsed = time.nanoTimestamp() - start_time;
                 std.debug.print("[Worker {d}] mergeCMS: {d:.2}ms\n", .{ self.id, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
             }
@@ -176,7 +172,7 @@ pub fn Worker(
             // Save first pass data to disk
             try self.sfm.saveFirstPassToDisk(worker_path);
 
-            if (self.debug) {
+            if (debug) {
                 const elapsed = time.nanoTimestamp() - start_time;
                 std.debug.print("[Worker {d}] dumpState to {s}: {d:.2}ms\n", .{ self.id, worker_path, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
             }
@@ -186,13 +182,13 @@ pub fn Worker(
         fn handleCoordinatorMessage(self: *Self, msg: message.CoordinatorMessage) !void {
             const start_time = time.nanoTimestamp();
 
-            if (self.debug) {
+            if (debug) {
                 std.debug.print("[Worker {d}] [DEBUG] Received {s} message from coordinator\n", .{ self.id, @tagName(msg.msg_type) });
             }
             switch (msg.msg_type) {
                 .ProcessDocument => {
                     if (msg.document == null or msg.pass == null) {
-                        if (self.debug) {
+                        if (debug) {
                             std.debug.print("[Worker {d}] Warning: Received ProcessDocument message with null document or pass\n", .{self.id});
                         }
                         return;
@@ -206,7 +202,7 @@ pub fn Worker(
                     } else if (pass == 2) {
                         try self.processDocumentSecondPass(document);
                     } else {
-                        if (self.debug) {
+                        if (debug) {
                             std.debug.print("[Worker {d}] Warning: Received ProcessDocument message with invalid pass {d}\n", .{ self.id, pass });
                         }
                         return;
@@ -225,7 +221,7 @@ pub fn Worker(
                 .RequestCMS => {
                     // New message type that replaces MergeCMS
                     // Instead of modifying the global CMS, we just provide our local CMS
-                    if (self.debug) {
+                    if (debug) {
                         std.debug.print("[Worker {d}] Received request for CMS data\n", .{self.id});
                         std.debug.print("[Worker {d}] [DEBUG] Preparing to send CMS at address {*}\n", .{ self.id, self.sfm.cms });
                     }
@@ -234,7 +230,7 @@ pub fn Worker(
                     const response = message.createProvideCMSMessage(self.id, @as(*anyopaque, @ptrCast(self.sfm.cms)));
                     const push_result = self.output_queue.push(response);
 
-                    if (self.debug) {
+                    if (debug) {
                         if (push_result) {
                             std.debug.print("[Worker {d}] Sent CMS data to coordinator\n", .{self.id});
                         } else {
@@ -244,7 +240,7 @@ pub fn Worker(
                 },
                 .DumpState => {
                     if (msg.dump_path == null) {
-                        if (self.debug) {
+                        if (debug) {
                             std.debug.print("[Worker {d}] Warning: Received DumpState message with null dump_path\n", .{self.id});
                         }
                         return;
@@ -257,7 +253,7 @@ pub fn Worker(
                     _ = self.output_queue.push(response);
                 },
                 .Shutdown => {
-                    if (self.debug) {
+                    if (debug) {
                         std.debug.print("[Worker {d}] Received shutdown message\n", .{self.id});
                     }
                     self.running = false;
@@ -266,14 +262,14 @@ pub fn Worker(
                 },
             }
             const elapsed = time.nanoTimestamp() - start_time;
-            if (self.debug and elapsed > 10 * time.ns_per_ms) { // Log if handling took more than 10ms
+            if (debug and elapsed > 10 * time.ns_per_ms) { // Log if handling took more than 10ms
                 std.debug.print("[Worker {d}] [DEBUG] handleCoordinatorMessage for {s} took {d:.2}ms\n", .{ self.id, @tagName(msg.msg_type), @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
             }
         }
 
         /// Main worker loop
         fn run(self: *Self) !void {
-            if (self.debug) {
+            if (debug) {
                 std.debug.print("[Worker {d}] started running\n", .{self.id});
             }
 
@@ -282,7 +278,7 @@ pub fn Worker(
                 if (self.input_queue.pop()) |msg| {
                     // Handle the message
                     self.handleCoordinatorMessage(msg) catch |err| {
-                        if (self.debug) {
+                        if (debug) {
                             std.debug.print("[Worker {d}] Error handling message: {any}\n", .{ self.id, err });
                         }
 
@@ -298,7 +294,7 @@ pub fn Worker(
                 }
             }
 
-            if (self.debug) {
+            if (debug) {
                 std.debug.print("[Worker {d}] stopped running\n", .{self.id});
             }
         }

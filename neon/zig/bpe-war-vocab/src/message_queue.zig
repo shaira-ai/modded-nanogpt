@@ -4,7 +4,7 @@ const message = @import("message.zig");
 const Allocator = std.mem.Allocator;
 
 /// SPSC queue capacity - must be a power of 2
-pub const QUEUE_CAPACITY = 32;
+pub const QUEUE_CAPACITY = 128;
 
 /// Queue for coordinator messages - now value-based instead of pointer-based
 pub const CoordinatorMessageQueue = struct {
@@ -36,6 +36,9 @@ pub const CoordinatorMessageQueue = struct {
 
     /// Get number of messages in the queue
     pub fn count(self: *CoordinatorMessageQueue) usize {
+        if (true) {
+        @compileError("CoordinatorMessageQueue.count() is not implemented");
+        }
         return self.queue.count();
     }
 };
@@ -75,6 +78,9 @@ pub const WorkerMessageQueue = struct {
 
     /// Get number of messages in the queue
     pub fn count(self: *WorkerMessageQueue) usize {
+        if (true) {
+        @compileError("WorkerMessageQueue.count() is not implemented");
+        }
         return self.queue.count();
     }
 };
