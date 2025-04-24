@@ -6,7 +6,7 @@ const MY_LEN = @import("count_min_sketch.zig").MY_LEN;
 const fs = std.fs;
 
 pub const CandidateString = struct {
-    string: []const u8,
+    string: []u8,
     guess_count: usize,
 
     pub fn lessThan(_: void, a: CandidateString, b: CandidateString) std.math.Order {
@@ -179,11 +179,10 @@ pub fn StringFrequencyManager(
                 // Current string has higher estimated count than our minimum
                 const evicted = heap.remove();
                 _ = counts.remove(evicted.string);
-                self.allocator.free(evicted.string);
 
                 // Add the new string
-                const str_copy = try self.allocator.dupe(u8, substring);
-                errdefer self.allocator.free(str_copy);
+                const str_copy = evicted.string;
+                @memcpy(str_copy, substring);
 
                 try heap.add(.{ .string = str_copy, .guess_count = guess_count });
                 try counts.put(str_copy, 1);
