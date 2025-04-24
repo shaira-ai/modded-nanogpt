@@ -181,6 +181,7 @@ pub fn Coordinator(
             self.allocator.free(self.workers);
             self.allocator.free(self.input_queues);
             self.allocator.free(self.output_queues);
+            self.allocator.free(self.n_outstanding_jobs);
 
             // Free the global CMS if it exists
             if (self.global_cms) |cms| {
@@ -294,6 +295,7 @@ pub fn Coordinator(
                                 // Remove this document from pending
                                 _ = self.pending_documents.swapRemove(i);
                                 found_pending_doc = true;
+                                self.allocator.free(doc);
 
                                 if (self.debug) {
                                     //std.debug.print("[Coordinator] [DEBUG] Removed document from pending list, {d} remaining\n", .{self.pending_documents.items.len});
@@ -771,7 +773,7 @@ pub fn Coordinator(
 
                 // If we didn't process any messages, sleep a bit to avoid spinning
                 if (!any_messages_processed) {
-                    std.time.sleep(1);
+                    //std.time.sleep(1);
                 }
             }
 

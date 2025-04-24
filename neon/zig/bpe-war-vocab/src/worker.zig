@@ -290,7 +290,7 @@ pub fn Worker(
                     };
                 } else {
                     // No messages, sleep for a bit
-                    std.time.sleep(1 * std.time.ns_per_ms); // 1ms
+                    std.time.sleep(300 * std.time.ns_per_ms); // 1ms
                 }
             }
 
