@@ -29,11 +29,17 @@ pub const CandidateString = struct {
     pub fn lessThan(_: void, a: CandidateString, b: CandidateString) std.math.Order {
         if (a.guess_count < b.guess_count) {
             return .lt;
-        } else if (a.guess_count > b.guess_count) {
-            return .gt;
-        } else {
-            return std.mem.order(u8, a.string, b.string);
         }
+        if (a.guess_count > b.guess_count) {
+            return .gt;
+        }
+        if (b.cached_bytes < a.cached_bytes) {
+            return .lt;
+        }
+        if (b.cached_bytes > a.cached_bytes) {
+            return .gt;
+        }
+        return std.mem.order(u8, b.string, a.string);
     }
 };
 
