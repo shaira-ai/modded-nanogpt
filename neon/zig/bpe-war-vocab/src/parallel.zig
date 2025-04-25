@@ -176,22 +176,24 @@ pub fn ParallelAnalyzer(
                 var new_manager = try SFMType.init(self.allocator, self.top_k);
 
                 // Copy the global CMS data to the new manager
-                try new_manager.cms.merge(global_cms);
-
-                // Initialize counter arrays to zero
-                @memset(new_manager.length2_counters, 0);
-                @memset(new_manager.length3_counters, 0);
+                if (MY_LEN > 3) {
+                    try new_manager.cms.merge(global_cms);
+                }
 
                 // Sum counters from all workers
                 for (self.coordinator.workers) |worker| {
                     // Add each worker's length2 counters
-                    for (0..new_manager.length2_counters.len) |i| {
-                        new_manager.length2_counters[i] += worker.sfm.length2_counters[i];
+                    if (MY_LEN == 2) {
+                        for (0..new_manager.length2_counters.len) |i| {
+                            new_manager.length2_counters[i] += worker.sfm.length2_counters[i];
+                        }
                     }
 
                     // Add each worker's length3 counters
-                    for (0..new_manager.length3_counters.len) |i| {
-                        new_manager.length3_counters[i] += worker.sfm.length3_counters[i];
+                    if (MY_LEN == 3) {
+                        for (0..new_manager.length3_counters.len) |i| {
+                            new_manager.length3_counters[i] += worker.sfm.length3_counters[i];
+                        }
                     }
 
                     if (self.debug) {
@@ -302,6 +304,11 @@ pub fn ParallelAnalyzer(
 
             if (self.debug) {
                 std.debug.print("[ParallelAnalyzer] Data loader rewound in {d:.2}ms\n", .{@as(f64, @floatFromInt(data_loader_time)) / time.ns_per_ms});
+            }
+
+            try self.coordinator.runSecondPass();
+            if (true) {
+                return;
             }
 
             // Create a specialized second pass coordinator

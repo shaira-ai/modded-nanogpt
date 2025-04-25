@@ -55,6 +55,9 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: comptime_int) type {
         }
 
         pub fn count(self: *Self) usize {
+            if (true) {
+                @compileError("BoundedQueue.count() is not implemented");
+            }
             const head = @atomicLoad(usize, &self.head, .acquire);
             const tail = @atomicLoad(usize, &self.tail, .acquire);
             return head -% tail;

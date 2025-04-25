@@ -203,7 +203,7 @@ pub fn Worker(
                     }
 
                     // Send the document processed message
-                    const response = message.createDocumentProcessedMessage(self.id, document, pass);
+                    const response = message.createDocumentProcessedMessage(self.id, process_data.document_id, document, pass);
                     _ = self.output_queue.push(response);
                 },
                 .FindTopK => {

@@ -10,6 +10,8 @@ const worker_mod = @import("worker.zig");
 const fineweb = @import("data_loader.zig").FinewebDataLoader;
 const CMS_F = @import("count_min_sketch.zig").CountMinSketch;
 
+const EMPTY_SLICE: []const u8 = "";
+
 /// Multi-threaded document processing coordinator
 pub fn Coordinator(
     comptime cms_width: usize,
@@ -33,6 +35,8 @@ pub fn Coordinator(
             FirstPass,
             /// Merging CMS from workers
             MergingCMS,
+            /// Start second pass
+            StartSecondPass,
             /// Finding top K strings using shared CMS
             SecondPass,
             /// Merging results from workers
@@ -91,10 +95,14 @@ pub fn Coordinator(
         error_msg: ?[]const u8 = null,
 
         /// Queue depth - documents to maintain per worker
-        queue_depth: usize = 40,
+        queue_depth: usize,
 
         /// Documents waiting for acknowledgment from workers
-        pending_documents: std.ArrayList([]const u8),
+        pending_documents: [][]const u8,
+
+        /// free list for pending documents
+        pending_documents_free_list: []usize,
+        n_free_pending_documents: usize,
 
         /// Flag to track if we've reached the end of documents
         end_of_documents_reached: bool = false,
@@ -133,8 +141,20 @@ pub fn Coordinator(
             errdefer allocator.free(n_outstanding_jobs);
             @memset(n_outstanding_jobs, 0);
 
+            const queue_depth = 40;
+
             // Create pending documents list
-            const pending_documents = std.ArrayList([]const u8).init(allocator);
+            const pending_documents = try allocator.alloc([]const u8, num_workers * queue_depth);
+            errdefer allocator.free(pending_documents);
+            for (pending_documents) |*ptr| {
+                ptr.* = EMPTY_SLICE;
+            }
+
+            const pending_documents_free_list = try allocator.alloc(usize, num_workers * queue_depth);
+            errdefer allocator.free(pending_documents_free_list);
+            for (pending_documents_free_list, 0..) |*ptr, i| {
+                ptr.* = i;
+            }
 
             // Initialize the coordinator with placeholder values
             self.* = .{
@@ -147,7 +167,10 @@ pub fn Coordinator(
                 .n_outstanding_jobs = n_outstanding_jobs,
                 .top_k = top_k,
                 .debug = debug,
+                .queue_depth = queue_depth,
                 .pending_documents = pending_documents,
+                .pending_documents_free_list = pending_documents_free_list,
+                .n_free_pending_documents = num_workers * queue_depth,
                 .max_documents = 0, // Process all available documents (no limit)
                 .end_of_documents_reached = false,
                 .active_workers = 0,
@@ -197,10 +220,13 @@ pub fn Coordinator(
             }
 
             // Free pending documents
-            for (self.pending_documents.items) |doc| {
-                self.allocator.free(doc);
+            for (self.pending_documents) |doc| {
+                if (doc.len > 0) {
+                    self.allocator.free(doc);
+                }
             }
-            self.pending_documents.deinit();
+            self.allocator.free(self.pending_documents);
+            self.allocator.free(self.pending_documents_free_list);
 
             // Free the coordinator itself
             self.allocator.destroy(self);
@@ -290,24 +316,11 @@ pub fn Coordinator(
 
                     // Remove from pending documents
                     // Check pending documents array
-                    var found_pending_doc = false;
-                    for (self.pending_documents.items, 0..) |doc, i| {
-                        if (doc.ptr == document.ptr) {
-                            // Remove this document from pending
-                            _ = self.pending_documents.swapRemove(i);
-                            found_pending_doc = true;
-                            self.allocator.free(doc);
-
-                            if (self.debug) {
-                                //std.debug.print("[Coordinator] [DEBUG] Removed document from pending list, {d} remaining\n", .{self.pending_documents.items.len});
-                            }
-                            break;
-                        }
-                    }
-
-                    if (!found_pending_doc and self.debug) {
-                        //std.debug.print("[Coordinator] [DEBUG] Warning: Could not find document in pending list\n", .{});
-                    }
+                    const index = processed_data.document_id;
+                    self.allocator.free(document);
+                    self.pending_documents_free_list[self.n_free_pending_documents] = index;
+                    self.pending_documents[index] = EMPTY_SLICE;
+                    self.n_free_pending_documents += 1;
 
                     // Count processed documents
                     if (pass == 1) {
@@ -315,12 +328,16 @@ pub fn Coordinator(
 
                         if (self.debug and (self.first_pass_count % 1000 == 0 or self.first_pass_count < 10)) {
                             std.debug.print("[Coordinator] First pass processed: {d} documents\n", .{self.first_pass_count});
+                            const n_pending = self.pending_documents_free_list.len - self.n_free_pending_documents;
+                            std.debug.print("[Coordinator] [DEBUG] Removed document from pending list, {d} remaining\n", .{n_pending});
                         }
                     } else if (pass == 2) {
                         self.second_pass_count += 1;
 
                         if (self.debug and (self.second_pass_count % 1000 == 0 or self.second_pass_count < 10)) {
                             std.debug.print("[Coordinator] Second pass processed: {d} documents\n", .{self.second_pass_count});
+                            const n_pending = self.pending_documents_free_list.len - self.n_free_pending_documents;
+                            std.debug.print("[Coordinator] [DEBUG] Removed document from pending list, {d} remaining\n", .{n_pending});
                         }
                     }
                 },
@@ -484,7 +501,8 @@ pub fn Coordinator(
 
             if (self.debug) {
                 std.debug.print("[Coordinator] First pass complete ({d} documents), requesting CMS data from workers\n", .{self.first_pass_count});
-                std.debug.print("[Coordinator] [DEBUG] Pending documents: {d}, State: {s}\n", .{ self.pending_documents.items.len, @tagName(self.state) });
+                const n_pending = self.pending_documents_free_list.len - self.n_free_pending_documents;
+                std.debug.print("[Coordinator] [DEBUG] Pending documents: {d}, State: {s}\n", .{ n_pending, @tagName(self.state) });
             }
 
             // Create the global CMS
@@ -560,6 +578,14 @@ pub fn Coordinator(
                         std.debug.print("[Coordinator] CMS merging in progress ({d}/{d} workers completed)\n", .{ self.cms_merge_completions, self.num_workers });
                     }
                 },
+                .StartSecondPass => {
+                    // Start second pass
+                    self.state = .SecondPass;
+
+                    if (self.debug) {
+                        std.debug.print("[Coordinator] Starting second pass\n", .{});
+                    }
+                },
                 .SecondPass => {
                     // All documents processed in second pass, transition to merging results
                     self.state = .MergingResults;
@@ -600,6 +626,37 @@ pub fn Coordinator(
             }
         }
 
+        fn addToPendingDocuments(self: *Self, document: []const u8) usize {
+            self.n_free_pending_documents -= 1;
+            const index = self.pending_documents_free_list[self.n_free_pending_documents];
+            self.pending_documents[index] = document;
+            return index;
+        }
+
+        pub fn runSecondPass(self: *Self) !void {
+            self.state = .StartSecondPass;
+            self.end_of_documents_reached = false;
+            self.running = true;
+            return self.run();
+        }
+
+        pub fn shutdownWorkers(self: *Self) void {
+            for (0..self.num_workers) |i| {
+                const msg = message.createShutdownMessage(i);
+                const result = self.input_queues[i].push(msg);
+                const n_pushed: usize = if (result) 1 else 0;
+                self.n_outstanding_jobs[i] += n_pushed;
+            }
+            for (0..self.num_workers) |i| {
+                while (self.n_outstanding_jobs[i] > 0) {
+                    const msg = self.output_queues[i].pop();
+                    if (msg) |_| {
+                        self.n_outstanding_jobs[i] -= 1;
+                    }
+                }
+            }
+        }
+
         /// Main coordinator loop
         fn run(self: *Self) !void {
             if (self.debug) {
@@ -616,7 +673,7 @@ pub fn Coordinator(
             }
 
             // Transition to first pass if we're idle, otherwise continue where we left off
-            if (self.state == .Idle) {
+            if (self.state == .Idle or self.state == .StartSecondPass) {
                 try self.transitionStateIfNeeded();
             }
 
@@ -636,11 +693,11 @@ pub fn Coordinator(
                         }
 
                         // Add to pending documents
-                        try self.pending_documents.append(doc.?);
+                        const doc_id = self.addToPendingDocuments(doc.?);
 
                         // Create a message for the worker
                         const pass: u8 = if (self.state == .FirstPass) 1 else 2;
-                        const msg = message.createProcessDocumentMessage(i, doc.?, pass);
+                        const msg = message.createProcessDocumentMessage(i, doc_id, doc.?, pass);
 
                         // Send the message
                         const result = self.input_queues[i].push(msg);
@@ -671,47 +728,38 @@ pub fn Coordinator(
                 // Loop through each worker's output queue
                 for (0..self.num_workers) |i| {
                     // Process all available messages from this worker
-                    while (self.output_queues[i].pop()) |msg| {
+                    if (self.output_queues[i].pop()) |msg| {
                         self.n_outstanding_jobs[i] -= 1;
                         any_messages_processed = true;
 
                         // Handle the message (documents processed, errors, etc.)
                         try self.handleWorkerMessage(msg);
+                    }
+                    if ((self.state == .FirstPass or self.state == .SecondPass) and !self.end_of_documents_reached
+                        and self.n_outstanding_jobs[i] < self.queue_depth) {
+                        const doc = try self.getNextDocument();
+                        if (doc) |document| {
+                            // Add to pending documents
+                            const doc_id = self.addToPendingDocuments(document);
 
-                        // If this was a document processed message, immediately feed another document
-                        // to the same worker to keep it busy
-                        if (msg == .DocumentProcessed and
-                            (self.state == .FirstPass or self.state == .SecondPass))
-                        {
-                            const worker_id = msg.DocumentProcessed.worker_id;
+                            // Create a message for the worker
+                            const pass: u8 = if (self.state == .FirstPass) 1 else 2;
+                            const new_msg = message.createProcessDocumentMessage(i, doc_id, document, pass);
 
-                            // Only feed if the worker's queue isn't already full
-                            if (self.n_outstanding_jobs[worker_id] < self.queue_depth and !self.end_of_documents_reached) {
-                                const doc = try self.getNextDocument();
-                                if (doc) |document| {
-                                    // Add to pending documents
-                                    try self.pending_documents.append(document);
+                            // Send the message
+                            const result = self.input_queues[i].push(new_msg);
+                            const n_pushed: usize = if (result) 1 else 0;
+                            self.n_outstanding_jobs[i] += n_pushed;
 
-                                    // Create a message for the worker
-                                    const pass: u8 = if (self.state == .FirstPass) 1 else 2;
-                                    const new_msg = message.createProcessDocumentMessage(worker_id, document, pass);
+                            if (self.debug and (self.first_pass_count + self.second_pass_count) % 10000 == 0) {
+                                std.debug.print("[Coordinator] Fed another document to worker {d} (pass {d})\n", .{ i, pass });
+                            }
+                        } else {
+                            // No more documents, mark that we've reached the end
+                            self.end_of_documents_reached = true;
 
-                                    // Send the message
-                                    const result = self.input_queues[worker_id].push(new_msg);
-                                    const n_pushed: usize = if (result) 1 else 0;
-                                    self.n_outstanding_jobs[worker_id] += n_pushed;
-
-                                    if (self.debug and (self.first_pass_count + self.second_pass_count) % 10000 == 0) {
-                                        std.debug.print("[Coordinator] Fed another document to worker {d} (pass {d})\n", .{ worker_id, pass });
-                                    }
-                                } else {
-                                    // No more documents
-                                    self.end_of_documents_reached = true;
-
-                                    if (self.debug) {
-                                        std.debug.print("[Coordinator] No more documents to process\n", .{});
-                                    }
-                                }
+                            if (self.debug) {
+                                std.debug.print("[Coordinator] No more documents to process\n", .{});
                             }
                         }
                     }
@@ -730,14 +778,15 @@ pub fn Coordinator(
                         }
                     }
 
-                    if (all_workers_idle and self.pending_documents.items.len == 0) {
+                    const n_pending = self.pending_documents_free_list.len - self.n_free_pending_documents;
+                    if (all_workers_idle and n_pending == 0) {
                         // All documents have been processed and acknowledged, transition to next state
                         if (self.debug) {
                             std.debug.print("[Coordinator] All documents processed, transitioning to next phase\n", .{});
                         }
                         try self.transitionStateIfNeeded();
                     } else if (self.debug and (self.first_pass_count + self.second_pass_count) % 10000 == 0) {
-                        std.debug.print("[Coordinator] Waiting for {d} workers to finish, {d} pending documents\n", .{ active_workers, self.pending_documents.items.len });
+                        std.debug.print("[Coordinator] Waiting for {d} workers to finish, {d} pending documents\n", .{ active_workers, n_pending });
                     }
                 }
 
@@ -772,17 +821,17 @@ pub fn Coordinator(
 
                 // If we didn't process any messages, sleep a bit to avoid spinning
                 if (!any_messages_processed) {
-                    //std.time.sleep(1);
+                    std.time.sleep(1);
                 }
             }
 
             // Shut down workers
-            for (0..self.num_workers) |i| {
-                const msg = message.createShutdownMessage(i);
-                const result = self.input_queues[i].push(msg);
-                const n_pushed: usize = if (result) 1 else 0;
-                self.n_outstanding_jobs[i] += n_pushed;
-            }
+            // for (0..self.num_workers) |i| {
+            //     const msg = message.createShutdownMessage(i);
+            //     const result = self.input_queues[i].push(msg);
+            //     const n_pushed: usize = if (result) 1 else 0;
+            //     self.n_outstanding_jobs[i] += n_pushed;
+            // }
 
             if (self.debug) {
                 std.debug.print("[Coordinator] stopped running\n", .{});

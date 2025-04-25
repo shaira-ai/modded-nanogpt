@@ -36,6 +36,7 @@ pub const MAX_ERROR_MSG_LEN = 10;
 pub const CoordinatorMessage = union(CoordinatorMessageType) {
     ProcessDocument: struct {
         worker_id: usize,
+        document_id: usize,
         document: []const u8,
         pass: u8,
     },
@@ -58,6 +59,7 @@ pub const CoordinatorMessage = union(CoordinatorMessageType) {
 pub const WorkerMessage = union(WorkerMessageType) {
     DocumentProcessed: struct {
         worker_id: usize, // Keep worker_id for consistency
+        document_id: usize,
         document: []const u8,
         pass: u8,
     },
@@ -87,10 +89,11 @@ pub const WorkerMessage = union(WorkerMessageType) {
 };
 
 /// Create a new CoordinatorMessage for processing a document
-pub fn createProcessDocumentMessage(worker_id: usize, document: []const u8, pass: u8) CoordinatorMessage {
+pub fn createProcessDocumentMessage(worker_id: usize, document_id: usize,document: []const u8, pass: u8) CoordinatorMessage {
     return CoordinatorMessage{
         .ProcessDocument = .{
             .worker_id = worker_id,
+            .document_id = document_id,
             .document = document,
             .pass = pass,
         },
@@ -135,10 +138,11 @@ pub fn createShutdownMessage(worker_id: usize) CoordinatorMessage {
 }
 
 /// Create a new WorkerMessage for document processed
-pub fn createDocumentProcessedMessage(worker_id: usize, document: []const u8, pass: u8) WorkerMessage {
+pub fn createDocumentProcessedMessage(worker_id: usize, document_id: usize, document: []const u8, pass: u8) WorkerMessage {
     return WorkerMessage{
         .DocumentProcessed = .{
             .worker_id = worker_id,
+            .document_id = document_id,
             .document = document,
             .pass = pass,
         },
