@@ -4,10 +4,27 @@ const CMS_F = @import("count_min_sketch.zig").CountMinSketch;
 const N_LENGTHS = @import("count_min_sketch.zig").N_LENGTHS;
 const MY_LEN = @import("count_min_sketch.zig").MY_LEN;
 const fs = std.fs;
+const native_endian = @import("builtin").target.cpu.arch.endian();
 
 pub const CandidateString = struct {
     string: []u8,
+    cached_bytes: u64,
     guess_count: usize,
+
+    pub fn init(string: []u8, guess_count: usize) CandidateString {
+        var cached_bytes: u64 = 0;
+        const copy_len = @min(MY_LEN, @sizeOf(u64));
+        @memcpy(@as([*]u8, @ptrCast(&cached_bytes)), string[0..copy_len]);
+        if (native_endian != .big) {
+            cached_bytes = @byteSwap(cached_bytes);
+        }
+
+        return CandidateString{
+            .string = string,
+            .cached_bytes = cached_bytes,
+            .guess_count = guess_count,
+        };
+    }
 
     pub fn lessThan(_: void, a: CandidateString, b: CandidateString) std.math.Order {
         if (a.guess_count < b.guess_count) {
@@ -15,7 +32,7 @@ pub const CandidateString = struct {
         } else if (a.guess_count > b.guess_count) {
             return .gt;
         } else {
-            return .eq;
+            return std.mem.order(u8, a.string, b.string);
         }
     }
 };
@@ -47,10 +64,10 @@ pub fn StringFrequencyManager(
         length2_counters: []usize,
         length3_counters: []usize,
         cms_is_owned: bool = true,
-        // Min heaps for tracking top-K strings of each length
-        heaps: []std.PriorityQueue(CandidateString, void, CandidateString.lessThan),
-        // Maps to track actual counts of candidate strings
-        actual_counts: []std.StringHashMap(usize),
+        // Min heap for tracking top-K strings of my length
+        heap: std.PriorityQueue(CandidateString, void, CandidateString.lessThan),
+        // Map to track actual counts of candidate strings
+        actual_counts: std.StringHashMap(usize),
 
         const Self = @This();
 
@@ -65,14 +82,14 @@ pub fn StringFrequencyManager(
             errdefer cms.deinit();
 
             // Initialize heaps and count maps
-            const heaps = try allocator.alloc(std.PriorityQueue(CandidateString, void, CandidateString.lessThan), max_length + 1);
-            for (heaps) |*heap| {
-                heap.* = std.PriorityQueue(CandidateString, void, CandidateString.lessThan).init(allocator, {});
-            }
-            const actual_counts = try allocator.alloc(std.StringHashMap(usize), max_length + 1);
-            for (actual_counts) |*map| {
-                map.* = std.StringHashMap(usize).init(allocator);
-            }
+            // const heaps = try allocator.alloc(std.PriorityQueue(CandidateString, void, CandidateString.lessThan), max_length + 1);
+            // for (heaps) |*heap| {
+            //     heap.* = std.PriorityQueue(CandidateString, void, CandidateString.lessThan).init(allocator, {});
+            // }
+            // const actual_counts = try allocator.alloc(std.StringHashMap(usize), max_length + 1);
+            // for (actual_counts) |*map| {
+            //     map.* = std.StringHashMap(usize).init(allocator);
+            // }
             const len2_counters = try allocator.alloc(usize, 0x10000);
             const len3_counters = try allocator.alloc(usize, 0x1000000);
             @memset(len2_counters, 0);
@@ -84,8 +101,8 @@ pub fn StringFrequencyManager(
                 .top_k = top_k,
                 .length2_counters = len2_counters,
                 .length3_counters = len3_counters,
-                .heaps = heaps,
-                .actual_counts = actual_counts,
+                .heap = std.PriorityQueue(CandidateString, void, CandidateString.lessThan).init(allocator, {}),
+                .actual_counts = std.StringHashMap(usize).init(allocator),
             };
 
             const elapsed = time.nanoTimestamp() - start_time;
@@ -101,19 +118,14 @@ pub fn StringFrequencyManager(
             }
             self.allocator.free(self.length2_counters);
             self.allocator.free(self.length3_counters);
-            for (self.heaps) |*heap| {
-                while (heap.count() > 0) {
-                    const item = heap.remove();
-                    self.allocator.free(item.string);
-                }
-                heap.deinit();
+            while (self.heap.count() > 0) {
+                const item = self.heap.remove();
+                self.allocator.free(item.string);
             }
-            self.allocator.free(self.heaps);
+            self.heap.deinit();
 
-            for (self.actual_counts) |*map| {
-                map.deinit();
-            }
-            self.allocator.free(self.actual_counts);
+
+            self.actual_counts.deinit();
             self.allocator.destroy(self);
 
             const elapsed = time.nanoTimestamp() - start_time;
@@ -133,20 +145,20 @@ pub fn StringFrequencyManager(
 
             // Process all substrings of all lengths in one pass
             for (0..document.len) |i| {
-                if (i + 2 <= document.len) {
+                if (MY_LEN == 2 and i + 2 <= document.len) {
                     const substring = document[i .. i + 2];
                     const index = length2ToIndex(substring);
                     self.length2_counters[index] += 1;
                 }
 
-                if (i + 3 <= document.len) {
+                if (MY_LEN == 3 and i + 3 <= document.len) {
                     const substring = document[i .. i + 3];
                     const index = length3ToIndex(substring);
                     self.length3_counters[index] += 1;
                 }
 
                 const max_len = @min(max_length, document.len - i);
-                if (max_len >= 4) {
+                if (max_len >= MY_LEN) {
                     self.cms.addPrefixes(@ptrCast(&document[i]), max_len);
                 }
             }
@@ -158,9 +170,8 @@ pub fn StringFrequencyManager(
         }
 
         fn processString(self: *Self, substring: []const u8, guess_count: u64) !void {
-            const len = substring.len;
-            var heap = &self.heaps[len];
-            var counts = &self.actual_counts[len];
+            var heap = &self.heap;
+            var counts = &self.actual_counts;
 
             // Check if we're already tracking this string
             if (counts.contains(substring)) {
@@ -173,7 +184,7 @@ pub fn StringFrequencyManager(
                 const str_copy = try self.allocator.dupe(u8, substring);
                 errdefer self.allocator.free(str_copy);
 
-                try heap.add(.{ .string = str_copy, .guess_count = guess_count });
+                try heap.add(CandidateString.init(str_copy, guess_count));
                 try counts.put(str_copy, 1);
             } else if (heap.count() == self.top_k and heap.peek().?.guess_count < guess_count) {
                 // Current string has higher estimated count than our minimum
@@ -184,7 +195,7 @@ pub fn StringFrequencyManager(
                 const str_copy = evicted.string;
                 @memcpy(str_copy, substring);
 
-                try heap.add(.{ .string = str_copy, .guess_count = guess_count });
+                try heap.add(CandidateString.init(str_copy, guess_count));
                 try counts.put(str_copy, 1);
             }
         }
@@ -310,8 +321,9 @@ pub fn StringFrequencyManager(
             std.debug.print("\n=== FREQUENCY ANALYSIS RESULTS ===\n", .{});
 
             var total_strings: usize = 0;
-            for (self.heaps, 0..) |*heap, len| {
-                var counts = &self.actual_counts[len];
+            for (MY_LEN..MY_LEN + 1) |len| {
+                var heap = &self.heap;
+                var counts = &self.actual_counts;
 
                 const count = heap.count();
                 total_strings += count;

@@ -8,6 +8,8 @@ const SFM = @import("string_frequency_manager.zig").StringFrequencyManager;
 const CMS_F = @import("count_min_sketch.zig").CountMinSketch;
 const coordinator_mod = @import("coordinator.zig");
 const spsc = @import("spsc.zig");
+const CandidateString = @import("string_frequency_manager.zig").CandidateString;
+const MY_LEN = @import("count_min_sketch.zig").MY_LEN;
 
 /// Parallel string frequency analysis framework
 pub fn ParallelAnalyzer(
@@ -598,39 +600,37 @@ pub fn ParallelAnalyzer(
                 const worker_merge_start = time.nanoTimestamp();
 
                 // Merge the actual counts into main manager
-                for (0..max_length + 1) |len| {
-                    var worker_heap = &worker.manager.heaps[len];
-                    var worker_counts = &worker.manager.actual_counts[len];
-                    var main_counts = &params.mainManager.actual_counts[len];
+                var worker_heap = &worker.manager.heap;
+                var worker_counts = &worker.manager.actual_counts;
+                var main_counts = &params.mainManager.actual_counts;
 
-                    // Process the heap items (top-K candidates)
-                    while (worker_heap.count() > 0) {
-                        const item = worker_heap.remove();
-                        const count = worker_counts.get(item.string) orelse 0;
+                // Process the heap items (top-K candidates)
+                while (worker_heap.count() > 0) {
+                    const item = worker_heap.remove();
+                    const count = worker_counts.get(item.string) orelse 0;
 
-                        // Add to main manager if not already there, or increase count if it is
-                        if (main_counts.contains(item.string)) {
-                            // Already exists, just add the count
-                            main_counts.getPtr(item.string).?.* += count;
-                        } else {
-                            // New string, create a copy and add it
-                            const str_copy = try params.allocator.dupe(u8, item.string);
-                            try main_counts.put(str_copy, count);
+                    // Add to main manager if not already there, or increase count if it is
+                    if (main_counts.contains(item.string)) {
+                        // Already exists, just add the count
+                        main_counts.getPtr(item.string).?.* += count;
+                    } else {
+                        // New string, create a copy and add it
+                        const str_copy = try params.allocator.dupe(u8, item.string);
+                        try main_counts.put(str_copy, count);
 
-                            // Add to main manager's heap if needed
-                            var main_heap = &params.mainManager.heaps[len];
-                            if (main_heap.count() < params.topK) {
-                                try main_heap.add(.{ .string = str_copy, .guess_count = item.guess_count });
-                            } else if (main_heap.peek().?.guess_count < item.guess_count) {
-                                const evicted = main_heap.remove();
-                                params.allocator.free(evicted.string);
-                                try main_heap.add(.{ .string = str_copy, .guess_count = item.guess_count });
-                            }
+                        // Add to main manager's heap if needed
+                        var main_heap = &params.mainManager.heap;
+                        if (main_heap.count() < params.topK) {
+                            try main_heap.add(CandidateString.init(str_copy, item.guess_count));
+                        } else if (main_heap.peek().?.guess_count < item.guess_count) {
+                            const evicted = main_heap.remove();
+                            params.allocator.free(evicted.string);
+                            try main_heap.add(CandidateString.init(str_copy, item.guess_count));
                         }
-
-                        // Free the worker's string
-                        params.allocator.free(item.string);
                     }
+
+                    // Free the worker's string
+                    params.allocator.free(item.string);
                 }
 
                 // Clean up the worker's manager and queues
