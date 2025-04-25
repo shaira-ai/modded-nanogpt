@@ -4,6 +4,7 @@ const fs = std.fs;
 const time = std.time;
 
 const parallel = @import("parallel.zig");
+const fineweb = @import("data_loader.zig");
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
@@ -24,6 +25,14 @@ pub fn main() !void {
     // Flag to skip disk I/O and keep data in memory between passes
     const skip_disk_io = true;
 
+    const input_files = [_][]const u8{
+        "fineweb_train_000001.bin",
+        "fineweb_train_000002.bin",
+    };
+
+    const vocab_file = "vocab.json";
+    const saved_data_path = "fineweb_first_pass_parallel.bin";
+
     std.debug.print("=== Parallel String Frequency Analysis ===\n", .{});
     std.debug.print("Parameters:\n", .{});
     std.debug.print("  - CMS width: {d} counters\n", .{cms_width});
@@ -33,15 +42,18 @@ pub fn main() !void {
     std.debug.print("  - Top K: {d} strings per length\n", .{top_k});
     std.debug.print("  - Worker threads: {d} (of {d} cores)\n", .{ num_threads, available_cores });
     std.debug.print("  - Skip disk I/O: {}\n", .{skip_disk_io});
+    std.debug.print("  - Using {d} input files\n", .{input_files.len});
+
+    // Print file list
+    for (input_files, 0..) |file, i| {
+        std.debug.print("    {d}: {s}\n", .{ i + 1, file });
+    }
 
     // Create the parallel analyzer
     const ParallelAnalyzer = parallel.ParallelAnalyzer(cms_width, cms_depth, min_length, max_length);
 
-    const data_file = "fineweb_train_000001.bin";
-    const vocab_file = "vocab.json";
-    const saved_data_path = "fineweb_first_pass_parallel.bin";
-
-    var analyzer = try ParallelAnalyzer.init(allocator, num_threads, data_file, vocab_file, saved_data_path, top_k, debug);
+    // Create analyzer with specific files
+    var analyzer = try ParallelAnalyzer.init(allocator, num_threads, &input_files, vocab_file, saved_data_path, top_k, debug);
     defer analyzer.deinit();
 
     // Check if saved data exists

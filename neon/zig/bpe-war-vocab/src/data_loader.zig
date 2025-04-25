@@ -2,6 +2,8 @@ const std = @import("std");
 const input_parser = @import("input_parser.zig");
 const gpt_encode = @import("gpt_encode.zig");
 const time = std.time;
+const fs = std.fs;
+const Allocator = std.mem.Allocator;
 
 pub const SEPARATOR_TOKEN_ID: usize = 50256;
 
@@ -18,11 +20,15 @@ pub fn reportFunctionTime(function_name: []const u8, elapsed_ns: i128) void {
 pub const FinewebDataLoader = struct {
     // File handling
     allocator: std.mem.Allocator,
-    file: std.fs.File,
-    file_path: []const u8,
+    file: ?std.fs.File, // Now optional since we may be between files
+
+    // Multi-file support
+    file_paths: [][]const u8, // List of all file paths to process
+    current_file_index: usize, // Current file index in file_paths
+    current_file_path: []const u8, // Current file path (for easier access)
 
     // Buffered reader with large buffer
-    buffered_reader: std.io.BufferedReader(2 * 1024 * 1024, std.fs.File.Reader),
+    buffered_reader: ?std.io.BufferedReader(2 * 1024 * 1024, std.fs.File.Reader), // Now optional
 
     // Token handling
     token_map: std.AutoHashMap(usize, []const u8),
@@ -34,19 +40,30 @@ pub const FinewebDataLoader = struct {
     // Document state tracking
     current_document: ?[]usize,
     added_fake_separator: bool,
-    reached_end: bool,
-    header_skipped: bool,
+    reached_end: bool, // Now indicates all files are processed
+    header_skipped: bool, // Now per-file state
 
     // Vocabulary information for rewinding
     vocab_path: ?[]const u8,
 
-    pub fn init(allocator: std.mem.Allocator, file_path: []const u8) !*FinewebDataLoader {
+    // Main initializer - process multiple files (or a single file)
+    pub fn init(allocator: Allocator, file_paths: []const []const u8) !*FinewebDataLoader {
         const start_time = time.nanoTimestamp();
+
+        // Check if there are any files to process
+        if (file_paths.len == 0) {
+            std.debug.print("[ERROR] No files provided to FinewebDataLoader.init\n", .{});
+            return error.NoFilesProvided;
+        }
 
         const self = try allocator.create(FinewebDataLoader);
 
-        // Open the file
-        const file = try std.fs.cwd().openFile(file_path, .{});
+        // Make a copy of the file paths
+        var paths_copy = try allocator.alloc([]const u8, file_paths.len);
+        var i: usize = 0;
+        while (i < file_paths.len) : (i += 1) {
+            paths_copy[i] = try allocator.dupe(u8, file_paths[i]);
+        }
 
         // Allocate token_bytes array
         const token_bytes = try allocator.alloc(?[]const u8, 50257);
@@ -54,11 +71,14 @@ pub const FinewebDataLoader = struct {
             ptr.* = null;
         }
 
+        // Initialize with no open file yet
         self.* = .{
             .allocator = allocator,
-            .file = file,
-            .file_path = try allocator.dupe(u8, file_path),
-            .buffered_reader = std.io.bufferedReaderSize(2 * 1024 * 1024, file.reader()),
+            .file = null,
+            .file_paths = paths_copy,
+            .current_file_index = 0,
+            .current_file_path = paths_copy[0], // Start with first file
+            .buffered_reader = null,
             .token_map = std.AutoHashMap(usize, []const u8).init(allocator),
             .byte_to_token = std.StringHashMap(usize).init(allocator),
             .token_bytes = token_bytes,
@@ -69,6 +89,9 @@ pub const FinewebDataLoader = struct {
             .vocab_path = null,
         };
 
+        // Open the first file
+        try self.openCurrentFile();
+
         // Print timing information
         const elapsed = time.nanoTimestamp() - start_time;
         reportFunctionTime("init", elapsed);
@@ -76,11 +99,75 @@ pub const FinewebDataLoader = struct {
         return self;
     }
 
+    // Helper function to open the current file
+    fn openCurrentFile(self: *FinewebDataLoader) !void {
+        const start_time = time.nanoTimestamp();
+
+        // Close any existing file
+        if (self.file) |file| {
+            file.close();
+            self.file = null;
+            self.buffered_reader = null;
+        }
+
+        // Open the current file
+        if (self.current_file_index < self.file_paths.len) {
+            self.current_file_path = self.file_paths[self.current_file_index];
+
+            const file = try std.fs.cwd().openFile(self.current_file_path, .{});
+            self.file = file;
+
+            // Initialize the buffered reader
+            const buffered = std.io.bufferedReaderSize(2 * 1024 * 1024, file.reader());
+            self.buffered_reader = buffered;
+
+            // Reset per-file state
+            self.header_skipped = false;
+
+            if (self.current_file_index > 0) {
+                std.debug.print("[INFO] Opened next file: {s} (file {d} of {d})\n", .{ self.current_file_path, self.current_file_index + 1, self.file_paths.len });
+            }
+        } else {
+            self.reached_end = true;
+        }
+
+        const elapsed = time.nanoTimestamp() - start_time;
+        reportFunctionTime("openCurrentFile", elapsed);
+    }
+
+    // Move to the next file
+    fn moveToNextFile(self: *FinewebDataLoader) !bool {
+        const start_time = time.nanoTimestamp();
+
+        // Check if we're already at the end
+        if (self.current_file_index >= self.file_paths.len - 1) {
+            self.reached_end = true;
+            return false;
+        }
+
+        // Move to the next file
+        self.current_file_index += 1;
+        try self.openCurrentFile();
+
+        const elapsed = time.nanoTimestamp() - start_time;
+        reportFunctionTime("moveToNextFile", elapsed);
+
+        return true;
+    }
+
     pub fn deinit(self: *FinewebDataLoader) void {
         const start_time = time.nanoTimestamp();
 
-        self.file.close();
-        self.allocator.free(self.file_path);
+        // Close file if open
+        if (self.file) |file| {
+            file.close();
+        }
+
+        // Free all file paths
+        for (self.file_paths) |path| {
+            self.allocator.free(path);
+        }
+        self.allocator.free(self.file_paths);
 
         var token_it = self.token_map.iterator();
         while (token_it.next()) |entry| {
@@ -176,17 +263,18 @@ pub const FinewebDataLoader = struct {
     pub fn rewind(self: *FinewebDataLoader) !void {
         const start_time = time.nanoTimestamp();
 
-        // Close the current file
-        self.file.close();
+        // Close any open file
+        if (self.file) |file| {
+            file.close();
+            self.file = null;
+            self.buffered_reader = null;
+        }
 
-        // Re-open the file
-        self.file = try std.fs.cwd().openFile(self.file_path, .{});
-
-        // Re-initialize the buffered reader
-        self.buffered_reader = std.io.bufferedReaderSize(2 * 1024 * 1024, self.file.reader());
+        // Reset to the first file
+        self.current_file_index = 0;
+        try self.openCurrentFile();
 
         // Reset tracking state
-        self.header_skipped = false;
         self.reached_end = false;
 
         // Free the current document if any
@@ -194,8 +282,6 @@ pub const FinewebDataLoader = struct {
             self.allocator.free(doc);
             self.current_document = null;
         }
-
-        // No need to reload vocabulary - it's already loaded
 
         const elapsed = time.nanoTimestamp() - start_time;
         reportFunctionTime("rewind", elapsed);
@@ -206,12 +292,13 @@ pub const FinewebDataLoader = struct {
         const start_time = time.nanoTimestamp();
 
         if (self.header_skipped) return;
+        if (self.buffered_reader == null) return error.NoFileOpen;
 
         const HEADER_SIZE = 1024; // Based on our examination of the file
 
         // Use BufferedReader to skip bytes
         var skip_buffer: [HEADER_SIZE]u8 = undefined;
-        const bytes_read = try self.buffered_reader.reader().readAll(&skip_buffer);
+        const bytes_read = try self.buffered_reader.?.reader().readAll(&skip_buffer);
 
         if (bytes_read < HEADER_SIZE) {
             return error.IncompleteHeader;
@@ -227,6 +314,7 @@ pub const FinewebDataLoader = struct {
     /// Read token IDs from the file (using 2-byte tokens)
     pub fn readTokenIds(self: *FinewebDataLoader, count: usize) ![]usize {
         //const start_time = time.nanoTimestamp();
+        if (self.buffered_reader == null) return error.NoFileOpen;
 
         const result = try self.allocator.alloc(usize, count);
         errdefer self.allocator.free(result);
@@ -238,12 +326,13 @@ pub const FinewebDataLoader = struct {
         var byte_buffer = try self.allocator.alloc(u8, CHUNK_SIZE);
         defer self.allocator.free(byte_buffer);
 
-        const bytes_read = try self.buffered_reader.reader().readAll(byte_buffer);
+        const bytes_read = try self.buffered_reader.?.reader().readAll(byte_buffer);
 
         // Process all complete tokens in the buffer
         const complete_tokens = bytes_read / 2;
 
-        for (0..complete_tokens) |i| {
+        var i: usize = 0;
+        while (i < complete_tokens) : (i += 1) {
             const token_offset = i * 2;
             const token_id = @as(usize, std.mem.bytesToValue(u16, byte_buffer[token_offset .. token_offset + 2][0..2]));
             result[tokens_read] = token_id;
@@ -255,14 +344,10 @@ pub const FinewebDataLoader = struct {
             return error.EndOfFile;
         }
 
-        // Print timing information
-        //const elapsed = time.nanoTimestamp() - start_time;
-        //reportFunctionTime("readTokenIds", elapsed);
-
         return result[0..tokens_read];
     }
 
-    /// Find the next document in the token stream
+    /// Find the next document in the token stream across multiple files
     pub fn nextDocument(self: *FinewebDataLoader) !?[]usize {
         //const start_time = time.nanoTimestamp();
 
@@ -272,6 +357,15 @@ pub const FinewebDataLoader = struct {
         }
 
         if (self.reached_end) return null;
+
+        // Make sure a file is open
+        if (self.file == null) {
+            try self.openCurrentFile();
+            if (self.file == null) {
+                self.reached_end = true;
+                return null;
+            }
+        }
 
         if (!self.header_skipped) {
             try self.skipHeader();
@@ -297,12 +391,26 @@ pub const FinewebDataLoader = struct {
             // Ensure we have capacity for the next chunk
             try document_tokens.ensureUnusedCapacity(CHUNK_SIZE);
 
-            const bytes_read = try self.buffered_reader.reader().readAll(byte_buffer);
+            // Handle potential end of file and transition to next file
+            var bytes_read: usize = 0;
+            if (self.buffered_reader) |*reader| {
+                bytes_read = try reader.reader().readAll(byte_buffer);
+            }
+
             if (bytes_read == 0) {
-                if (token_count == 0) {
+                // End of current file reached
+                if (try self.moveToNextFile()) {
+                    // Successfully moved to next file, skip header and continue
+                    if (!self.header_skipped) {
+                        try self.skipHeader();
+                    }
+                    continue;
+                } else if (token_count == 0) {
+                    // End of all files and no document started
                     self.reached_end = true;
                     return null;
                 } else {
+                    // End of all files but we have a partial document
                     found_document = true;
                     self.reached_end = true;
                     break;
@@ -334,37 +442,22 @@ pub const FinewebDataLoader = struct {
             }
         }
 
-        //std.debug.print("Processed a single document with tokens {}\n", .{token_count});
-
         // Create the result
         if (document_tokens.items.len > 0) {
             const result = try document_tokens.toOwnedSlice();
             self.current_document = result;
 
-            //const elapsed = time.nanoTimestamp() - start_time;
-            //reportFunctionTime("nextDocument", elapsed);
-
             return result;
         } else {
-            //const elapsed = time.nanoTimestamp() - start_time;
-            //reportFunctionTime("nextDocument", elapsed);
-
             return null;
         }
     }
 
-    /// Get the next document as a string
+    /// Get the next document as a string, handling multiple files
     pub fn nextDocumentString(self: *FinewebDataLoader) !?[]u8 {
-        //const start_time = time.nanoTimestamp();
-
         const document = try self.nextDocument();
         if (document == null) return null;
         const result = try self.documentToString(document.?);
-
-        // Print timing information
-        //const elapsed = time.nanoTimestamp() - start_time;
-        //reportFunctionTime("nextDocumentString", elapsed);
-
         return result;
     }
 
@@ -401,10 +494,6 @@ pub const FinewebDataLoader = struct {
         }
         @memset(buffer[pos..], 0);
 
-        // Print timing information
-        //const elapsed = time.nanoTimestamp() - start_time;
-        //reportFunctionTime("documentToString", elapsed);
-
         return buffer[0..pos];
     }
 
@@ -429,7 +518,8 @@ pub const FinewebDataLoader = struct {
             // Process valid documents
             if (document.?.len > 0) {
                 // Extract substrings and count frequencies
-                for (1..max_length + 1) |len| {
+                var len: usize = 1;
+                while (len <= max_length) : (len += 1) {
                     if (len > document.?.len) break;
 
                     // Process all substrings of current length in batch
@@ -485,38 +575,19 @@ pub const FinewebDataLoader = struct {
 
         return result;
     }
-};
 
-/// Example usage for FinewebDataLoader
-pub fn showExample() !void {
-    const allocator = std.heap.page_allocator;
-
-    // Open the data file
-    var loader = try FinewebDataLoader.init(allocator, "fineweb_train_000001.bin");
-    defer loader.deinit();
-
-    // Load the vocabulary
-    try loader.loadVocabulary("vocab.json");
-
-    // Process for BPE learning
-    var substrings = try loader.extractSubstringsFromDocuments(100);
-    defer substrings.deinit();
-
-    // Display summary
-    std.debug.print("Extracted {d} unique substrings\n", .{substrings.total_count});
-
-    // Show a few examples
-    const lengths = try substrings.getAllLengths();
-    defer allocator.free(lengths);
-
-    for (lengths) |length| {
-        if (substrings.getStringsOfLength(length)) |strings| {
-            if (strings.len > 0) {
-                std.debug.print("Length {d}: {d} strings, most frequent: '{s}' ({d})\n", .{ length, strings.len, strings[0].content, strings[0].frequency });
-            }
-        }
+    // Get information about current file status
+    pub fn getFileStatus(self: *FinewebDataLoader) struct {
+        current_file_index: usize,
+        total_files: usize,
+        current_file_path: []const u8,
+        reached_end: bool,
+    } {
+        return .{
+            .current_file_index = self.current_file_index,
+            .total_files = self.file_paths.len,
+            .current_file_path = self.current_file_path,
+            .reached_end = self.reached_end,
+        };
     }
-
-    // Report timing information
-    try loader.reportTimings();
-}
+};

@@ -32,11 +32,10 @@ pub fn ParallelAnalyzer(
         num_threads: usize,
         saved_data_path: []const u8,
 
-        /// Initialize the parallel analyzer
         pub fn init(
             allocator: Allocator,
             num_threads: usize,
-            data_file: []const u8,
+            data_files: []const []const u8,
             vocab_file: []const u8,
             saved_data_path: []const u8,
             top_k: usize,
@@ -44,12 +43,18 @@ pub fn ParallelAnalyzer(
         ) !*Self {
             const start_time = time.nanoTimestamp();
 
+            // Validate inputs
+            if (data_files.len == 0) {
+                std.debug.print("[ERROR] No files provided to ParallelAnalyzer.init\n", .{});
+                return error.NoFilesProvided;
+            }
+
             // Create the analyzer
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
 
-            // Initialize data loader
-            var loader = try fineweb.init(allocator, data_file);
+            // Initialize data loader with the files
+            var loader = try fineweb.init(allocator, data_files);
             errdefer loader.deinit();
             try loader.loadVocabulary(vocab_file);
 
@@ -76,6 +81,19 @@ pub fn ParallelAnalyzer(
             if (debug) {
                 const elapsed = time.nanoTimestamp() - start_time;
                 std.debug.print("[ParallelAnalyzer] init: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
+
+                // Print file information
+                const status = loader.getFileStatus();
+                std.debug.print("[ParallelAnalyzer] Using {d} files for processing\n", .{status.total_files});
+
+                // Log the first few files
+                const max_to_show = @min(5, data_files.len);
+                for (data_files[0..max_to_show], 0..) |file, i| {
+                    std.debug.print("[ParallelAnalyzer] File {d}: {s}\n", .{ i + 1, file });
+                }
+                if (data_files.len > max_to_show) {
+                    std.debug.print("[ParallelAnalyzer] ... and {d} more files\n", .{data_files.len - max_to_show});
+                }
             }
 
             return self;
@@ -125,6 +143,10 @@ pub fn ParallelAnalyzer(
         pub fn runFirstPass(self: *Self) !void {
             if (self.debug) {
                 std.debug.print("[ParallelAnalyzer] Starting first pass with {d} threads\n", .{self.num_threads});
+
+                // Print data source information
+                const status = self.data_loader.getFileStatus();
+                std.debug.print("[ParallelAnalyzer] Processing data from {d} files\n", .{status.total_files});
             }
 
             // Start the coordinator
@@ -323,6 +345,13 @@ pub fn ParallelAnalyzer(
                 if (elapsed_since_update > 5 * std.time.ns_per_s) { // Update every 5 seconds
                     const elapsed_sec = @as(f64, @floatFromInt(current_time - coord_start)) / std.time.ns_per_s;
                     std.debug.print("[ParallelAnalyzer] Second pass in progress - {d:.1} seconds elapsed\n", .{elapsed_sec});
+
+                    // Show data loader file status
+                    const status = self.data_loader.getFileStatus();
+                    if (!status.reached_end) {
+                        std.debug.print("[ParallelAnalyzer] Processing file {d} of {d}: {s}\n", .{ status.current_file_index + 1, status.total_files, status.current_file_path });
+                    }
+
                     last_update_time = current_time;
                 }
             }
@@ -383,13 +412,13 @@ pub fn ParallelAnalyzer(
                 worker.thread = try std.Thread.spawn(.{}, runSecondPassWorker, .{worker});
 
                 if (params.debug) {
-                    std.debug.print("[SecondPassCoordinator] Started worker {d} (CMS shared in {d:.2}ms)\n", .{ i, @as(f64, @floatFromInt(manager_time)) / std.time.ns_per_ms });
+                    std.debug.print("[SecondPassCoordinator] Started worker {d} (CMS shared in {d:.2}ms)\n", .{ i, @as(f64, @floatFromInt(manager_time)) / time.ns_per_ms });
                 }
             }
 
             const init_time = std.time.nanoTimestamp() - init_start;
             if (params.debug) {
-                std.debug.print("[SecondPassCoordinator] All workers initialized in {d:.2}ms\n", .{@as(f64, @floatFromInt(init_time)) / std.time.ns_per_ms});
+                std.debug.print("[SecondPassCoordinator] All workers initialized in {d:.2}ms\n", .{@as(f64, @floatFromInt(init_time)) / time.ns_per_ms});
             }
 
             // Process documents
@@ -424,7 +453,7 @@ pub fn ParallelAnalyzer(
 
             const prefill_time = std.time.nanoTimestamp() - prefill_start;
             if (params.debug) {
-                std.debug.print("[SecondPassCoordinator] Pre-filled all worker queues in {d:.2}ms\n", .{@as(f64, @floatFromInt(prefill_time)) / std.time.ns_per_ms});
+                std.debug.print("[SecondPassCoordinator] Pre-filled all worker queues in {d:.2}ms\n", .{@as(f64, @floatFromInt(prefill_time)) / time.ns_per_ms});
             }
 
             // Main processing loop
@@ -482,7 +511,7 @@ pub fn ParallelAnalyzer(
                 }
 
                 // Check for progress logging
-                const current_time = std.time.nanoTimestamp();
+                const current_time = time.nanoTimestamp();
                 const elapsed_since_log = current_time - last_log_time;
                 if (elapsed_since_log > 2 * std.time.ns_per_s) { // Log every 2 seconds
                     const docs_since_last_log = total_docs - doc_count_at_last_log;
@@ -496,6 +525,12 @@ pub fn ParallelAnalyzer(
                         if (worker.running) {
                             std.debug.print("[SecondPassCoordinator] Worker {d}: {d} documents processed, queue depth: {d}\n", .{ i, worker.doc_count, worker.input_queue.count() });
                         }
+                    }
+
+                    // Show data loader file status
+                    const status = params.dataLoader.getFileStatus();
+                    if (!status.reached_end) {
+                        std.debug.print("[SecondPassCoordinator] Processing file {d} of {d}: {s}\n", .{ status.current_file_index + 1, status.total_files, status.current_file_path });
                     }
 
                     last_log_time = current_time;
@@ -539,13 +574,13 @@ pub fn ParallelAnalyzer(
                 std.time.sleep(1 * std.time.ns_per_ms);
             }
 
-            const process_time = std.time.nanoTimestamp() - process_start;
+            const process_time = time.nanoTimestamp() - process_start;
             if (params.debug) {
-                std.debug.print("[SecondPassCoordinator] Processing phase completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(process_time)) / std.time.ns_per_ms});
+                std.debug.print("[SecondPassCoordinator] Processing phase completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(process_time)) / time.ns_per_ms});
             }
 
             // Wait for all worker threads to finish
-            const merge_start = std.time.nanoTimestamp();
+            const merge_start = time.nanoTimestamp();
             for (workers) |*worker| {
                 worker.thread.join();
 
@@ -560,7 +595,7 @@ pub fn ParallelAnalyzer(
             }
 
             for (workers, 0..) |*worker, i| {
-                const worker_merge_start = std.time.nanoTimestamp();
+                const worker_merge_start = time.nanoTimestamp();
 
                 // Merge the actual counts into main manager
                 for (0..max_length + 1) |len| {
@@ -607,15 +642,15 @@ pub fn ParallelAnalyzer(
                 worker.completion_queue.deinit(params.allocator);
                 params.allocator.destroy(worker.completion_queue);
 
-                const worker_merge_time = std.time.nanoTimestamp() - worker_merge_start;
+                const worker_merge_time = time.nanoTimestamp() - worker_merge_start;
                 if (params.debug) {
-                    std.debug.print("[SecondPassCoordinator] Merged results from worker {d} in {d:.2}ms\n", .{ i, @as(f64, @floatFromInt(worker_merge_time)) / std.time.ns_per_ms });
+                    std.debug.print("[SecondPassCoordinator] Merged results from worker {d} in {d:.2}ms\n", .{ i, @as(f64, @floatFromInt(worker_merge_time)) / time.ns_per_ms });
                 }
             }
 
-            const merge_time = std.time.nanoTimestamp() - merge_start;
+            const merge_time = time.nanoTimestamp() - merge_start;
             if (params.debug) {
-                std.debug.print("[SecondPassCoordinator] Results merge phase completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(merge_time)) / std.time.ns_per_ms});
+                std.debug.print("[SecondPassCoordinator] Results merge phase completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(merge_time)) / time.ns_per_ms});
             }
 
             // Signal completion
