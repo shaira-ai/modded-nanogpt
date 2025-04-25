@@ -131,6 +131,7 @@ pub fn Coordinator(
 
             const n_outstanding_jobs = try allocator.alloc(usize, num_workers);
             errdefer allocator.free(n_outstanding_jobs);
+            @memset(n_outstanding_jobs, 0);
 
             // Create pending documents list
             const pending_documents = std.ArrayList([]const u8).init(allocator);
