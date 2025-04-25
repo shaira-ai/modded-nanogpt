@@ -175,16 +175,22 @@ pub fn StringFrequencyManager(
             //std.debug.print("[TIMING] buildCMS ({d} bytes): {d:.2}ms\n", .{ document.len, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
         }
 
-        fn processString(self: *Self, substring: []const u8, guess_count: u64) !void {
+        fn processString(self: *Self, substring: []const u8) !void {
             var heap = &self.heap;
             var counts = &self.actual_counts;
 
             // Check if we're already tracking this string
-            if (counts.contains(substring)) {
+            const maybe_value_ptr = counts.getPtr(substring);
+            if (maybe_value_ptr) |value_ptr| {
                 //std.debug.print("Already tracking '{s}'\n", .{substring});
                 // Already tracking, just increment the actual count
-                counts.getPtr(substring).?.* += 1;
-            } else if (heap.count() < self.top_k) {
+                value_ptr.* += 1;
+                return;
+            }
+            var scratch: [N_LENGTHS]u64 = undefined;
+            self.cms.query(&scratch, @ptrCast(substring.ptr));
+            const guess_count = scratch[0];
+            if (heap.count() < self.top_k) {
                 //std.debug.print("Adding '{s}' to heap\n", .{substring});
                 // Haven't reached capacity yet, add the string
                 const str_copy = try self.allocator.dupe(u8, substring);
@@ -192,7 +198,7 @@ pub fn StringFrequencyManager(
 
                 try heap.add(CandidateString.init(str_copy, guess_count));
                 try counts.put(str_copy, 1);
-            } else if (heap.count() == self.top_k and heap.peek().?.guess_count < guess_count) {
+            } else if (heap.peek().?.guess_count < guess_count) {
                 // Current string has higher estimated count than our minimum
                 const evicted = heap.remove();
                 _ = counts.remove(evicted.string);
@@ -230,11 +236,7 @@ pub fn StringFrequencyManager(
                     continue;
                 }
 
-                var scratch: [N_LENGTHS]u64 = undefined;
-                self.cms.query(&scratch, @ptrCast(&document[i]));
-                for (scratch[0..1], MY_LEN..MY_LEN + 1) |guess_count, len| {
-                    try self.processString(document[i .. i + len], guess_count);
-                }
+                try self.processString(document[i .. i + MY_LEN]);
             }
 
             //const elapsed = time.nanoTimestamp() - start_time;
