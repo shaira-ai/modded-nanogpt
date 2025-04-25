@@ -183,19 +183,13 @@ pub fn Worker(
             const start_time = time.nanoTimestamp();
 
             if (debug) {
-                std.debug.print("[Worker {d}] [DEBUG] Received {s} message from coordinator\n", .{ self.id, @tagName(msg.msg_type) });
+                std.debug.print("[Worker {d}] [DEBUG] Received {s} message from coordinator\n", .{ self.id, @tagName(msg) });
             }
-            switch (msg.msg_type) {
-                .ProcessDocument => {
-                    if (msg.document == null or msg.pass == null) {
-                        if (debug) {
-                            std.debug.print("[Worker {d}] Warning: Received ProcessDocument message with null document or pass\n", .{self.id});
-                        }
-                        return;
-                    }
 
-                    const document = msg.document.?;
-                    const pass = msg.pass.?;
+            switch (msg) {
+                .ProcessDocument => |process_data| {
+                    const document = process_data.document;
+                    const pass = process_data.pass;
 
                     if (pass == 1) {
                         try self.processDocumentFirstPass(document);
@@ -238,15 +232,8 @@ pub fn Worker(
                         }
                     }
                 },
-                .DumpState => {
-                    if (msg.dump_path == null) {
-                        if (debug) {
-                            std.debug.print("[Worker {d}] Warning: Received DumpState message with null dump_path\n", .{self.id});
-                        }
-                        return;
-                    }
-
-                    try self.dumpState(msg.dump_path.?);
+                .DumpState => |dump_data| {
+                    try self.dumpState(dump_data.dump_path);
 
                     // Send the state dumped message
                     const response = message.createStateDumpedMessage(self.id);
@@ -261,9 +248,10 @@ pub fn Worker(
                     // No response needed
                 },
             }
+
             const elapsed = time.nanoTimestamp() - start_time;
             if (debug and elapsed > 10 * time.ns_per_ms) { // Log if handling took more than 10ms
-                std.debug.print("[Worker {d}] [DEBUG] handleCoordinatorMessage for {s} took {d:.2}ms\n", .{ self.id, @tagName(msg.msg_type), @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
+                std.debug.print("[Worker {d}] [DEBUG] handleCoordinatorMessage for {s} took {d:.2}ms\n", .{ self.id, @tagName(msg), @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
             }
         }
 
@@ -290,7 +278,7 @@ pub fn Worker(
                     };
                 } else {
                     // No messages, sleep for a bit
-                    std.time.sleep(300 * std.time.ns_per_ms); // 1ms
+                    std.time.sleep(300 * std.time.ns_per_ms); // 300ms
                 }
             }
 

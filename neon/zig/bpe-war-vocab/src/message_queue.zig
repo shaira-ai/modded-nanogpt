@@ -37,7 +37,7 @@ pub const CoordinatorMessageQueue = struct {
     /// Get number of messages in the queue
     pub fn count(self: *CoordinatorMessageQueue) usize {
         if (true) {
-        @compileError("CoordinatorMessageQueue.count() is not implemented");
+            @compileError("CoordinatorMessageQueue.count() is not implemented");
         }
         return self.queue.count();
     }
@@ -79,7 +79,7 @@ pub const WorkerMessageQueue = struct {
     /// Get number of messages in the queue
     pub fn count(self: *WorkerMessageQueue) usize {
         if (true) {
-        @compileError("WorkerMessageQueue.count() is not implemented");
+            @compileError("WorkerMessageQueue.count() is not implemented");
         }
         return self.queue.count();
     }

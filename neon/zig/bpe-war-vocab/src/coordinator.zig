@@ -277,57 +277,56 @@ pub fn Coordinator(
 
             // Add detailed message info logging
             if (self.debug) {
-                //std.debug.print("[Coordinator] [DEBUG] Handling message from Worker {d}, type: {s}\n", .{ msg.worker_id, @tagName(msg.msg_type) });
+                //std.debug.print("[Coordinator] [DEBUG] Handling message from Worker, type: {s}\n", .{@tagName(msg)});
             }
 
             defer message.freeWorkerMessage(self.allocator, &msg);
 
-            switch (msg.msg_type) {
-                .DocumentProcessed => {
+            switch (msg) {
+                .DocumentProcessed => |processed_data| {
+                    const document = processed_data.document;
+                    const pass = processed_data.pass;
+
                     // Remove from pending documents
-                    if (msg.document != null and msg.pass != null) {
-                        const pass = msg.pass.?;
+                    // Check pending documents array
+                    var found_pending_doc = false;
+                    for (self.pending_documents.items, 0..) |doc, i| {
+                        if (doc.ptr == document.ptr) {
+                            // Remove this document from pending
+                            _ = self.pending_documents.swapRemove(i);
+                            found_pending_doc = true;
+                            self.allocator.free(doc);
 
-                        // Check pending documents array
-                        var found_pending_doc = false;
-                        for (self.pending_documents.items, 0..) |doc, i| {
-                            if (doc.ptr == msg.document.?.ptr) {
-                                // Remove this document from pending
-                                _ = self.pending_documents.swapRemove(i);
-                                found_pending_doc = true;
-                                self.allocator.free(doc);
-
-                                if (self.debug) {
-                                    //std.debug.print("[Coordinator] [DEBUG] Removed document from pending list, {d} remaining\n", .{self.pending_documents.items.len});
-                                }
-                                break;
+                            if (self.debug) {
+                                //std.debug.print("[Coordinator] [DEBUG] Removed document from pending list, {d} remaining\n", .{self.pending_documents.items.len});
                             }
+                            break;
                         }
+                    }
 
-                        if (!found_pending_doc and self.debug) {
-                            //std.debug.print("[Coordinator] [DEBUG] Warning: Could not find document in pending list\n", .{});
+                    if (!found_pending_doc and self.debug) {
+                        //std.debug.print("[Coordinator] [DEBUG] Warning: Could not find document in pending list\n", .{});
+                    }
+
+                    // Count processed documents
+                    if (pass == 1) {
+                        self.first_pass_count += 1;
+
+                        if (self.debug and (self.first_pass_count % 1000 == 0 or self.first_pass_count < 10)) {
+                            std.debug.print("[Coordinator] First pass processed: {d} documents\n", .{self.first_pass_count});
                         }
+                    } else if (pass == 2) {
+                        self.second_pass_count += 1;
 
-                        // Count processed documents
-                        if (pass == 1) {
-                            self.first_pass_count += 1;
-
-                            if (self.debug and (self.first_pass_count % 1000 == 0 or self.first_pass_count < 10)) {
-                                std.debug.print("[Coordinator] First pass processed: {d} documents\n", .{self.first_pass_count});
-                            }
-                        } else if (pass == 2) {
-                            self.second_pass_count += 1;
-
-                            if (self.debug and (self.second_pass_count % 1000 == 0 or self.second_pass_count < 10)) {
-                                std.debug.print("[Coordinator] Second pass processed: {d} documents\n", .{self.second_pass_count});
-                            }
+                        if (self.debug and (self.second_pass_count % 1000 == 0 or self.second_pass_count < 10)) {
+                            std.debug.print("[Coordinator] Second pass processed: {d} documents\n", .{self.second_pass_count});
                         }
                     }
                 },
                 .TopKComplete => {
                     // Worker has completed finding top-K strings
                     if (self.debug) {
-                        std.debug.print("[Coordinator] Worker {d} completed finding top-K strings\n", .{msg.worker_id});
+                        std.debug.print("[Coordinator] Worker completed finding top-K strings\n", .{});
                     }
 
                     // Check if all workers are done
@@ -366,38 +365,38 @@ pub fn Coordinator(
                         std.debug.print("[Coordinator] [DEBUG] Not all workers complete or not in MergingResults state. State: {s}, active workers: {d}\n", .{ @tagName(self.state), active_workers });
                     }
                 },
-                .ProvideCMS => {
+                .ProvideCMS => |cms_data| {
                     // Worker has provided its CMS data for merging
-                    if (msg.worker_cms != null) {
-                        const worker_cms = @as(*CMS, @ptrCast(@alignCast(msg.worker_cms.?)));
+                    const worker_cms = @as(*CMS, @ptrCast(@alignCast(cms_data.worker_cms)));
 
-                        // Merge the worker's CMS into the global CMS
-                        try self.global_cms.?.merge(worker_cms);
+                    // Merge the worker's CMS into the global CMS
+                    try self.global_cms.?.merge(worker_cms);
 
-                        // Increment completion counter
-                        self.cms_merge_completions += 1;
+                    // Increment completion counter
+                    self.cms_merge_completions += 1;
 
-                        // If all workers have provided their CMS data, skip second pass and go to Complete
-                        if (self.cms_merge_completions == self.num_workers and self.state == .MergingCMS) {
-                            if (self.debug) {
-                                std.debug.print("[Coordinator] All workers provided CMS data, transitioning to Complete (skipping Second Pass)\n", .{});
-                            }
-                            // Skip the second pass since ParallelAnalyzer will handle it
-                            self.state = .Complete;
-                            self.running = false;
+                    // If all workers have provided their CMS data, skip second pass and go to Complete
+                    if (self.cms_merge_completions == self.num_workers and self.state == .MergingCMS) {
+                        if (self.debug) {
+                            std.debug.print("[Coordinator] All workers provided CMS data, transitioning to Complete (skipping Second Pass)\n", .{});
                         }
+                        // Skip the second pass since ParallelAnalyzer will handle it
+                        self.state = .Complete;
+                        self.running = false;
                     }
                 },
                 .StateDumped => {
                     // Worker has dumped its state
                     if (self.debug) {
-                        std.debug.print("[Coordinator] Worker {d} dumped state\n", .{msg.worker_id});
+                        std.debug.print("[Coordinator] Worker dumped state\n", .{});
                     }
                 },
-                .Error => {
+                .Error => |error_data| {
                     // Worker encountered an error
-                    if (msg.getErrorMessage()) |error_text| {
-                        const error_copy = try std.fmt.allocPrint(self.allocator, "Worker {d} error: {s}", .{ msg.worker_id, error_text });
+                    const worker_id = error_data.worker_id; // We still need worker_id for error reporting
+
+                    if (error_data.getErrorMessage()) |error_text| {
+                        const error_copy = try std.fmt.allocPrint(self.allocator, "Worker {d} error: {s}", .{ worker_id, error_text });
 
                         if (self.error_msg) |old_error| {
                             self.allocator.free(old_error);
@@ -415,7 +414,7 @@ pub fn Coordinator(
 
             const elapsed = time.nanoTimestamp() - start_time;
             if (self.debug and elapsed > 50 * time.ns_per_ms) { // Log if handling took more than 50ms
-                std.debug.print("[Coordinator] [DEBUG] handleWorkerMessage for {s} took {d:.2}ms\n", .{ @tagName(msg.msg_type), @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
+                std.debug.print("[Coordinator] [DEBUG] handleWorkerMessage for {s} took {d:.2}ms\n", .{ @tagName(msg), @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
             }
         }
 
@@ -514,7 +513,6 @@ pub fn Coordinator(
                 const n_pushed: usize = if (result) 1 else 0;
                 sent_count += n_pushed;
                 self.n_outstanding_jobs[i] += n_pushed;
-
 
                 if (self.debug) {
                     if (result) {
@@ -681,10 +679,10 @@ pub fn Coordinator(
 
                         // If this was a document processed message, immediately feed another document
                         // to the same worker to keep it busy
-                        if (msg.msg_type == .DocumentProcessed and
+                        if (msg == .DocumentProcessed and
                             (self.state == .FirstPass or self.state == .SecondPass))
                         {
-                            const worker_id = msg.worker_id;
+                            const worker_id = msg.DocumentProcessed.worker_id;
 
                             // Only feed if the worker's queue isn't already full
                             if (self.n_outstanding_jobs[worker_id] < self.queue_depth and !self.end_of_documents_reached) {
