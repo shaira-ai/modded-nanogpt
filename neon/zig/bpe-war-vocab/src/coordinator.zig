@@ -753,14 +753,14 @@ pub fn Coordinator(
                 const elapsed_ms = @as(u64, @intCast(@divFloor(elapsed, std.time.ns_per_ms)));
 
                 // Check for stuck condition - no progress for 30 seconds
-                const since_last_progress = std.time.nanoTimestamp() - last_progress_time;
-                const since_last_progress_ms = @as(u64, @intCast(@divFloor(since_last_progress, std.time.ns_per_ms)));
+                // const since_last_progress = std.time.nanoTimestamp() - last_progress_time;
+                // const since_last_progress_ms = @as(u64, @intCast(@divFloor(since_last_progress, std.time.ns_per_ms)));
 
-                if (!any_messages_processed and since_last_progress_ms > 30 * 1000) {
-                    std.debug.print("[Coordinator] No progress for {d} seconds in state {s}, forcing state transition\n", .{ since_last_progress_ms / 1000, @tagName(self.state) });
-                    try self.transitionStateIfNeeded();
-                    last_progress_time = std.time.nanoTimestamp();
-                }
+                // if (!any_messages_processed and since_last_progress_ms > 30 * 1000) {
+                //     std.debug.print("[Coordinator] No progress for {d} seconds in state {s}, forcing state transition\n", .{ since_last_progress_ms / 1000, @tagName(self.state) });
+                //     try self.transitionStateIfNeeded();
+                //     last_progress_time = std.time.nanoTimestamp();
+                // }
 
                 // Check for timeout
                 if (elapsed_ms > max_runtime_ms) {
