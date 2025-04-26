@@ -300,381 +300,6 @@ pub fn ParallelAnalyzer(
             }
         }
 
-        // This function runs the coordinator for the second pass
-        fn runSecondPassCoordinator(params: anytype) !void {
-            const start_time = std.time.nanoTimestamp();
-
-            // Create worker threads
-            const workers = try params.allocator.alloc(SecondPassWorkerThread, params.numThreads);
-            defer params.allocator.free(workers);
-
-            const init_start = std.time.nanoTimestamp();
-            if (params.debug) {
-                std.debug.print("[SecondPassCoordinator] Creating {d} worker threads\n", .{params.numThreads});
-            }
-
-            // Initialize workers
-            for (workers, 0..) |*worker, i| {
-                // Create a new manager for this worker but share the CMS from the main manager
-                const manager_start = std.time.nanoTimestamp();
-
-                // Create a new manager with empty CMS
-                worker.manager = try SFMType.init(params.allocator, params.topK);
-
-                // First, deinit the worker's new empty CMS
-                worker.manager.cms.deinit();
-
-                // Then point to the main CMS instead of copying it
-                worker.manager.cms = params.mainManager.cms;
-
-                // Mark that this worker doesn't own the CMS (to avoid double-free)
-                worker.manager.cms_is_owned = false;
-
-                const manager_time = std.time.nanoTimestamp() - manager_start;
-
-                // Initialize SPSC queues - using larger capacity for better performance
-                worker.input_queue = try params.allocator.create(spsc.BoundedQueue([]const u8, 32));
-                worker.input_queue.* = try spsc.BoundedQueue([]const u8, 32).init(params.allocator);
-
-                worker.completion_queue = try params.allocator.create(spsc.BoundedQueue(usize, 32));
-                worker.completion_queue.* = try spsc.BoundedQueue(usize, 32).init(params.allocator);
-
-                worker.id = i;
-                worker.running = true;
-                worker.doc_count = 0;
-                worker.allocator = params.allocator;
-                worker.debug = params.debug;
-
-                // Start the worker thread
-                worker.thread = try std.Thread.spawn(.{}, runSecondPassWorker, .{worker});
-
-                if (params.debug) {
-                    std.debug.print("[SecondPassCoordinator] Started worker {d} (CMS shared in {d:.2}ms)\n", .{ i, @as(f64, @floatFromInt(manager_time)) / time.ns_per_ms });
-                }
-            }
-
-            const init_time = std.time.nanoTimestamp() - init_start;
-            if (params.debug) {
-                std.debug.print("[SecondPassCoordinator] All workers initialized in {d:.2}ms\n", .{@as(f64, @floatFromInt(init_time)) / time.ns_per_ms});
-            }
-
-            // Process documents
-            var total_docs: usize = 0;
-            var last_log_time = start_time;
-            var doc_count_at_last_log: usize = 0;
-            var docs_in_flight: usize = 0;
-
-            // Pre-fill worker queues first
-            const prefill_start = std.time.nanoTimestamp();
-            for (workers) |*worker| {
-                // Fill each worker's queue initially
-                var docs_queued: usize = 0;
-                while (docs_queued < 20 and worker.running) { // Fill with 20 docs initially
-                    const doc_opt = try params.dataLoader.nextDocumentString();
-                    if (doc_opt == null) break;
-
-                    const doc = doc_opt.?;
-                    if (worker.input_queue.push(doc)) {
-                        docs_queued += 1;
-                        docs_in_flight += 1;
-                    } else {
-                        // Queue is full, stop filling this worker
-                        break;
-                    }
-                }
-
-                if (params.debug) {
-                    std.debug.print("[SecondPassCoordinator] Pre-filled worker {d} with {d} documents\n", .{ worker.id, docs_queued });
-                }
-            }
-
-            const prefill_time = std.time.nanoTimestamp() - prefill_start;
-            if (params.debug) {
-                std.debug.print("[SecondPassCoordinator] Pre-filled all worker queues in {d:.2}ms\n", .{@as(f64, @floatFromInt(prefill_time)) / time.ns_per_ms});
-            }
-
-            // Main processing loop
-            const process_start = std.time.nanoTimestamp();
-            var end_of_documents = false;
-
-            while (true) {
-                // Check if all workers need more documents
-                var all_workers_idle = true;
-                var all_workers_done = true;
-                var active_workers: usize = 0;
-
-                for (workers) |*worker| {
-                    if (worker.running) {
-                        all_workers_done = false;
-                        active_workers += 1;
-                    }
-
-                    // Check for completions first
-                    var completions: usize = 0;
-                    while (worker.completion_queue.pop()) |_| {
-                        completions += 1;
-                        total_docs += 1;
-                        docs_in_flight -= 1;
-                    }
-
-                    if (completions > 0) {
-                        worker.doc_count += completions;
-                        all_workers_idle = false;
-                    }
-
-                    // If this worker needs more documents (queue has space)
-                    if (!end_of_documents and worker.input_queue.count() < 10 and worker.running) {
-                        all_workers_idle = false;
-
-                        // Try to get a new document
-                        const doc_opt = try params.dataLoader.nextDocumentString();
-                        if (doc_opt == null) {
-                            // No more documents, mark that we've reached the end
-                            end_of_documents = true;
-
-                            if (params.debug) {
-                                std.debug.print("[SecondPassCoordinator] Reached end of documents after {d} documents\n", .{total_docs + docs_in_flight});
-                            }
-                        } else {
-                            // Unwrap the optional to get the actual string slice
-                            const doc = doc_opt.?;
-
-                            // Add document to worker's queue (retry if full)
-                            if (worker.input_queue.push(doc)) {
-                                docs_in_flight += 1;
-                            }
-                        }
-                    }
-                }
-
-                // Check for progress logging
-                const current_time = time.nanoTimestamp();
-                const elapsed_since_log = current_time - last_log_time;
-                if (elapsed_since_log > 2 * std.time.ns_per_s) { // Log every 2 seconds
-                    const docs_since_last_log = total_docs - doc_count_at_last_log;
-                    const elapsed_sec = @as(f64, @floatFromInt(elapsed_since_log)) / std.time.ns_per_s;
-                    const docs_per_sec = @as(f64, @floatFromInt(docs_since_last_log)) / elapsed_sec;
-
-                    std.debug.print("[SecondPassCoordinator] Processed {d} documents ({d:.2} docs/sec), {d} in flight, {d} active workers\n", .{ total_docs, docs_per_sec, docs_in_flight, active_workers });
-
-                    // Show per-worker stats
-                    for (workers, 0..) |worker, i| {
-                        if (worker.running) {
-                            std.debug.print("[SecondPassCoordinator] Worker {d}: {d} documents processed, queue depth: {d}\n", .{ i, worker.doc_count, worker.input_queue.count() });
-                        }
-                    }
-
-                    // Show data loader file status
-                    const status = params.dataLoader.getFileStatus();
-                    if (!status.reached_end) {
-                        std.debug.print("[SecondPassCoordinator] Processing file {d} of {d}: {s}\n", .{ status.current_file_index + 1, status.total_files, status.current_file_path });
-                    }
-
-                    last_log_time = current_time;
-                    doc_count_at_last_log = total_docs;
-                }
-
-                // If we've reached the end of documents and all workers are done processing
-                if (end_of_documents and docs_in_flight == 0) {
-                    // Send shutdown signals to all workers
-                    for (workers) |*worker| {
-                        if (worker.running) {
-                            // Create an empty string as a shutdown signal
-                            const empty_string = try params.allocator.dupe(u8, "");
-
-                            // Keep trying until the queue has space
-                            while (!worker.input_queue.push(empty_string)) {
-                                std.time.sleep(1 * std.time.ns_per_ms);
-                            }
-
-                            if (params.debug) {
-                                std.debug.print("[SecondPassCoordinator] Signaled worker {d} to stop\n", .{worker.id});
-                            }
-                        }
-                    }
-
-                    if (params.debug) {
-                        std.debug.print("[SecondPassCoordinator] All documents processed, waiting for workers to complete\n", .{});
-                    }
-                    break;
-                }
-
-                // If all workers are done, break out
-                if (all_workers_done) {
-                    if (params.debug) {
-                        std.debug.print("[SecondPassCoordinator] All workers completed, waiting for threads to join\n", .{});
-                    }
-                    break;
-                }
-
-                // Sleep a bit to avoid spinning
-                std.time.sleep(1 * std.time.ns_per_ms);
-            }
-
-            const process_time = time.nanoTimestamp() - process_start;
-            if (params.debug) {
-                std.debug.print("[SecondPassCoordinator] Processing phase completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(process_time)) / time.ns_per_ms});
-            }
-
-            // Wait for all worker threads to finish
-            const merge_start = time.nanoTimestamp();
-            for (workers) |*worker| {
-                worker.thread.join();
-
-                if (params.debug) {
-                    std.debug.print("[SecondPassCoordinator] Worker {d} processed {d} documents\n", .{ worker.id, worker.doc_count });
-                }
-            }
-
-            // Merge results from all worker managers into the main manager
-            if (params.debug) {
-                std.debug.print("[SecondPassCoordinator] All workers finished, merging results...\n", .{});
-            }
-
-            for (workers, 0..) |*worker, i| {
-                const worker_merge_start = time.nanoTimestamp();
-
-                // Merge the actual counts into main manager
-                var worker_heap = &worker.manager.heap;
-                var worker_counts = &worker.manager.actual_counts;
-                var main_counts = &params.mainManager.actual_counts;
-
-                // Process the heap items (top-K candidates)
-                while (worker_heap.count() > 0) {
-                    const item = worker_heap.remove();
-                    const count = worker_counts.get(item.string) orelse 0;
-
-                    // Add to main manager if not already there, or increase count if it is
-                    if (main_counts.contains(item.string)) {
-                        // Already exists, just add the count
-                        main_counts.getPtr(item.string).?.* += count;
-                    } else {
-                        // New string, create a copy and add it
-                        const str_copy = try params.allocator.dupe(u8, item.string);
-                        try main_counts.put(str_copy, count);
-
-                        // Add to main manager's heap if needed
-                        var main_heap = &params.mainManager.heap;
-                        if (main_heap.count() < params.topK) {
-                            try main_heap.add(CandidateString.init(str_copy, item.guess_count));
-                        } else if (main_heap.peek().?.guess_count < item.guess_count) {
-                            const evicted = main_heap.remove();
-                            params.allocator.free(evicted.string);
-                            try main_heap.add(CandidateString.init(str_copy, item.guess_count));
-                        }
-                    }
-
-                    // Free the worker's string
-                    params.allocator.free(item.string);
-                }
-
-                // Clean up the worker's manager and queues
-                // OPTIMIZATION: Don't deinit the CMS itself since it's shared and not owned by worker
-                worker.manager.cms_is_owned = false;
-                worker.manager.deinit();
-                worker.input_queue.deinit(params.allocator);
-                params.allocator.destroy(worker.input_queue);
-                worker.completion_queue.deinit(params.allocator);
-                params.allocator.destroy(worker.completion_queue);
-
-                const worker_merge_time = time.nanoTimestamp() - worker_merge_start;
-                if (params.debug) {
-                    std.debug.print("[SecondPassCoordinator] Merged results from worker {d} in {d:.2}ms\n", .{ i, @as(f64, @floatFromInt(worker_merge_time)) / time.ns_per_ms });
-                }
-            }
-
-            const merge_time = time.nanoTimestamp() - merge_start;
-            if (params.debug) {
-                std.debug.print("[SecondPassCoordinator] Results merge phase completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(merge_time)) / time.ns_per_ms});
-            }
-
-            // Signal completion
-            params.completionFlag.* = true;
-
-            const elapsed_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - start_time)) / std.time.ns_per_ms;
-            if (params.debug) {
-                std.debug.print("[SecondPassCoordinator] Second pass completed in {d:.2}ms, processed {d} documents ({d:.2} docs/sec)\n", .{ elapsed_ms, total_docs, @as(f64, @floatFromInt(total_docs)) / (elapsed_ms / 1000.0) });
-            }
-        }
-
-        // Define the worker thread type for the second pass
-        const SecondPassWorkerThread = struct {
-            id: usize,
-            thread: std.Thread,
-            input_queue: *spsc.BoundedQueue([]const u8, 32),
-            completion_queue: *spsc.BoundedQueue(usize, 32),
-            manager: *SFMType,
-            allocator: Allocator,
-            running: bool,
-            doc_count: usize,
-            debug: bool,
-        };
-
-        // This function runs a worker for the second pass
-        fn runSecondPassWorker(worker: *SecondPassWorkerThread) !void {
-            const start_time = time.nanoTimestamp();
-
-            if (worker.debug) {
-                std.debug.print("[SecondPassWorker {d}] Started\n", .{worker.id});
-            }
-
-            var doc_count: usize = 0;
-            var last_log_time = start_time;
-            var last_log_count: usize = 0;
-
-            while (worker.running) {
-                // Get a document from the input queue
-                const doc_opt = worker.input_queue.pop();
-                if (doc_opt == null) {
-                    // Empty queue, wait a bit
-                    std.time.sleep(1 * std.time.ns_per_ms);
-                    continue;
-                }
-
-                // Process the document
-                const doc = doc_opt.?;
-
-                if (doc.len == 0) {
-                    // Empty string signals shutdown
-                    if (worker.debug) {
-                        std.debug.print("[SecondPassWorker {d}] Received shutdown signal\n", .{worker.id});
-                    }
-                    worker.running = false;
-                    worker.allocator.free(doc); // Free the shutdown signal string
-                    break;
-                }
-
-                const process_start = time.nanoTimestamp();
-                try worker.manager.processDocumentSecondPass(doc);
-                const process_time = time.nanoTimestamp() - process_start;
-
-                worker.allocator.free(doc);
-
-                // Signal completion
-                _ = worker.completion_queue.push(1);
-
-                doc_count += 1;
-
-                if (doc_count % 5000 == 0 or doc_count == 1) {
-                    const current_time = time.nanoTimestamp();
-                    const elapsed = @as(f64, @floatFromInt(current_time - start_time)) / time.ns_per_ms;
-                    const docs_per_sec = @as(f64, @floatFromInt(doc_count)) / (elapsed / 1000.0);
-
-                    if (worker.debug) {
-                        std.debug.print("[SecondPassWorker {d}] Processed {d} documents ({d:.2} docs/sec, last doc: {d:.2}ms)\n", .{ worker.id, doc_count, docs_per_sec, @as(f64, @floatFromInt(process_time)) / time.ns_per_ms });
-                    }
-
-                    last_log_time = current_time;
-                    last_log_count = doc_count;
-                }
-            }
-
-            const elapsed_ms = @as(f64, @floatFromInt(time.nanoTimestamp() - start_time)) / time.ns_per_ms;
-            if (worker.debug) {
-                std.debug.print("[SecondPassWorker {d}] Finished, processed {d} documents in {d:.2}ms ({d:.2} docs/sec)\n", .{ worker.id, doc_count, elapsed_ms, @as(f64, @floatFromInt(doc_count)) / (elapsed_ms / 1000.0) });
-            }
-        }
-
         pub fn getResults(self: *Self) !void {
             if (self.debug) {
                 std.debug.print("[ParallelAnalyzer] Getting results\n", .{});
@@ -708,54 +333,28 @@ pub fn ParallelAnalyzer(
 
             const manager = if (self.manager) |m| m else self.coordinator.workers[0].sfm;
 
-            if (MY_LEN < 4) {
-                if (MY_LEN == 2) {
-                    var token_count: u32 = 0;
-                    for (manager.length2_counters) |count| {
-                        if (count > 0) token_count += 1;
-                    }
+            var token_count_by_length = std.AutoHashMap(usize, usize).init(self.allocator);
+            defer token_count_by_length.deinit();
 
-                    header[1] = @intCast(@min(token_count, top_k));
+            for (manager.heap.items) |candidate| {
+                const length = candidate.string.len;
+
+                if (length == 0 or length > 256) continue;
+
+                const current = token_count_by_length.get(length) orelse 0;
+                try token_count_by_length.put(length, current + 1);
+            }
+
+            var lengths_it = token_count_by_length.iterator();
+            while (lengths_it.next()) |entry| {
+                const length = entry.key_ptr.*;
+                const count = entry.value_ptr.*;
+
+                if (length > 0 and length <= 256) {
+                    header[length - 1] = @intCast(count);
 
                     if (self.debug) {
-                        std.debug.print("[ParallelAnalyzer] Length 2: {d} tokens\n", .{header[1]});
-                    }
-                } else if (MY_LEN == 3) {
-                    var token_count: u32 = 0;
-                    for (manager.length3_counters) |count| {
-                        if (count > 0) token_count += 1;
-                    }
-
-                    header[2] = @intCast(@min(token_count, top_k));
-
-                    if (self.debug) {
-                        std.debug.print("[ParallelAnalyzer] Length 3: {d} tokens\n", .{header[2]});
-                    }
-                }
-            } else {
-                var token_count_by_length = std.AutoHashMap(usize, usize).init(self.allocator);
-                defer token_count_by_length.deinit();
-
-                for (manager.heap.items) |candidate| {
-                    const length = candidate.string.len;
-
-                    if (length == 0 or length > 256) continue;
-
-                    const current = token_count_by_length.get(length) orelse 0;
-                    try token_count_by_length.put(length, current + 1);
-                }
-
-                var lengths_it = token_count_by_length.iterator();
-                while (lengths_it.next()) |entry| {
-                    const length = entry.key_ptr.*;
-                    const count = entry.value_ptr.*;
-
-                    if (length > 0 and length <= 256) {
-                        header[length - 1] = @intCast(count);
-
-                        if (self.debug) {
-                            std.debug.print("[ParallelAnalyzer] Length {d}: {d} tokens\n", .{ length, count });
-                        }
+                        std.debug.print("[ParallelAnalyzer] Length {d}: {d} tokens\n", .{ length, count });
                     }
                 }
             }
@@ -764,90 +363,34 @@ pub fn ParallelAnalyzer(
             try writer.writeAll(std.mem.asBytes(&header));
 
             // Now write the tokens, grouped by length
-            if (MY_LEN < 4) {
-                if (MY_LEN == 2) {
-                    const TokenPair16 = struct { index: u16, count: usize };
-
-                    var token_pairs = std.ArrayList(TokenPair16).init(self.allocator);
-                    defer token_pairs.deinit();
-
-                    for (manager.length2_counters, 0..) |count, index| {
-                        if (count > 0) {
-                            try token_pairs.append(.{ .index = @intCast(index), .count = count });
-                        }
-                    }
-
-                    const TokenSorter = struct {
-                        fn compare(_: void, a: TokenPair16, b: TokenPair16) bool {
-                            return a.count > b.count;
-                        }
-                    };
-
-                    std.sort.insertion(TokenPair16, token_pairs.items, {}, TokenSorter.compare);
-
-                    const tokens_to_write = @min(token_pairs.items.len, top_k);
-                    for (token_pairs.items[0..tokens_to_write]) |item| {
-                        const token = manager.length2_token_from_index(item.index);
-                        try writer.writeAll(&token);
-                    }
-                } else if (MY_LEN == 3) {
-                    const TokenPair32 = struct { index: u32, count: usize };
-
-                    var token_pairs = std.ArrayList(TokenPair32).init(self.allocator);
-                    defer token_pairs.deinit();
-
-                    var total_nonzero: usize = 0;
-                    for (manager.length3_counters, 0..) |count, index| {
-                        if (count > 0) {
-                            try token_pairs.append(.{ .index = @intCast(index), .count = count });
-                            total_nonzero += 1;
-                        }
-                    }
-
-                    const TokenSorter = struct {
-                        fn compare(_: void, a: TokenPair32, b: TokenPair32) bool {
-                            return a.count > b.count;
-                        }
-                    };
-
-                    std.sort.pdq(TokenPair32, token_pairs.items, {}, TokenSorter.compare);
-
-                    // Write sorted tokens (up to top_k)
-                    const tokens_to_write = @min(token_pairs.items.len, top_k);
-                    for (token_pairs.items[0..tokens_to_write]) |item| {
-                        const token = manager.length3_token_from_index(item.index);
-                        try writer.writeAll(&token);
-                    }
-
-                    std.debug.print("[ParallelAnalyzer] Length 3 tokens written successfully\n", .{});
+            var length_arrays = std.AutoHashMap(usize, std.ArrayList([]const u8)).init(self.allocator);
+            defer {
+                var len_it = length_arrays.iterator();
+                while (len_it.next()) |entry| {
+                    entry.value_ptr.*.deinit();
                 }
-            } else {
-                var length_arrays = std.AutoHashMap(usize, std.ArrayList([]const u8)).init(self.allocator);
-                defer {
-                    var len_it = length_arrays.iterator();
-                    while (len_it.next()) |entry| {
-                        entry.value_ptr.*.deinit();
-                    }
-                    length_arrays.deinit();
+                length_arrays.deinit();
+            }
+
+            while(manager.heap.count() > 0) {
+                const candidate = manager.heap.remove();
+                const length = candidate.string.len;
+
+                if (length == 0 or length > 256) continue;
+
+                if (!length_arrays.contains(length)) {
+                    try length_arrays.put(length, std.ArrayList([]const u8).init(self.allocator));
                 }
 
-                for (manager.heap.items) |candidate| {
-                    const length = candidate.string.len;
+                try length_arrays.getPtr(length).?.append(candidate.string);
+            }
 
-                    if (length == 0 or length > 256) continue;
-
-                    if (!length_arrays.contains(length)) {
-                        try length_arrays.put(length, std.ArrayList([]const u8).init(self.allocator));
-                    }
-
-                    try length_arrays.getPtr(length).?.append(candidate.string);
-                }
-
-                for (1..257) |length| {
-                    if (length_arrays.get(@intCast(length))) |token_list| {
-                        for (token_list.items) |token| {
-                            try writer.writeAll(token);
-                        }
+            for (1..257) |length| {
+                if (length_arrays.get(@intCast(length))) |token_list| {
+                    var idx: usize = 0;
+                    while (idx < token_list.items.len) : (idx += 1) {
+                        const token = token_list.items[token_list.items.len - idx - 1];
+                        try writer.writeAll(token);
                     }
                 }
             }

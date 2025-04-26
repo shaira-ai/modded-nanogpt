@@ -235,6 +235,10 @@ pub fn main() !void {
         std.debug.print("Pass 2 completed in {d:.2}ms\n", .{second_pass_ms});
     }
 
+    if (MY_LEN < 4) {
+        try analyzer.addSmallStringsToHeap();
+    }
+
     // Get and display results
     std.debug.print("\n=== RESULTS ===\n", .{});
     try analyzer.getResults();

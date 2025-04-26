@@ -399,6 +399,41 @@ pub fn StringFrequencyManager(
             return self;
         }
 
+        fn addItemToHeap(self: *Self, item: CandidateString) !void {
+            if (self.heap.count() < top_k) {
+                try self.heap.add(item);
+            } else if (CandidateString.lessThan(undefined, self.heap.peek().?, item) == .lt) {
+                const evicted = self.heap.remove();
+                self.allocator.free(evicted.string);
+                try self.heap.add(item);
+            } else {
+                self.allocator.free(item.string);
+            }
+        }
+
+        pub fn addSmallStringsToHeap(self: *Self) !void {
+            for (self.length2_counters, 0..) |*count, index| {
+                if (count.* > 0) {
+                    const str = try self.allocator.alloc(u8, 2);
+                    const idx_u16: u16 = @intCast(index);
+                    @memcpy(str, @as([*]const u8, @ptrCast(&idx_u16)));
+                    const item = CandidateString.init(str, 420, count.*);
+                    try self.addItemToHeap(item);
+                }
+                count.* = 0;
+            }
+            for (self.length3_counters, 0..) |*count, index| {
+                if (count.* > 0) {
+                    const str = try self.allocator.alloc(u8, 3);
+                    const idx_u24: u24 = @intCast(index);
+                    @memcpy(str, @as([*]const u8, @ptrCast(&idx_u24)));
+                    const item = CandidateString.init(str, 420, count.*);
+                    try self.addItemToHeap(item);
+                }
+                count.* = 0;
+            }
+        }
+
         // Get results and calculate error statistics
         pub fn getResults(self: *Self) !void {
             const start_time = time.nanoTimestamp();
@@ -407,185 +442,69 @@ pub fn StringFrequencyManager(
 
             var total_strings: usize = 0;
 
-            // Process and display length 2 strings
-            {
-                const display_count = top_k;
+            var heap = &self.heap;
+            var counts = &self.actual_counts;
 
-                const ItemType2 = struct { index: u16, count: usize };
-                const lessThan2 = struct {
-                    pub fn lessThan(_: void, a: ItemType2, b: ItemType2) std.math.Order {
-                        return std.math.order(a.count, b.count);
-                    }
-                }.lessThan;
+            const count = heap.count();
+            total_strings += count;
 
-                var length2_heap = std.PriorityQueue(ItemType2, void, lessThan2).init(self.allocator, {});
-                defer length2_heap.deinit();
+            std.debug.print("\nLength {d}: {d} strings\n", .{ MY_LEN, count });
 
-                for (self.length2_counters, 0..) |count, index| {
-                    if (count == 0) continue;
-
-                    if (length2_heap.count() < display_count) {
-                        try length2_heap.add(.{ .index = @intCast(index), .count = count });
-                    } else if (length2_heap.peek().?.count < count) {
-                        _ = length2_heap.remove();
-                        try length2_heap.add(.{ .index = @intCast(index), .count = count });
-                    }
-                }
-
-                std.debug.print("\nLength 2: {d} strings\n", .{@min(display_count, length2_heap.count())});
-                std.debug.print("Top strings of length 2:\n", .{});
-
-                var results = std.ArrayList(ItemType2).init(self.allocator);
+            // Only print details for a few sample lengths to keep output manageable
+            if (true) {
+                // Extract top strings (in reverse order)
+                var results = std.ArrayList(CandidateString).init(self.allocator);
                 defer results.deinit();
 
-                while (length2_heap.count() > 0) {
-                    try results.append(length2_heap.remove());
+                while (heap.count() > 0) {
+                    try results.append(heap.remove());
                 }
 
+                // Print top strings with error stats
+                std.debug.print("Top strings of length {d}:\n", .{MY_LEN});
+
+                var total_error: f64 = 0;
+                var total_error_pct: f64 = 0;
+
+                const display_count = @min(1000, results.items.len);
+
+                // Display in descending order (highest frequency first)
                 var i: usize = results.items.len;
                 var displayed: usize = 0;
-                var buf: [2]u8 = undefined;
 
                 while (i > 0 and displayed < display_count) {
                     i -= 1;
                     const item = results.items[i];
-
-                    const idx = item.index;
-                    buf[0] = @intCast((idx >> 8) & 0xFF);
-                    buf[1] = @intCast(idx & 0xFF);
-
-                    std.debug.print("  {d}. '{s}': count={d}\n", .{
-                        displayed + 1,
-                        std.fmt.fmtSliceEscapeLower(&buf),
-                        item.count,
-                    });
-
-                    displayed += 1;
-                }
-
-                total_strings += displayed;
-            }
-
-            // Process and display length 3 strings
-            {
-                const display_count = top_k;
-
-                const ItemType3 = struct { index: u24, count: usize };
-                const lessThan3 = struct {
-                    pub fn lessThan(_: void, a: ItemType3, b: ItemType3) std.math.Order {
-                        return std.math.order(a.count, b.count);
-                    }
-                }.lessThan;
-
-                var length3_heap = std.PriorityQueue(ItemType3, void, lessThan3).init(self.allocator, {});
-                defer length3_heap.deinit();
-
-                // Iterate through all length 3 counters in one go (like length 2)
-                for (self.length3_counters, 0..) |count, index| {
-                    if (count == 0) continue;
-
-                    if (length3_heap.count() < display_count) {
-                        try length3_heap.add(.{ .index = @intCast(index), .count = count });
-                    } else if (length3_heap.peek().?.count < count) {
-                        _ = length3_heap.remove();
-                        try length3_heap.add(.{ .index = @intCast(index), .count = count });
-                    }
-                }
-
-                // Display results
-                std.debug.print("\nLength 3: {d} strings\n", .{@min(display_count, length3_heap.count())});
-                std.debug.print("Top strings of length 3:\n", .{});
-
-                var results = std.ArrayList(ItemType3).init(self.allocator);
-                defer results.deinit();
-
-                while (length3_heap.count() > 0) {
-                    try results.append(length3_heap.remove());
-                }
-
-                var i: usize = results.items.len;
-                var displayed: usize = 0;
-                var buf: [3]u8 = undefined;
-
-                while (i > 0 and displayed < display_count) {
-                    i -= 1;
-                    const item = results.items[i];
-
-                    const idx = item.index;
-                    buf[0] = @intCast((idx >> 16) & 0xFF);
-                    buf[1] = @intCast((idx >> 8) & 0xFF);
-                    buf[2] = @intCast(idx & 0xFF);
-
-                    std.debug.print("  {d}. '{s}': count={d}\n", .{ displayed + 1, std.fmt.fmtSliceEscapeLower(&buf), item.count });
-
-                    displayed += 1;
-                }
-
-                total_strings += displayed;
-            }
-
-            if (MY_LEN >= 4) {
-                var heap = &self.heap;
-                var counts = &self.actual_counts;
-
-                const count = heap.count();
-                total_strings += count;
-
-                std.debug.print("\nLength {d}: {d} strings\n", .{ MY_LEN, count });
-
-                // Only print details for a few sample lengths to keep output manageable
-                if (true) {
-                    // Extract top strings (in reverse order)
-                    var results = std.ArrayList(CandidateString).init(self.allocator);
-                    defer results.deinit();
-
-                    while (heap.count() > 0) {
-                        try results.append(heap.remove());
-                    }
-
-                    // Print top strings with error stats
-                    std.debug.print("Top strings of length {d}:\n", .{MY_LEN});
-
-                    var total_error: f64 = 0;
-                    var total_error_pct: f64 = 0;
-
-                    const display_count = @min(1000, results.items.len);
-
-                    // Display in descending order (highest frequency first)
-                    var i: usize = results.items.len;
-                    var displayed: usize = 0;
-
-                    while (i > 0 and displayed < display_count) {
-                        i -= 1;
-                        const item = results.items[i];
-
+                    var actual: usize = item.guess_count;
+                    if (item.string.len >= 4) {
                         if (counts.getPtr(item.string, item.hash)) |actual_ptr| {
-                            const actual = actual_ptr.*;
-                            const abs_error = if (item.guess_count > actual)
-                                item.guess_count - actual
-                            else
-                                actual - item.guess_count;
-
-                            const error_pct = if (actual > 0)
-                                @as(f64, @floatFromInt(abs_error)) / @as(f64, @floatFromInt(actual)) * 100.0
-                            else
-                                0.0;
-
-                            std.debug.print("  {d}. '{s}': est={d}, actual={d}, error={d:.2}%\n", .{ displayed + 1, item.string, item.guess_count, actual, error_pct });
-
-                            total_error += @as(f64, @floatFromInt(abs_error));
-                            total_error_pct += error_pct;
-                            displayed += 1;
+                            actual = actual_ptr.*;
                         }
-
-                        // Add back to heap to restore original state
-                        try heap.add(item);
                     }
 
-                    if (displayed > 0) {
-                        const avg_error_pct = total_error_pct / @as(f64, @floatFromInt(displayed));
-                        std.debug.print("  Average error for length {d}: {d:.2}%\n", .{ MY_LEN, avg_error_pct });
-                    }
+                    const abs_error = if (item.guess_count > actual)
+                        item.guess_count - actual
+                    else
+                        actual - item.guess_count;
+
+                    const error_pct = if (actual > 0)
+                        @as(f64, @floatFromInt(abs_error)) / @as(f64, @floatFromInt(actual)) * 100.0
+                    else
+                        0.0;
+
+                    std.debug.print("  {d}. '{s}': est={d}, actual={d}, error={d:.2}%\n", .{ displayed + 1, item.string, item.guess_count, actual, error_pct });
+
+                    total_error += @as(f64, @floatFromInt(abs_error));
+                    total_error_pct += error_pct;
+                    displayed += 1;
+
+                    // Add back to heap to restore original state
+                    try heap.add(item);
+                }
+
+                if (displayed > 0) {
+                    const avg_error_pct = total_error_pct / @as(f64, @floatFromInt(displayed));
+                    std.debug.print("  Average error for length {d}: {d:.2}%\n", .{ MY_LEN, avg_error_pct });
                 }
             }
 
