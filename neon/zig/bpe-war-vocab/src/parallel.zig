@@ -265,6 +265,9 @@ pub fn ParallelAnalyzer(
 
         /// Run second pass using parallel processing
         pub fn runSecondPass(self: *Self) !void {
+            if (MY_LEN < 4) {
+                return;
+            }
             const overall_start_time = time.nanoTimestamp();
 
             if (self.debug) {
