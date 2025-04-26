@@ -524,18 +524,8 @@ pub fn Coordinator(
             var sent_count: usize = 0;
             for (0..self.num_workers) |i| {
                 const msg = message.createRequestCMSMessage(i);
-                const result = self.input_queues[i].push(msg);
-                const n_pushed: usize = if (result) 1 else 0;
-                sent_count += n_pushed;
-                self.n_outstanding_jobs[i] += n_pushed;
-
-                if (self.debug) {
-                    if (result) {
-                        std.debug.print("[Coordinator] [DEBUG] Sent RequestCMS to worker {d}\n", .{i});
-                    } else {
-                        std.debug.print("[Coordinator] [ERROR] Failed to send RequestCMS to worker {d}! Queue full?\n", .{i});
-                    }
-                }
+                const result = self.sendMessageToWorker(i, msg, true); // Expect response
+                sent_count += @intFromBool(result);
             }
 
             // Reset the CMS merge completions counter
@@ -593,9 +583,7 @@ pub fn Coordinator(
                     // Send find top-K messages to all workers
                     for (0..self.num_workers) |i| {
                         const msg = message.createFindTopKMessage(i);
-                        const result = self.input_queues[i].push(msg);
-                        const n_pushed: usize = if (result) 1 else 0;
-                        self.n_outstanding_jobs[i] += n_pushed;
+                        _ = self.sendMessageToWorker(i, msg, true); // Expect response
                     }
                 },
                 .MergingResults => {
@@ -646,6 +634,16 @@ pub fn Coordinator(
             self.shutdownWorkers();
         }
 
+        /// Send a message to a worker and track it if a response is expected
+        fn sendMessageToWorker(self: *Self, worker_id: usize, msg: message.CoordinatorMessage, expect_response: bool) bool {
+            const result = self.input_queues[worker_id].push(msg);
+            if (result and expect_response) {
+                self.n_outstanding_jobs[worker_id] += 1;
+            }
+            return result;
+        }
+
+        /// Send shutdown messages to all workers
         pub fn shutdownWorkers(self: *Self) void {
             for (0..self.num_workers) |i| {
                 while (self.n_outstanding_jobs[i] > 0) {
@@ -660,7 +658,7 @@ pub fn Coordinator(
 
             for (0..self.num_workers) |i| {
                 const msg = message.createShutdownMessage(i);
-                _ = self.input_queues[i].push(msg);
+                _ = self.sendMessageToWorker(i, msg, false); // Don't expect response
             }
         }
 
@@ -706,11 +704,8 @@ pub fn Coordinator(
                         const pass: u8 = if (self.state == .FirstPass) 1 else 2;
                         const msg = message.createProcessDocumentMessage(i, doc_id, doc.?, pass);
 
-                        // Send the message
-                        const result = self.input_queues[i].push(msg);
-                        const n_pushed: usize = if (result) 1 else 0;
-                        self.n_outstanding_jobs[i] += n_pushed;
-                        pushed += n_pushed;
+                        const result = self.sendMessageToWorker(i, msg, true); // Expect response
+                        pushed += @intFromBool(result);
 
                         if (self.debug and pushed == 1) {
                             std.debug.print("[Coordinator] Initial document push: sent document to worker {d} (pass {d})\n", .{ i, pass });
@@ -752,10 +747,7 @@ pub fn Coordinator(
                             const pass: u8 = if (self.state == .FirstPass) 1 else 2;
                             const new_msg = message.createProcessDocumentMessage(i, doc_id, document, pass);
 
-                            // Send the message
-                            const result = self.input_queues[i].push(new_msg);
-                            const n_pushed: usize = if (result) 1 else 0;
-                            self.n_outstanding_jobs[i] += n_pushed;
+                            _ = self.sendMessageToWorker(i, new_msg, true); // Expect response
 
                             if (self.debug and (self.first_pass_count + self.second_pass_count) % 10000 == 0) {
                                 std.debug.print("[Coordinator] Fed another document to worker {d} (pass {d})\n", .{ i, pass });
