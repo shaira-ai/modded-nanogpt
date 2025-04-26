@@ -18,9 +18,10 @@ pub fn Coordinator(
     comptime cms_depth: usize,
     comptime min_length: usize,
     comptime max_length: usize,
+    comptime top_k: usize,
 ) type {
     // Import worker type
-    const Worker = worker_mod.Worker(cms_width, cms_depth, min_length, max_length, false);
+    const Worker = worker_mod.Worker(cms_width, cms_depth, min_length, max_length, top_k, false);
     // Import CMS type
     const CMS = CMS_F(cms_width, cms_depth);
 
@@ -82,9 +83,6 @@ pub fn Coordinator(
         /// Max documents to process for faster testing (set to 0 for unlimited)
         max_documents: usize = 0, // Process all available documents (no limit)
 
-        /// Top-K strings to track per length
-        top_k: usize,
-
         /// Running flag
         running: bool = false,
 
@@ -118,7 +116,6 @@ pub fn Coordinator(
             allocator: Allocator,
             num_workers: usize,
             data_loader: *fineweb,
-            top_k: usize,
             debug: bool,
         ) !*Self {
             const start_time = time.nanoTimestamp();
@@ -165,7 +162,6 @@ pub fn Coordinator(
                 .output_queues = output_queues,
                 .data_loader = data_loader,
                 .n_outstanding_jobs = n_outstanding_jobs,
-                .top_k = top_k,
                 .debug = debug,
                 .queue_depth = queue_depth,
                 .pending_documents = pending_documents,
@@ -271,7 +267,7 @@ pub fn Coordinator(
                 self.output_queues[i] = try message_queue.WorkerMessageQueue.init(self.allocator);
 
                 // Create worker with references to the queues
-                self.workers[i] = try Worker.init(self.allocator, i, &self.input_queues[i], &self.output_queues[i], self.top_k);
+                self.workers[i] = try Worker.init(self.allocator, i, &self.input_queues[i], &self.output_queues[i]);
 
                 // Start worker
                 try self.workers[i].start();

@@ -33,7 +33,7 @@ pub fn CountMinSketch(
         hashes: [4 * 1024 * 1024][num_hashes]u64, // Pre-allocated hash buffer
         hash_idx: usize = 0, // Index into the hash buffer
 
-        const num_hashes = (depth * @ctz(width) + 63) / 64;
+        pub const num_hashes = (depth * @ctz(width) + 63) / 64;
         const width_mask: usize = width - 1; // Mask for efficient modulo (width - 1)
         const Self = @This();
         const FakeXxHash = @import("xxhash.zig").XxHash3(MY_LEN, MY_LEN, num_hashes);
@@ -124,12 +124,16 @@ pub fn CountMinSketch(
             if (len < MY_LEN) {
                 return;
             }
-            const num_hashes_i_will_add = N_LENGTHS * num_hashes;
+            const num_hashes_i_will_add = 1;
             if (self.hash_idx + num_hashes_i_will_add >= self.hashes.len) {
                 self.flush();
             }
             FakeXxHash.hash(&self.hashes[self.hash_idx], self.hash_seeds, @as(*const [256]u8, @ptrCast(string)));
             self.hash_idx += 1;
+        }
+
+        pub inline fn getHashes(self: *Self, dst: [*]u64, string: [*]const u8) void {
+            FakeXxHash.hash(dst, self.hash_seeds, @ptrCast(string));
         }
 
         /// Flush all remaining strings
@@ -154,7 +158,7 @@ pub fn CountMinSketch(
             self.hash_idx = 0;
         }
 
-        inline fn queryOne(self: *Self, hashes: [num_hashes]u64) u64 {
+        pub inline fn queryOne(self: *Self, hashes: [num_hashes]u64) u64 {
             var min_value: u64 = std.math.maxInt(u64);
             var big_hashes: [depth]u64 = undefined;
             inline for (0..depth) |i| {

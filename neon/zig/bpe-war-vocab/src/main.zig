@@ -5,14 +5,15 @@ const time = std.time;
 
 const parallel = @import("parallel.zig");
 const fineweb = @import("data_loader.zig");
+const MY_LEN = @import("count_min_sketch.zig").MY_LEN;
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
     var timer = try std.time.Timer.start();
 
     // Configure parameters
-    const min_length = 2;
-    const max_length = 256;
+    const min_length = MY_LEN;
+    const max_length = MY_LEN;
     const top_k = 10000; // Track top 10000 strings per length
     const cms_width = 1 << 24; // ~16 million counters per hash function
     const cms_depth = 10;
@@ -151,10 +152,10 @@ pub fn main() !void {
     }
 
     // Create the parallel analyzer
-    const ParallelAnalyzer = parallel.ParallelAnalyzer(cms_width, cms_depth, min_length, max_length);
+    const ParallelAnalyzer = parallel.ParallelAnalyzer(cms_width, cms_depth, min_length, max_length, top_k);
 
     // Create analyzer with specific files
-    var analyzer = try ParallelAnalyzer.init(allocator, num_threads, &input_files, vocab_file, saved_data_path, top_k, debug);
+    var analyzer = try ParallelAnalyzer.init(allocator, num_threads, &input_files, vocab_file, saved_data_path, debug);
     defer analyzer.deinit();
 
     // Check if saved data exists

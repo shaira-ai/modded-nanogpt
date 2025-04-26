@@ -17,10 +17,11 @@ pub fn ParallelAnalyzer(
     comptime cms_depth: usize,
     comptime min_length: usize,
     comptime max_length: usize,
+    comptime top_k: usize,
 ) type {
     // Define types
-    const SFMType = SFM(cms_width, cms_depth, min_length, max_length);
-    const Coordinator = coordinator_mod.Coordinator(cms_width, cms_depth, min_length, max_length);
+    const SFMType = SFM(cms_width, cms_depth, min_length, max_length, top_k);
+    const Coordinator = coordinator_mod.Coordinator(cms_width, cms_depth, min_length, max_length, top_k);
 
     return struct {
         const Self = @This();
@@ -29,7 +30,6 @@ pub fn ParallelAnalyzer(
         coordinator: *Coordinator,
         manager: ?*SFMType,
         data_loader: *fineweb,
-        top_k: usize,
         debug: bool,
         num_threads: usize,
         saved_data_path: []const u8,
@@ -40,7 +40,6 @@ pub fn ParallelAnalyzer(
             data_files: []const []const u8,
             vocab_file: []const u8,
             saved_data_path: []const u8,
-            top_k: usize,
             debug: bool,
         ) !*Self {
             const start_time = time.nanoTimestamp();
@@ -61,7 +60,7 @@ pub fn ParallelAnalyzer(
             try loader.loadVocabulary(vocab_file);
 
             // Initialize coordinator
-            var coordinator = try Coordinator.init(allocator, num_threads, loader, top_k, debug);
+            var coordinator = try Coordinator.init(allocator, num_threads, loader, debug);
             errdefer coordinator.deinit();
 
             // Save the path
@@ -74,7 +73,6 @@ pub fn ParallelAnalyzer(
                 .coordinator = coordinator,
                 .manager = null,
                 .data_loader = loader,
-                .top_k = top_k,
                 .debug = debug,
                 .num_threads = num_threads,
                 .saved_data_path = saved_path,
@@ -173,7 +171,7 @@ pub fn ParallelAnalyzer(
             // Get access to the global CMS from coordinator
             if (self.coordinator.global_cms) |global_cms| {
                 // Create a new SFM manager for the second pass
-                var new_manager = try SFMType.init(self.allocator, self.top_k);
+                var new_manager = try SFMType.init(self.allocator);
 
                 // Copy the global CMS data to the new manager
                 if (MY_LEN > 3) {
@@ -226,7 +224,7 @@ pub fn ParallelAnalyzer(
             // Get access to the global CMS from coordinator
             if (self.coordinator.global_cms) |global_cms| {
                 // Create a temporary SFM to save the data
-                var temp_sfm = try SFMType.init(self.allocator, self.top_k);
+                var temp_sfm = try SFMType.init(self.allocator);
                 defer temp_sfm.deinit();
 
                 // Copy the global CMS data to the SFM
@@ -273,7 +271,6 @@ pub fn ParallelAnalyzer(
 
             // Load the data from disk
             const manager = try SFMType.loadFirstPassFromDisk(self.allocator, self.saved_data_path);
-            manager.top_k = self.top_k;
             self.manager = manager;
 
             if (self.debug) {
@@ -719,7 +716,7 @@ pub fn ParallelAnalyzer(
 
                 // Create a temporary SFM to show some kind of results
                 if (self.coordinator.global_cms) |global_cms| {
-                    var temp_sfm = try SFMType.init(self.allocator, self.top_k);
+                    var temp_sfm = try SFMType.init(self.allocator);
                     defer temp_sfm.deinit();
 
                     try temp_sfm.cms.merge(global_cms);

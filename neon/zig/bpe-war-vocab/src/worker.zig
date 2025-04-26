@@ -15,11 +15,12 @@ pub fn Worker(
     comptime cms_depth: usize,
     comptime min_length: usize,
     comptime max_length: usize,
+    comptime top_k: usize,
     comptime debug: bool,
 ) type {
     // Get the CMS type
     const CMS = CMS_F(cms_width, cms_depth);
-    const SFMType = SFM(cms_width, cms_depth, min_length, max_length);
+    const SFMType = SFM(cms_width, cms_depth, min_length, max_length, top_k);
 
     return struct {
         const Self = @This();
@@ -51,7 +52,6 @@ pub fn Worker(
             id: usize,
             input_queue: *message_queue.CoordinatorMessageQueue, // Keep as pointer
             output_queue: *message_queue.WorkerMessageQueue, // Keep as pointer
-            top_k: usize,
         ) !*Self {
             const start_time = time.nanoTimestamp();
 
@@ -60,7 +60,7 @@ pub fn Worker(
             errdefer allocator.destroy(self);
 
             // Create the SFM (which will create its own CMS)
-            const sfm = try SFMType.init(allocator, top_k);
+            const sfm = try SFMType.init(allocator);
             errdefer sfm.deinit();
 
             // Initialize the worker with pointers to the queues

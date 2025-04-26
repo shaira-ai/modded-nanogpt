@@ -3,15 +3,17 @@ const time = std.time;
 const CMS_F = @import("count_min_sketch.zig").CountMinSketch;
 const N_LENGTHS = @import("count_min_sketch.zig").N_LENGTHS;
 const MY_LEN = @import("count_min_sketch.zig").MY_LEN;
+const HashTable = @import("hash_table.zig").HashTable;
 const fs = std.fs;
 const native_endian = @import("builtin").target.cpu.arch.endian();
 
 pub const CandidateString = struct {
     string: []u8,
+    hash: u64,
     cached_bytes: u64,
     guess_count: usize,
 
-    pub fn init(string: []u8, guess_count: usize) CandidateString {
+    pub fn init(string: []u8, hash: u64, guess_count: usize) CandidateString {
         var cached_bytes: u64 = 0;
         const copy_len = @min(MY_LEN, @sizeOf(u64));
         @memcpy(@as([*]u8, @ptrCast(&cached_bytes)), string[0..copy_len]);
@@ -21,6 +23,7 @@ pub const CandidateString = struct {
 
         return CandidateString{
             .string = string,
+            .hash = hash,
             .cached_bytes = cached_bytes,
             .guess_count = guess_count,
         };
@@ -56,28 +59,33 @@ const SerializationHeader = extern struct {
     top_k: u32,
 };
 
+fn get_RHT_POW(top_k: usize) u6 {
+    return std.math.log2(top_k) + 2; 
+}
+
 pub fn StringFrequencyManager(
     comptime cms_width: usize,
     comptime cms_depth: usize,
     comptime min_length: usize,
     comptime max_length: usize,
+    comptime top_k: usize,
 ) type {
     const CMS = CMS_F(cms_width, cms_depth);
+    const num_hashes = CMS.num_hashes;
     return struct {
         allocator: std.mem.Allocator,
         cms: *CMS,
-        top_k: usize,
         length2_counters: []usize,
         length3_counters: []usize,
         cms_is_owned: bool = true,
         // Min heap for tracking top-K strings of my length
         heap: std.PriorityQueue(CandidateString, void, CandidateString.lessThan),
         // Map to track actual counts of candidate strings
-        actual_counts: std.StringHashMap(usize),
+        actual_counts: HashTable(get_RHT_POW(top_k)),
 
         const Self = @This();
 
-        pub fn init(allocator: std.mem.Allocator, top_k: usize) !*Self {
+        pub fn init(allocator: std.mem.Allocator) !*Self {
             const start_time = time.nanoTimestamp();
 
             const self = try allocator.create(Self);
@@ -104,11 +112,10 @@ pub fn StringFrequencyManager(
             self.* = .{
                 .allocator = allocator,
                 .cms = cms,
-                .top_k = top_k,
                 .length2_counters = len2_counters,
                 .length3_counters = len3_counters,
                 .heap = std.PriorityQueue(CandidateString, void, CandidateString.lessThan).init(allocator, {}),
-                .actual_counts = std.StringHashMap(usize).init(allocator),
+                .actual_counts = try HashTable(get_RHT_POW(top_k)).init(allocator),
             };
 
             const elapsed = time.nanoTimestamp() - start_time;
@@ -178,37 +185,36 @@ pub fn StringFrequencyManager(
         fn processString(self: *Self, substring: []const u8) !void {
             var heap = &self.heap;
             var counts = &self.actual_counts;
+            var scratch: [num_hashes]u64 = undefined;
+            self.cms.getHashes(&scratch, @ptrCast(substring.ptr));
 
             // Check if we're already tracking this string
-            const maybe_value_ptr = counts.getPtr(substring);
+            const maybe_value_ptr = counts.getPtr(substring, scratch[0]);
             if (maybe_value_ptr) |value_ptr| {
                 //std.debug.print("Already tracking '{s}'\n", .{substring});
                 // Already tracking, just increment the actual count
                 value_ptr.* += 1;
                 return;
             }
-            var scratch: [N_LENGTHS]u64 = undefined;
-            self.cms.query(&scratch, @ptrCast(substring.ptr));
-            const guess_count = scratch[0];
-            if (heap.count() < self.top_k) {
+            const guess_count = self.cms.queryOne(scratch);
+            if (heap.count() < top_k) {
                 //std.debug.print("Adding '{s}' to heap\n", .{substring});
                 // Haven't reached capacity yet, add the string
                 const str_copy = try self.allocator.dupe(u8, substring);
                 errdefer self.allocator.free(str_copy);
 
-                try heap.add(CandidateString.init(str_copy, guess_count));
-                try counts.put(str_copy, 1);
+                try heap.add(CandidateString.init(str_copy, scratch[0], guess_count));
+                counts.insertKnownNotPresent(str_copy, scratch[0], 1);
             } else if (heap.peek().?.guess_count < guess_count) {
                 // Current string has higher estimated count than our minimum
                 const evicted = heap.remove();
-                _ = counts.remove(evicted.string);
-
+                counts.deleteKnownPresent(evicted.string, evicted.hash);
                 // Add the new string
                 const str_copy = evicted.string;
                 @memcpy(str_copy, substring);
 
-                try heap.add(CandidateString.init(str_copy, guess_count));
-                try counts.put(str_copy, 1);
+                try heap.add(CandidateString.init(str_copy, scratch[0], guess_count));
+                counts.insertKnownNotPresent(str_copy, scratch[0], 1);
             }
         }
 
@@ -260,7 +266,7 @@ pub fn StringFrequencyManager(
                 .cms_depth = @as(u32, @intCast(cms_depth)),
                 .min_length = @as(u32, @intCast(min_length)),
                 .max_length = @as(u32, @intCast(max_length)),
-                .top_k = @as(u32, @intCast(self.top_k)),
+                .top_k = @as(u32, @intCast(top_k)),
             };
 
             try writer.writeAll(std.mem.asBytes(&header));
@@ -298,7 +304,7 @@ pub fn StringFrequencyManager(
                 return error.UnsupportedVersion;
             }
 
-            const self = try init(allocator, header.top_k);
+            const self = try init(allocator);
             errdefer self.deinit();
 
             for (0..cms_depth) |i| {
@@ -364,7 +370,8 @@ pub fn StringFrequencyManager(
                         i -= 1;
                         const item = results.items[i];
 
-                        if (counts.get(item.string)) |actual| {
+                        if (counts.getPtr(item.string, item.hash)) |actual_ptr| {
+                            const actual = actual_ptr.*;
                             const abs_error = if (item.guess_count > actual)
                                 item.guess_count - actual
                             else
