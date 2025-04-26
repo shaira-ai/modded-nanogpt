@@ -166,18 +166,9 @@ pub fn ParallelAnalyzer(
                 std.debug.print("[ParallelAnalyzer] Preparing data for second pass in memory\n", .{});
             }
 
-            const start_time = time.nanoTimestamp();
-
-            // Get access to the global CMS from coordinator
-            if (self.coordinator.global_cms) |global_cms| {
-                // Create a new SFM manager for the second pass
+            if (MY_LEN < 4) {
+                const start_time = time.nanoTimestamp();
                 var new_manager = try SFMType.init(self.allocator);
-
-                // Copy the global CMS data to the new manager
-                if (MY_LEN > 3) {
-                    try new_manager.cms.merge(global_cms);
-                }
-
                 // Sum counters from all workers
                 for (self.coordinator.workers) |worker| {
                     // Add each worker's length2 counters
@@ -198,20 +189,14 @@ pub fn ParallelAnalyzer(
                         std.debug.print("[ParallelAnalyzer] Merged counters from worker {d}\n", .{worker.id});
                     }
                 }
-
-                // Set the manager for use in second pass
                 if (self.manager) |old_manager| {
                     old_manager.deinit();
                 }
                 self.manager = new_manager;
-
                 const elapsed = time.nanoTimestamp() - start_time;
                 if (self.debug) {
                     std.debug.print("[ParallelAnalyzer] Data prepared for second pass in {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
                 }
-            } else {
-                std.debug.print("[ParallelAnalyzer] ERROR: No global CMS available\n", .{});
-                return error.NoGlobalCMS;
             }
         }
 
@@ -286,11 +271,6 @@ pub fn ParallelAnalyzer(
                 std.debug.print("[ParallelAnalyzer] Starting second pass with {d} threads\n", .{self.num_threads});
             }
 
-            if (self.manager == null) {
-                std.debug.print("[ParallelAnalyzer] ERROR: No manager available for second pass. Did you call loadFirstPassData()?\n", .{});
-                return error.NoManagerForSecondPass;
-            }
-
             // OPTIMIZATION: Reuse the existing data loader instead of creating a new one
             const data_loader_start = time.nanoTimestamp();
 
@@ -309,16 +289,6 @@ pub fn ParallelAnalyzer(
                 std.debug.print("[ParallelAnalyzer] Setting up workers to share global CMS\n", .{});
             }
 
-            // For each worker, replace their CMS with a reference to the global one
-            for (self.coordinator.workers, 0..) |worker, i| {
-                worker.sfm.cms.deinit();
-                worker.sfm.cms = self.manager.?.cms;
-                worker.sfm.cms_is_owned = false;
-
-                if (self.debug) {
-                    std.debug.print("[ParallelAnalyzer] Worker {d} now using shared global CMS\n", .{i});
-                }
-            }
             try self.coordinator.runSecondPass();
 
             const total_time = time.nanoTimestamp() - overall_start_time;
@@ -710,20 +680,7 @@ pub fn ParallelAnalyzer(
             if (self.manager) |manager| {
                 try manager.getResults();
             } else {
-                if (self.debug) {
-                    std.debug.print("[ParallelAnalyzer] No manager, no results available\n", .{});
-                }
-
-                // Create a temporary SFM to show some kind of results
-                if (self.coordinator.global_cms) |global_cms| {
-                    var temp_sfm = try SFMType.init(self.allocator);
-                    defer temp_sfm.deinit();
-
-                    try temp_sfm.cms.merge(global_cms);
-                    try temp_sfm.getResults();
-                } else {
-                    std.debug.print("[ParallelAnalyzer] No results available\n", .{});
-                }
+                try self.coordinator.workers[0].sfm.getResults();
             }
             if (self.debug) {
                 std.debug.print("[ParallelAnalyzer] Results displayed\n", .{});

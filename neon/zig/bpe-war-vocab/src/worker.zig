@@ -206,29 +206,57 @@ pub fn Worker(
                     const response = message.createDocumentProcessedMessage(self.id, process_data.document_id, document, pass);
                     _ = self.output_queue.push(response);
                 },
-                .FindTopK => {
-                    // TODO: Implement finding top K strings
-                    // For now, just send a response
-                    const response = message.createTopKCompleteMessage(self.id);
-                    _ = self.output_queue.push(response);
-                },
-                .RequestCMS => {
-                    // New message type that replaces MergeCMS
-                    // Instead of modifying the global CMS, we just provide our local CMS
-                    if (debug) {
-                        std.debug.print("[Worker {d}] Received request for CMS data\n", .{self.id});
-                        std.debug.print("[Worker {d}] [DEBUG] Preparing to send CMS at address {*}\n", .{ self.id, self.sfm.cms });
-                    }
+                // .FindTopK => {
+                //     // TODO: Implement finding top K strings
+                //     // For now, just send a response
+                //     const response = message.createTopKCompleteMessage(self.id);
+                //     _ = self.output_queue.push(response);
+                // },
+                .MergeCMS => |cms_data| {
+                    const other_cms = @as(*CMS, @ptrCast(@alignCast(cms_data.cms)));
+                    try self.sfm.cms.merge(other_cms);
 
                     // Create a response that includes a pointer to our local CMS
-                    const response = message.createProvideCMSMessage(self.id, @as(*anyopaque, @ptrCast(self.sfm.cms)));
+                    const response = message.createMergedCMSMessage(self.id);
                     const push_result = self.output_queue.push(response);
 
                     if (debug) {
                         if (push_result) {
-                            std.debug.print("[Worker {d}] Sent CMS data to coordinator\n", .{self.id});
+                            std.debug.print("[Worker {d}] Sent completion after merging CMS data to coordinator\n", .{self.id});
                         } else {
                             std.debug.print("[Worker {d}] [ERROR] Failed to send CMS data to coordinator! Queue full?\n", .{self.id});
+                        }
+                    }
+                },
+                .CopyCMS => |cms_data| {
+                    const other_cms = @as(*CMS, @ptrCast(@alignCast(cms_data.cms)));
+                    try self.sfm.cms.copyFrom(other_cms);
+
+                    // Create a response that includes a pointer to our local CMS
+                    const response = message.createCopiedCMSMessage(self.id);
+                    const push_result = self.output_queue.push(response);
+
+                    if (debug) {
+                        if (push_result) {
+                            std.debug.print("[Worker {d}] Sent completion after copying CMS data to coordinator\n", .{self.id});
+                        } else {
+                            std.debug.print("[Worker {d}] [ERROR] Failed to send CMS data to coordinator! Queue full?\n", .{self.id});
+                        }
+                    }
+                },
+                .MergeCounts => |sfm_data| {
+                    const other_sfm = @as(*SFMType, @ptrCast(@alignCast(sfm_data.sfm)));
+                    try self.sfm.mergeCounts(other_sfm);
+
+                    // Create a response that includes a pointer to our local CMS
+                    const response = message.createMergedCountsMessage(self.id);
+                    const push_result = self.output_queue.push(response);
+
+                    if (debug) {
+                        if (push_result) {
+                            std.debug.print("[Worker {d}] Sent completion after merging Counts data to coordinator\n", .{self.id});
+                        } else {
+                            std.debug.print("[Worker {d}] [ERROR] Failed to send Counts data to coordinator! Queue full?\n", .{self.id});
                         }
                     }
                 },
@@ -278,7 +306,7 @@ pub fn Worker(
                     };
                 } else {
                     // No messages, sleep for a bit
-                    std.time.sleep(300 * std.time.ns_per_ms); // 300ms
+                    std.time.sleep(1 * std.time.ns_per_ms); // 300ms
                 }
             }
 

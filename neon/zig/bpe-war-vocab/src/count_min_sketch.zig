@@ -2,7 +2,7 @@ const std = @import("std");
 const time = std.time;
 
 pub const N_LENGTHS = 253;
-pub const MY_LEN = 10;
+pub const MY_LEN = 3;
 
 /// Count-Min Sketch implementation for efficiently approximating string frequencies
 /// Uses xxhash for fast hashing and implements conservative updating
@@ -217,6 +217,14 @@ pub fn CountMinSketch(
             for (0..depth) |i| {
                 for (0..width) |j| {
                     self.counters[i][j] += other.counters[i][j];
+                }
+            }
+        }
+
+        pub fn copyFrom(self: *Self, other: *Self) !void {
+            for (0..depth) |i| {
+                for (0..width) |j| {
+                    self.counters[i][j] = other.counters[i][j];
                 }
             }
         }

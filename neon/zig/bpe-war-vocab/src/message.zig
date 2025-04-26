@@ -5,10 +5,12 @@ const Allocator = std.mem.Allocator;
 pub const CoordinatorMessageType = enum {
     /// Process a document (first or second pass)
     ProcessDocument,
-    /// Find the top K strings based on current CMS data
-    FindTopK,
-    /// Request worker's CMS data (replaces MergeCMS)
-    RequestCMS,
+    /// Request worker to merge CMS data from another worker
+    MergeCMS,
+    /// Request worker to copy CMS data from another worker
+    CopyCMS,
+    /// Request worker to merge Counts data from another worker
+    MergeCounts,
     /// Dump the worker's state to a file
     DumpState,
     /// Shutdown the worker thread
@@ -19,10 +21,12 @@ pub const CoordinatorMessageType = enum {
 pub const WorkerMessageType = enum {
     /// Document has been processed
     DocumentProcessed,
-    /// Top K strings have been found
-    TopKComplete,
-    /// Worker is providing its CMS for merging (replaces CMSMergeComplete)
-    ProvideCMS,
+    /// Worker is done merging another CMS into its own
+    MergedCMS,
+    /// Worker is done copying another CMS into its own
+    CopiedCMS,
+    /// Worker is done merging Counts data into its own
+    MergedCounts,
     /// State has been dumped to a file
     StateDumped,
     /// Error occurred during processing
@@ -40,11 +44,17 @@ pub const CoordinatorMessage = union(CoordinatorMessageType) {
         document: []const u8,
         pass: u8,
     },
-    FindTopK: struct {
+    MergeCMS: struct {
         worker_id: usize,
+        cms: *anyopaque,
     },
-    RequestCMS: struct {
+    CopyCMS: struct {
         worker_id: usize,
+        cms: *anyopaque,
+    },
+    MergeCounts: struct {
+        worker_id: usize,
+        sfm: *anyopaque,
     },
     DumpState: struct {
         worker_id: usize,
@@ -63,12 +73,14 @@ pub const WorkerMessage = union(WorkerMessageType) {
         document: []const u8,
         pass: u8,
     },
-    TopKComplete: struct {
+    MergedCMS: struct {
         worker_id: usize, // Keep worker_id for consistency
     },
-    ProvideCMS: struct {
+    CopiedCMS: struct {
         worker_id: usize, // Keep worker_id for consistency
-        worker_cms: *anyopaque,
+    },
+    MergedCounts: struct {
+        worker_id: usize, // Keep worker_id for consistency
     },
     StateDumped: struct {
         worker_id: usize, // Keep worker_id for consistency
@@ -100,20 +112,32 @@ pub fn createProcessDocumentMessage(worker_id: usize, document_id: usize,documen
     };
 }
 
-/// Create a new CoordinatorMessage for finding top K strings
-pub fn createFindTopKMessage(worker_id: usize) CoordinatorMessage {
+/// Create a new CoordinatorMessage for merging CMS data
+pub fn createCMSMergeMessage(worker_id: usize, cms: *anyopaque) CoordinatorMessage {
     return CoordinatorMessage{
-        .FindTopK = .{
+        .MergeCMS = .{
             .worker_id = worker_id,
+            .cms = cms,
         },
     };
 }
 
-/// Create a new CoordinatorMessage for requesting CMS data
-pub fn createRequestCMSMessage(worker_id: usize) CoordinatorMessage {
+/// Create a new CoordinatorMessage for copying CMS data
+pub fn createCopyCMSMessage(worker_id: usize, cms: *anyopaque) CoordinatorMessage {
     return CoordinatorMessage{
-        .RequestCMS = .{
+        .CopyCMS = .{
             .worker_id = worker_id,
+            .cms = cms,
+        },
+    };
+}
+
+/// Create a new CoordinatorMessage for merging Counts data
+pub fn createMergeCountsMessage(worker_id: usize, sfm: *anyopaque) CoordinatorMessage {
+    return CoordinatorMessage{
+        .MergeCounts = .{
+            .worker_id = worker_id,
+            .sfm = sfm,
         },
     };
 }
@@ -149,21 +173,29 @@ pub fn createDocumentProcessedMessage(worker_id: usize, document_id: usize, docu
     };
 }
 
-/// Create a new WorkerMessage for top K complete
-pub fn createTopKCompleteMessage(worker_id: usize) WorkerMessage {
+/// Create a new WorkerMessage for merged CMS data
+pub fn createMergedCMSMessage(worker_id: usize) WorkerMessage {
     return WorkerMessage{
-        .TopKComplete = .{
+        .MergedCMS = .{
             .worker_id = worker_id,
         },
     };
 }
 
-/// Create a new WorkerMessage for providing CMS data
-pub fn createProvideCMSMessage(worker_id: usize, worker_cms: *anyopaque) WorkerMessage {
+/// Create a new WorkerMessage for copied CMS data
+pub fn createCopiedCMSMessage(worker_id: usize) WorkerMessage {
     return WorkerMessage{
-        .ProvideCMS = .{
+        .CopiedCMS = .{
             .worker_id = worker_id,
-            .worker_cms = worker_cms,
+        },
+    };
+}
+
+/// Create a new WorkerMessage for merged Counts data
+pub fn createMergedCountsMessage(worker_id: usize) WorkerMessage {
+    return WorkerMessage{
+        .MergedCounts = .{
+            .worker_id = worker_id,
         },
     };
 }

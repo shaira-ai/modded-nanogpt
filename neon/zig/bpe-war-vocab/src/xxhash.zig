@@ -27,15 +27,6 @@ pub fn XxHash3(
     comptime max_length: usize,
     comptime VEC_WIDTH: comptime_int
 ) type {
-    if (min_length < 4) {
-        @compileError("min_length must be >= 4");
-    }
-    if (max_length > 256) {
-        @compileError("max_length must be <= 256");
-    }
-    if (max_length < min_length) {
-        @compileError("max_length must be >= min_length");
-    }
     return struct {
         const V = @Vector(VEC_WIDTH, u64);
         const V32 = @Vector(VEC_WIDTH, u32);
@@ -197,6 +188,15 @@ pub fn XxHash3(
         // Public API - Oneshot
 
         pub noinline fn hash(noalias dst_: [*]u64, seed: [VEC_WIDTH]u64, noalias input: *const [256]u8) void {
+            if (min_length < 4) {
+                @compileError("min_length must be >= 4");
+            }
+            if (max_length > 256) {
+                @compileError("max_length must be <= 256");
+            }
+            if (max_length < min_length) {
+                @compileError("max_length must be >= min_length");
+            }
             if (min_length == max_length) {
                 return hashSingle(dst_, seed, input);
             }

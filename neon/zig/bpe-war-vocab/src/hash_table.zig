@@ -95,10 +95,12 @@ pub fn HashTable(comptime RHT_POW: u6) type {
         inline fn deleteKnownPresentInner(
             noalias xs: [*]Entry,
             key: []const u8,
-            hash: u64) void {
+            hash: u64) u64 {
             var bucknum = hash & RHT_MASK;
+            var ret: u64 = 0;
             while (true) {
                 if (xs[bucknum].hash == hash and std.mem.eql(u8, xs[bucknum].key, key)) {
+                    ret = xs[bucknum].value;
                     break;
                 }
                 bucknum +%= 1;
@@ -119,9 +121,10 @@ pub fn HashTable(comptime RHT_POW: u6) type {
                 .hash = 0,
                 .value = 0,
             };
+            return ret;
         }
 
-        pub inline fn deleteKnownPresent(self: *Self, key: []const u8, hash: u64) void {
+        pub inline fn deleteKnownPresent(self: *Self, key: []const u8, hash: u64) u64 {
             return deleteKnownPresentInner(self.xs, key, hash);
         }
     };

@@ -36,6 +36,8 @@ pub fn Coordinator(
             FirstPass,
             /// Merging CMS from workers
             MergingCMS,
+            /// Copying merged CMS to workers
+            CopyingCMS,
             /// Start second pass
             StartSecondPass,
             /// Finding top K strings using shared CMS
@@ -77,6 +79,9 @@ pub fn Coordinator(
         /// Number of documents processed in first pass
         first_pass_count: usize = 0,
 
+        /// stride for cms merge steps
+        cms_merge_stride: usize = 1,
+
         /// Number of documents processed in second pass
         second_pass_count: usize = 0,
 
@@ -107,9 +112,6 @@ pub fn Coordinator(
 
         /// Number of active workers
         active_workers: usize = 0,
-
-        /// Count of CMS merge completions received from workers
-        cms_merge_completions: usize = 0,
 
         /// Initialize a new coordinator
         pub fn init(
@@ -170,7 +172,6 @@ pub fn Coordinator(
                 .max_documents = 0, // Process all available documents (no limit)
                 .end_of_documents_reached = false,
                 .active_workers = 0,
-                .cms_merge_completions = 0,
             };
 
             if (debug) {
@@ -242,7 +243,6 @@ pub fn Coordinator(
 
             // Reset end-of-documents flag when starting a new pass
             self.end_of_documents_reached = false;
-            self.cms_merge_completions = 0;
 
             // Set running flag
             self.running = true;
@@ -337,64 +337,28 @@ pub fn Coordinator(
                         }
                     }
                 },
-                .TopKComplete => {
-                    // Worker has completed finding top-K strings
-                    if (self.debug) {
-                        std.debug.print("[Coordinator] Worker completed finding top-K strings\n", .{});
-                    }
-
-                    // Check if all workers are done
-                    var all_complete = true;
-                    var active_workers: usize = 0;
-
-                    // Detailed logging of worker status
-                    if (self.debug) {
-                        std.debug.print("[Coordinator] [DEBUG] Checking if all workers are done with TopK...\n", .{});
-                    }
-
-                    for (0..self.num_workers) |i| {
-                        // Check if this worker has pending messages
-                        const queue_count = self.n_outstanding_jobs[i];
-                        if (queue_count > 0) {
-                            all_complete = false;
-                            active_workers += 1;
-
-                            if (self.debug) {
-                                std.debug.print("[Coordinator] [DEBUG] Worker {d} still has {d} messages in queue\n", .{ i, queue_count });
-                            }
+                .MergedCounts => {
+                    // Worker has completed merging Counts data
+                    if (self.getTotalOutstandingJobs() == 0) {
+                        self.cms_merge_stride *= 2;
+                        if (!self.sendMergeCountsMessages()) {
+                            self.state = .Complete;
+                            self.running = false;
                         }
-                    }
-
-                    if (all_complete and self.state == .MergingResults) {
-                        // Force a state transition
-                        self.state = .Complete;
-
-                        if (self.debug) {
-                            std.debug.print("[Coordinator] All workers completed finding top-K strings\n", .{});
-                        }
-
-                        // Stop the coordinator
-                        self.running = false;
-                    } else if (self.debug) {
-                        std.debug.print("[Coordinator] [DEBUG] Not all workers complete or not in MergingResults state. State: {s}, active workers: {d}\n", .{ @tagName(self.state), active_workers });
                     }
                 },
-                .ProvideCMS => |cms_data| {
-                    // Worker has provided its CMS data for merging
-                    const worker_cms = @as(*CMS, @ptrCast(@alignCast(cms_data.worker_cms)));
-
-                    // Merge the worker's CMS into the global CMS
-                    try self.global_cms.?.merge(worker_cms);
-
-                    // Increment completion counter
-                    self.cms_merge_completions += 1;
-
-                    // If all workers have provided their CMS data, skip second pass and go to Complete
-                    if (self.cms_merge_completions == self.num_workers and self.state == .MergingCMS) {
-                        if (self.debug) {
-                            std.debug.print("[Coordinator] All workers provided CMS data, transitioning to Complete (skipping Second Pass)\n", .{});
+                .MergedCMS => |_| {
+                    if (self.getTotalOutstandingJobs() == 0) {
+                        self.cms_merge_stride *= 2;
+                        if (!self.sendMergeCMSMessages()) {
+                            self.state = .CopyingCMS;
+                            self.sendCopyCMSMessages();
                         }
-                        // Skip the second pass since ParallelAnalyzer will handle it
+                    }
+                },
+                .CopiedCMS => |_| {
+                    // If all workers have copied their CMS data, skip second pass and go to Complete
+                    if (self.getTotalOutstandingJobs() == 0) {
                         self.state = .Complete;
                         self.running = false;
                     }
@@ -485,9 +449,58 @@ pub fn Coordinator(
             return doc;
         }
 
-        fn transitionToMergingCMS(self: *Self) !void {
-            const start_time = time.nanoTimestamp();
+        fn sendCopyCMSMessages(self: *Self) void {
+            for (1..self.num_workers) |i| {
+                const msg = message.createCopyCMSMessage(i, self.workers[0].sfm.cms);
+                _ = self.sendMessageToWorker(i, msg, true); // Expect response
+            }
+        }
 
+        fn sendMergeCMSMessages(self: *Self) bool {
+            const mask = self.cms_merge_stride * 2 - 1;
+            const stride = self.cms_merge_stride;
+            var i: usize = 0;
+            var any_sent = false;
+            while (i < self.num_workers) : (i += 1) {
+                if (i & mask == 0 and i + stride < self.num_workers) {
+                    const msg = message.createCMSMergeMessage(i, self.workers[i+stride].sfm.cms);
+                    _ = self.sendMessageToWorker(i, msg, true); // Expect response
+                    any_sent = true;
+                    if (self.debug) {
+                        std.debug.print("[Coordinator] Sent CMS merge message to worker {d}, {d}\n", .{ i, i+stride });
+                    }
+                }
+            }
+            return any_sent;
+        }
+
+        fn sendMergeCountsMessages(self: *Self) bool {
+            const mask = self.cms_merge_stride * 2 - 1;
+            const stride = self.cms_merge_stride;
+            var i: usize = 0;
+            var any_sent = false;
+            while (i < self.num_workers) : (i += 1) {
+                if (i & mask == 0 and i + stride < self.num_workers) {
+                    const msg = message.createMergeCountsMessage(i, self.workers[i+stride].sfm);
+                    _ = self.sendMessageToWorker(i, msg, true); // Expect response
+                    any_sent = true;
+                    if (self.debug) {
+                        std.debug.print("[Coordinator] Sent Counts merge message to worker {d}, {d}\n", .{ i, i+stride });
+                    }
+                }
+            }
+            return any_sent;
+        }
+
+        fn getTotalOutstandingJobs(self: *Self) usize {
+            var total: usize = 0;
+            for (self.n_outstanding_jobs) |n| {
+                total += n;
+            }
+            return total;
+        }
+
+        fn transitionToMergingCMS(self: *Self) !void {
             if (self.debug) {
                 std.debug.print("[Coordinator] [DEBUG] Starting transition to MergingCMS state\n", .{});
             }
@@ -496,47 +509,12 @@ pub fn Coordinator(
             self.state = .MergingCMS;
 
             if (self.debug) {
-                std.debug.print("[Coordinator] First pass complete ({d} documents), requesting CMS data from workers\n", .{self.first_pass_count});
+                std.debug.print("[Coordinator] First pass complete ({d} documents), starting CMS merges\n", .{self.first_pass_count});
                 const n_pending = self.pending_documents_free_list.len - self.n_free_pending_documents;
                 std.debug.print("[Coordinator] [DEBUG] Pending documents: {d}, State: {s}\n", .{ n_pending, @tagName(self.state) });
             }
 
-            // Create the global CMS
-            if (self.debug) {
-                std.debug.print("[Coordinator] [DEBUG] Creating global CMS...\n", .{});
-            }
-
-            if (self.global_cms != null) {
-                std.debug.print("[Coordinator] [WARNING] global_cms already exists during transition to MergingCMS\n", .{});
-                self.global_cms.?.deinit();
-            }
-
-            self.global_cms = try CMS.init(self.allocator);
-            if (self.debug) {
-                std.debug.print("[Coordinator] [DEBUG] Global CMS created successfully\n", .{});
-            }
-
-            // Send request CMS messages to all workers
-            if (self.debug) {
-                std.debug.print("[Coordinator] [DEBUG] Sending RequestCMS messages to all {d} workers...\n", .{self.num_workers});
-            }
-
-            var sent_count: usize = 0;
-            for (0..self.num_workers) |i| {
-                const msg = message.createRequestCMSMessage(i);
-                const result = self.sendMessageToWorker(i, msg, true); // Expect response
-                sent_count += @intFromBool(result);
-            }
-
-            // Reset the CMS merge completions counter
-            self.cms_merge_completions = 0;
-
-            if (self.debug) {
-                std.debug.print("[Coordinator] [DEBUG] Sent CMS requests to {d}/{d} workers\n", .{ sent_count, self.num_workers });
-
-                const elapsed = time.nanoTimestamp() - start_time;
-                std.debug.print("[Coordinator] [DEBUG] Transition to MergingCMS completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
-            }
+            _ = self.sendMergeCMSMessages();
         }
 
         /// Transition to the next state if needed
@@ -561,7 +539,12 @@ pub fn Coordinator(
                     // workers to provide their CMS data which is handled via the
                     // ProvideCMS message handler
                     if (self.debug) {
-                        std.debug.print("[Coordinator] CMS merging in progress ({d}/{d} workers completed)\n", .{ self.cms_merge_completions, self.num_workers });
+                        std.debug.print("[Coordinator] CMS merging in progress\n", .{});
+                    }
+                },
+                .CopyingCMS => {
+                    if (self.debug) {
+                        std.debug.print("[Coordinator] Copying CMS in progress\n", .{});
                     }
                 },
                 .StartSecondPass => {
@@ -580,11 +563,8 @@ pub fn Coordinator(
                         std.debug.print("[Coordinator] Second pass complete ({d} documents), merging results\n", .{self.second_pass_count});
                     }
 
-                    // Send find top-K messages to all workers
-                    for (0..self.num_workers) |i| {
-                        const msg = message.createFindTopKMessage(i);
-                        _ = self.sendMessageToWorker(i, msg, true); // Expect response
-                    }
+                    self.cms_merge_stride = 1;
+                    _ = self.sendMergeCountsMessages();
                 },
                 .MergingResults => {
                     // All results merged, transition to complete
@@ -630,8 +610,6 @@ pub fn Coordinator(
             if (self.state != .Complete and self.state != .Error) {
                 self.state = .Complete;
             }
-
-            self.shutdownWorkers();
         }
 
         /// Send a message to a worker and track it if a response is expected
@@ -674,7 +652,6 @@ pub fn Coordinator(
                 self.first_pass_count = 0;
                 self.second_pass_count = 0;
                 self.end_of_documents_reached = false;
-                self.cms_merge_completions = 0;
             }
 
             // Transition to first pass if we're idle, otherwise continue where we left off
@@ -725,14 +702,14 @@ pub fn Coordinator(
             var last_progress_count: usize = 0;
 
             while (self.running) {
-                var any_messages_processed = false;
+                var did_anything = false;
 
                 // Loop through each worker's output queue
                 for (0..self.num_workers) |i| {
                     // Process all available messages from this worker
                     if (self.output_queues[i].pop()) |msg| {
                         self.n_outstanding_jobs[i] -= 1;
-                        any_messages_processed = true;
+                        did_anything = true;
 
                         // Handle the message (documents processed, errors, etc.)
                         try self.handleWorkerMessage(msg);
@@ -740,6 +717,7 @@ pub fn Coordinator(
                     if ((self.state == .FirstPass or self.state == .SecondPass) and !self.end_of_documents_reached and self.n_outstanding_jobs[i] < self.queue_depth) {
                         const doc = try self.getNextDocument();
                         if (doc) |document| {
+                            did_anything = true;
                             // Add to pending documents
                             const doc_id = self.addToPendingDocuments(document);
 
@@ -803,7 +781,7 @@ pub fn Coordinator(
                 // const since_last_progress = std.time.nanoTimestamp() - last_progress_time;
                 // const since_last_progress_ms = @as(u64, @intCast(@divFloor(since_last_progress, std.time.ns_per_ms)));
 
-                // if (!any_messages_processed and since_last_progress_ms > 30 * 1000) {
+                // if (!did_anything and since_last_progress_ms > 30 * 1000) {
                 //     std.debug.print("[Coordinator] No progress for {d} seconds in state {s}, forcing state transition\n", .{ since_last_progress_ms / 1000, @tagName(self.state) });
                 //     try self.transitionStateIfNeeded();
                 //     last_progress_time = std.time.nanoTimestamp();
@@ -818,7 +796,7 @@ pub fn Coordinator(
                 }
 
                 // If we didn't process any messages, sleep a bit to avoid spinning
-                if (!any_messages_processed) {
+                if (!did_anything) {
                     std.time.sleep(1);
                 }
             }

@@ -170,9 +170,11 @@ pub fn StringFrequencyManager(
                     self.length3_counters[index] += 1;
                 }
 
-                const max_len = @min(max_length, document.len - i);
-                if (max_len >= MY_LEN) {
-                    self.cms.addPrefixes(@ptrCast(&document[i]), max_len);
+                if (MY_LEN >= 4) {
+                    const max_len = @min(max_length, document.len - i);
+                    if (max_len >= MY_LEN) {
+                        self.cms.addPrefixes(@ptrCast(&document[i]), max_len);
+                    }
                 }
             }
 
@@ -183,6 +185,9 @@ pub fn StringFrequencyManager(
         }
 
         fn processString(self: *Self, substring: []const u8) !void {
+            if (MY_LEN < 4) {
+                return;
+            }
             var heap = &self.heap;
             var counts = &self.actual_counts;
             var scratch: [num_hashes]u64 = undefined;
@@ -197,23 +202,26 @@ pub fn StringFrequencyManager(
                 return;
             }
             const guess_count = self.cms.queryOne(scratch);
+            var new_item = CandidateString.init(@constCast(substring), scratch[0], guess_count);
             if (heap.count() < top_k) {
                 //std.debug.print("Adding '{s}' to heap\n", .{substring});
                 // Haven't reached capacity yet, add the string
                 const str_copy = try self.allocator.dupe(u8, substring);
                 errdefer self.allocator.free(str_copy);
+                new_item.string = str_copy;
 
-                try heap.add(CandidateString.init(str_copy, scratch[0], guess_count));
+                try heap.add(new_item);
                 counts.insertKnownNotPresent(str_copy, scratch[0], 1);
-            } else if (heap.peek().?.guess_count < guess_count) {
+            } else if (CandidateString.lessThan(undefined, heap.peek().?, new_item) == .lt) {
                 // Current string has higher estimated count than our minimum
                 const evicted = heap.remove();
-                counts.deleteKnownPresent(evicted.string, evicted.hash);
+                _ = counts.deleteKnownPresent(evicted.string, evicted.hash);
                 // Add the new string
                 const str_copy = evicted.string;
                 @memcpy(str_copy, substring);
+                new_item.string = str_copy;
 
-                try heap.add(CandidateString.init(str_copy, scratch[0], guess_count));
+                try heap.add(new_item);
                 counts.insertKnownNotPresent(str_copy, scratch[0], 1);
             }
         }
@@ -247,6 +255,32 @@ pub fn StringFrequencyManager(
 
             //const elapsed = time.nanoTimestamp() - start_time;
             //std.debug.print("[TIMING] processDocumentSecondPass ({d} bytes): {d:.2}ms\n", .{ document.len, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
+        }
+
+        pub fn mergeCounts(self: *Self, other: *Self) !void {
+            while (other.heap.count() > 0) {
+                var item = other.heap.remove();
+                const others_string = item.string;
+                const other_count = other.actual_counts.deleteKnownPresent(item.string, item.hash);
+                const maybe_value_ptr = self.actual_counts.getPtr(item.string, item.hash);
+                if (maybe_value_ptr) |value_ptr| {
+                    value_ptr.* += other_count;
+                } else if (self.heap.count() < top_k) {
+                    const str_copy = try self.allocator.dupe(u8, item.string);
+                    item.string = str_copy;
+                    try self.heap.add(item);
+                    self.actual_counts.insertKnownNotPresent(str_copy, item.hash, other_count);
+                } else if (CandidateString.lessThan(undefined, self.heap.peek().?, item) == .lt) {
+                    const evicted = self.heap.remove();
+                    _ = self.actual_counts.deleteKnownPresent(evicted.string, evicted.hash);
+                    const str_copy = evicted.string;
+                    @memcpy(str_copy, item.string);
+                    item.string = str_copy;
+                    try self.heap.add(item);
+                    self.actual_counts.insertKnownNotPresent(str_copy, item.hash, other_count);
+                }
+                other.allocator.free(others_string);
+            }
         }
 
         // Save the first pass results to a file
