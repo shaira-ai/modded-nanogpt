@@ -306,65 +306,23 @@ pub fn ParallelAnalyzer(
                 std.debug.print("[ParallelAnalyzer] Data loader rewound in {d:.2}ms\n", .{@as(f64, @floatFromInt(data_loader_time)) / time.ns_per_ms});
             }
 
-            try self.coordinator.runSecondPass();
-            if (true) {
-                return;
-            }
-
-            // Create a specialized second pass coordinator
-            const SecondPassParams = struct {
-                mainManager: *SFMType,
-                allocator: Allocator,
-                numThreads: usize,
-                dataLoader: *fineweb,
-                debug: bool,
-                maxDocuments: usize,
-                topK: usize,
-                completionFlag: *bool,
-            };
-
-            var completion_flag = false;
-            const params = SecondPassParams{
-                .mainManager = self.manager.?,
-                .allocator = self.allocator,
-                .numThreads = self.num_threads,
-                .dataLoader = self.data_loader, // Use existing rewound data loader
-                .debug = self.debug,
-                .maxDocuments = 0, // No limit
-                .topK = self.top_k,
-                .completionFlag = &completion_flag,
-            };
-
-            // Create and start the second pass coordinator thread
-            const coord_start = time.nanoTimestamp();
-            const second_pass_thread = try std.Thread.spawn(.{}, runSecondPassCoordinator, .{params});
+            // Share the global CMS with all workers
 
             if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] Second pass coordinator started\n", .{});
+                std.debug.print("[ParallelAnalyzer] Setting up workers to share global CMS\n", .{});
             }
 
-            // Wait for completion with progress updates
-            var last_update_time = coord_start;
-            while (!completion_flag) {
-                std.time.sleep(500 * std.time.ns_per_ms); // Sleep 500ms
+            // For each worker, replace their CMS with a reference to the global one
+            for (self.coordinator.workers, 0..) |worker, i| {
+                worker.sfm.cms.deinit();
+                worker.sfm.cms = self.manager.?.cms;
+                worker.sfm.cms_is_owned = false;
 
-                // Show periodic progress updates
-                const current_time = time.nanoTimestamp();
-                const elapsed_since_update = current_time - last_update_time;
-                if (elapsed_since_update > 5 * std.time.ns_per_s) { // Update every 5 seconds
-                    const elapsed_sec = @as(f64, @floatFromInt(current_time - coord_start)) / std.time.ns_per_s;
-                    std.debug.print("[ParallelAnalyzer] Second pass in progress - {d:.1} seconds elapsed\n", .{elapsed_sec});
-
-                    // Show data loader file status
-                    const status = self.data_loader.getFileStatus();
-                    if (!status.reached_end) {
-                        std.debug.print("[ParallelAnalyzer] Processing file {d} of {d}: {s}\n", .{ status.current_file_index + 1, status.total_files, status.current_file_path });
-                    }
-
-                    last_update_time = current_time;
+                if (self.debug) {
+                    std.debug.print("[ParallelAnalyzer] Worker {d} now using shared global CMS\n", .{i});
                 }
             }
-            second_pass_thread.join();
+            try self.coordinator.runSecondPass();
 
             const total_time = time.nanoTimestamp() - overall_start_time;
             if (self.debug) {

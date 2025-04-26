@@ -637,7 +637,17 @@ pub fn Coordinator(
             self.state = .StartSecondPass;
             self.end_of_documents_reached = false;
             self.running = true;
-            return self.run();
+            self.second_pass_count = 0;
+
+            // Run the coordinator
+            try self.run();
+
+            // After run completes, ensure proper shutdown
+            if (self.state != .Complete and self.state != .Error) {
+                self.state = .Complete;
+            }
+
+            self.shutdownWorkers();
         }
 
         pub fn shutdownWorkers(self: *Self) void {
@@ -649,9 +659,11 @@ pub fn Coordinator(
             }
             for (0..self.num_workers) |i| {
                 while (self.n_outstanding_jobs[i] > 0) {
-                    const msg = self.output_queues[i].pop();
-                    if (msg) |_| {
+                    if (self.output_queues[i].pop()) |worker_msg| {
                         self.n_outstanding_jobs[i] -= 1;
+                        message.freeWorkerMessage(self.allocator, &worker_msg);
+                    } else {
+                        std.time.sleep(1 * std.time.ns_per_ms);
                     }
                 }
             }
@@ -735,8 +747,7 @@ pub fn Coordinator(
                         // Handle the message (documents processed, errors, etc.)
                         try self.handleWorkerMessage(msg);
                     }
-                    if ((self.state == .FirstPass or self.state == .SecondPass) and !self.end_of_documents_reached
-                        and self.n_outstanding_jobs[i] < self.queue_depth) {
+                    if ((self.state == .FirstPass or self.state == .SecondPass) and !self.end_of_documents_reached and self.n_outstanding_jobs[i] < self.queue_depth) {
                         const doc = try self.getNextDocument();
                         if (doc) |document| {
                             // Add to pending documents
