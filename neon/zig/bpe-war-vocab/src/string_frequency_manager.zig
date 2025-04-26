@@ -2,49 +2,9 @@ const std = @import("std");
 const time = std.time;
 const CMS_F = @import("count_min_sketch.zig").CountMinSketch;
 const N_LENGTHS = @import("count_min_sketch.zig").N_LENGTHS;
-const MY_LEN = @import("count_min_sketch.zig").MY_LEN;
 const HashTable = @import("hash_table.zig").HashTable;
 const fs = std.fs;
 const native_endian = @import("builtin").target.cpu.arch.endian();
-
-pub const CandidateString = struct {
-    string: []u8,
-    hash: u64,
-    cached_bytes: u64,
-    guess_count: usize,
-
-    pub fn init(string: []u8, hash: u64, guess_count: usize) CandidateString {
-        var cached_bytes: u64 = 0;
-        const copy_len = @min(MY_LEN, @sizeOf(u64));
-        @memcpy(@as([*]u8, @ptrCast(&cached_bytes)), string[0..copy_len]);
-        if (native_endian != .big) {
-            cached_bytes = @byteSwap(cached_bytes);
-        }
-
-        return CandidateString{
-            .string = string,
-            .hash = hash,
-            .cached_bytes = cached_bytes,
-            .guess_count = guess_count,
-        };
-    }
-
-    pub fn lessThan(_: void, a: CandidateString, b: CandidateString) std.math.Order {
-        if (a.guess_count < b.guess_count) {
-            return .lt;
-        }
-        if (a.guess_count > b.guess_count) {
-            return .gt;
-        }
-        if (b.cached_bytes < a.cached_bytes) {
-            return .lt;
-        }
-        if (b.cached_bytes > a.cached_bytes) {
-            return .gt;
-        }
-        return std.mem.order(u8, b.string, a.string);
-    }
-};
 
 // File format version for serialization
 const FILE_FORMAT_VERSION: u32 = 1;
@@ -54,8 +14,7 @@ const SerializationHeader = extern struct {
     version: u32,
     cms_width: u32,
     cms_depth: u32,
-    min_length: u32,
-    max_length: u32,
+    length: u32,
     top_k: u32,
 };
 
@@ -66,13 +25,51 @@ fn get_RHT_POW(top_k: usize) u6 {
 pub fn StringFrequencyManager(
     comptime cms_width: usize,
     comptime cms_depth: usize,
-    comptime min_length: usize,
-    comptime max_length: usize,
+    comptime MY_LEN: comptime_int,
     comptime top_k: usize,
 ) type {
-    const CMS = CMS_F(cms_width, cms_depth);
+    const CMS = CMS_F(cms_width, cms_depth, MY_LEN);
     const num_hashes = CMS.num_hashes;
     return struct {
+        pub const CandidateString = struct {
+            string: []u8,
+            hash: u64,
+            cached_bytes: u64,
+            guess_count: usize,
+
+            pub fn init(string: []u8, hash: u64, guess_count: usize) CandidateString {
+                var cached_bytes: u64 = 0;
+                const copy_len = @min(MY_LEN, @sizeOf(u64));
+                @memcpy(@as([*]u8, @ptrCast(&cached_bytes)), string[0..copy_len]);
+                if (native_endian != .big) {
+                    cached_bytes = @byteSwap(cached_bytes);
+                }
+
+                return CandidateString{
+                    .string = string,
+                    .hash = hash,
+                    .cached_bytes = cached_bytes,
+                    .guess_count = guess_count,
+                };
+            }
+
+            pub fn lessThan(_: void, a: CandidateString, b: CandidateString) std.math.Order {
+                if (a.guess_count < b.guess_count) {
+                    return .lt;
+                }
+                if (a.guess_count > b.guess_count) {
+                    return .gt;
+                }
+                if (b.cached_bytes < a.cached_bytes) {
+                    return .lt;
+                }
+                if (b.cached_bytes > a.cached_bytes) {
+                    return .gt;
+                }
+                return std.mem.order(u8, b.string, a.string);
+            }
+        };
+
         allocator: std.mem.Allocator,
         cms: *CMS,
         length2_counters: []usize,
@@ -187,7 +184,7 @@ pub fn StringFrequencyManager(
                 }
 
                 if (MY_LEN >= 4) {
-                    const max_len = @min(max_length, document.len - i);
+                    const max_len = @min(MY_LEN, document.len - i);
                     if (max_len >= MY_LEN) {
                         self.cms.addPrefixes(@ptrCast(&document[i]), max_len);
                     }
@@ -335,8 +332,7 @@ pub fn StringFrequencyManager(
                 .version = FILE_FORMAT_VERSION,
                 .cms_width = @as(u32, @intCast(cms_width)),
                 .cms_depth = @as(u32, @intCast(cms_depth)),
-                .min_length = @as(u32, @intCast(min_length)),
-                .max_length = @as(u32, @intCast(max_length)),
+                .length = @as(u32, @intCast(MY_LEN)),
                 .top_k = @as(u32, @intCast(top_k)),
             };
 

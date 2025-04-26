@@ -13,14 +13,13 @@ const SFM = @import("string_frequency_manager.zig").StringFrequencyManager;
 pub fn Worker(
     comptime cms_width: usize,
     comptime cms_depth: usize,
-    comptime min_length: usize,
-    comptime max_length: usize,
+    comptime MY_LEN: comptime_int,
     comptime top_k: usize,
     comptime debug: bool,
 ) type {
     // Get the CMS type
-    const CMS = CMS_F(cms_width, cms_depth);
-    const SFMType = SFM(cms_width, cms_depth, min_length, max_length, top_k);
+    const CMS = CMS_F(cms_width, cms_depth, MY_LEN);
+    const SFMType = SFM(cms_width, cms_depth, MY_LEN, top_k);
 
     return struct {
         const Self = @This();

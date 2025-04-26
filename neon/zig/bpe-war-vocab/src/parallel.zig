@@ -9,19 +9,17 @@ const CMS_F = @import("count_min_sketch.zig").CountMinSketch;
 const coordinator_mod = @import("coordinator.zig");
 const spsc = @import("spsc.zig");
 const CandidateString = @import("string_frequency_manager.zig").CandidateString;
-const MY_LEN = @import("count_min_sketch.zig").MY_LEN;
 
 /// Parallel string frequency analysis framework
 pub fn ParallelAnalyzer(
     comptime cms_width: usize,
     comptime cms_depth: usize,
-    comptime min_length: usize,
-    comptime max_length: usize,
+    comptime MY_LEN: comptime_int,
     comptime top_k: usize,
 ) type {
     // Define types
-    const SFMType = SFM(cms_width, cms_depth, min_length, max_length, top_k);
-    const Coordinator = coordinator_mod.Coordinator(cms_width, cms_depth, min_length, max_length, top_k);
+    const SFMType = SFM(cms_width, cms_depth, MY_LEN, top_k);
+    const Coordinator = coordinator_mod.Coordinator(cms_width, cms_depth, MY_LEN, top_k);
 
     return struct {
         const Self = @This();
@@ -298,6 +296,11 @@ pub fn ParallelAnalyzer(
             if (self.debug) {
                 std.debug.print("[ParallelAnalyzer] Second pass completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(total_time)) / time.ns_per_ms});
             }
+        }
+
+        pub fn addSmallStringsToHeap(self: *Self) !void {
+            const manager = if (self.manager) |m| m else self.coordinator.workers[0].sfm;
+            try manager.addSmallStringsToHeap();
         }
 
         pub fn getResults(self: *Self) !void {

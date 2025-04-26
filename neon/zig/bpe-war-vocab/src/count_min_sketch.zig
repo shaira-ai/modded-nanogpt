@@ -1,14 +1,12 @@
 const std = @import("std");
 const time = std.time;
 
-pub const N_LENGTHS = 253;
-pub const MY_LEN = 10;
-
 /// Count-Min Sketch implementation for efficiently approximating string frequencies
 /// Uses xxhash for fast hashing and implements conservative updating
 pub fn CountMinSketch(
     comptime width: usize,
     comptime depth: usize,
+    comptime MY_LEN: comptime_int,
 ) type {
     return struct {
         const seeds: [12]u64 = .{
@@ -171,27 +169,10 @@ pub fn CountMinSketch(
         }
 
         /// Query the approximate frequency of a string
-        pub noinline fn _query(self: *Self, dst: [*]u64, string: [*]const u8) void {
-            var hashes: [N_LENGTHS][num_hashes]u64 = undefined;
-            FakeXxHash.hash(@ptrCast(&hashes), self.hash_seeds, @as(*const [256]u8, @ptrCast(string)));
-            const prefetch_ahead_amt = 16 * 5 / depth;
-            for (0..prefetch_ahead_amt) |i| {
-                self.prefetch(hashes[i]);
-            }
-            for (0..N_LENGTHS -| prefetch_ahead_amt) |i| {
-                dst[i] = self.queryOne(hashes[i]);
-                self.prefetch(hashes[i + prefetch_ahead_amt]);
-            }
-            for (N_LENGTHS -| prefetch_ahead_amt..N_LENGTHS) |i| {
-                dst[i] = self.queryOne(hashes[i]);
-            }
-        }
-        
-        /// Query the approximate frequency of a string
         pub noinline fn query(self: *Self, dst: [*]u64, string: [*]const u8) void {
-            var hashes: [N_LENGTHS][num_hashes]u64 = undefined;
+            var hashes: [num_hashes]u64 = undefined;
             FakeXxHash.hash(@ptrCast(&hashes), self.hash_seeds, @as(*const [256]u8, @ptrCast(string)));
-            dst[0] = self.queryOne(hashes[0]);
+            dst[0] = self.queryOne(hashes);
         }
 
         /// Compute hash indices for a string using xxhash with different seeds

@@ -16,14 +16,13 @@ const EMPTY_SLICE: []const u8 = "";
 pub fn Coordinator(
     comptime cms_width: usize,
     comptime cms_depth: usize,
-    comptime min_length: usize,
-    comptime max_length: usize,
+    comptime MY_LEN: comptime_int,
     comptime top_k: usize,
 ) type {
     // Import worker type
-    const Worker = worker_mod.Worker(cms_width, cms_depth, min_length, max_length, top_k, false);
+    const Worker = worker_mod.Worker(cms_width, cms_depth, MY_LEN, top_k, false);
     // Import CMS type
-    const CMS = CMS_F(cms_width, cms_depth);
+    const CMS = CMS_F(cms_width, cms_depth, MY_LEN);
 
     return struct {
         const Self = @This();
