@@ -60,7 +60,7 @@ const SerializationHeader = extern struct {
 };
 
 fn get_RHT_POW(top_k: usize) u6 {
-    return std.math.log2(top_k) + 2; 
+    return std.math.log2(top_k) + 2;
 }
 
 pub fn StringFrequencyManager(
@@ -136,7 +136,6 @@ pub fn StringFrequencyManager(
                 self.allocator.free(item.string);
             }
             self.heap.deinit();
-
 
             self.actual_counts.deinit();
             self.allocator.destroy(self);
@@ -369,14 +368,132 @@ pub fn StringFrequencyManager(
             std.debug.print("\n=== FREQUENCY ANALYSIS RESULTS ===\n", .{});
 
             var total_strings: usize = 0;
-            for (MY_LEN..MY_LEN + 1) |len| {
+
+            // Process and display length 2 strings
+            {
+                const display_count = top_k;
+
+                const ItemType2 = struct { index: u16, count: usize };
+                const lessThan2 = struct {
+                    pub fn lessThan(_: void, a: ItemType2, b: ItemType2) std.math.Order {
+                        return std.math.order(a.count, b.count);
+                    }
+                }.lessThan;
+
+                var length2_heap = std.PriorityQueue(ItemType2, void, lessThan2).init(self.allocator, {});
+                defer length2_heap.deinit();
+
+                for (self.length2_counters, 0..) |count, index| {
+                    if (count == 0) continue;
+
+                    if (length2_heap.count() < display_count) {
+                        try length2_heap.add(.{ .index = @intCast(index), .count = count });
+                    } else if (length2_heap.peek().?.count < count) {
+                        _ = length2_heap.remove();
+                        try length2_heap.add(.{ .index = @intCast(index), .count = count });
+                    }
+                }
+
+                std.debug.print("\nLength 2: {d} strings\n", .{@min(display_count, length2_heap.count())});
+                std.debug.print("Top strings of length 2:\n", .{});
+
+                var results = std.ArrayList(ItemType2).init(self.allocator);
+                defer results.deinit();
+
+                while (length2_heap.count() > 0) {
+                    try results.append(length2_heap.remove());
+                }
+
+                var i: usize = results.items.len;
+                var displayed: usize = 0;
+                var buf: [2]u8 = undefined;
+
+                while (i > 0 and displayed < display_count) {
+                    i -= 1;
+                    const item = results.items[i];
+
+                    const idx = item.index;
+                    buf[0] = @intCast((idx >> 8) & 0xFF);
+                    buf[1] = @intCast(idx & 0xFF);
+
+                    std.debug.print("  {d}. '{s}': count={d}\n", .{
+                        displayed + 1,
+                        std.fmt.fmtSliceEscapeLower(&buf),
+                        item.count,
+                    });
+
+                    displayed += 1;
+                }
+
+                total_strings += displayed;
+            }
+
+            // Process and display length 3 strings
+            {
+                const display_count = top_k;
+
+                const ItemType3 = struct { index: u24, count: usize };
+                const lessThan3 = struct {
+                    pub fn lessThan(_: void, a: ItemType3, b: ItemType3) std.math.Order {
+                        return std.math.order(a.count, b.count);
+                    }
+                }.lessThan;
+
+                var length3_heap = std.PriorityQueue(ItemType3, void, lessThan3).init(self.allocator, {});
+                defer length3_heap.deinit();
+
+                // Iterate through all length 3 counters in one go (like length 2)
+                for (self.length3_counters, 0..) |count, index| {
+                    if (count == 0) continue;
+
+                    if (length3_heap.count() < display_count) {
+                        try length3_heap.add(.{ .index = @intCast(index), .count = count });
+                    } else if (length3_heap.peek().?.count < count) {
+                        _ = length3_heap.remove();
+                        try length3_heap.add(.{ .index = @intCast(index), .count = count });
+                    }
+                }
+
+                // Display results
+                std.debug.print("\nLength 3: {d} strings\n", .{@min(display_count, length3_heap.count())});
+                std.debug.print("Top strings of length 3:\n", .{});
+
+                var results = std.ArrayList(ItemType3).init(self.allocator);
+                defer results.deinit();
+
+                while (length3_heap.count() > 0) {
+                    try results.append(length3_heap.remove());
+                }
+
+                var i: usize = results.items.len;
+                var displayed: usize = 0;
+                var buf: [3]u8 = undefined;
+
+                while (i > 0 and displayed < display_count) {
+                    i -= 1;
+                    const item = results.items[i];
+
+                    const idx = item.index;
+                    buf[0] = @intCast((idx >> 16) & 0xFF);
+                    buf[1] = @intCast((idx >> 8) & 0xFF);
+                    buf[2] = @intCast(idx & 0xFF);
+
+                    std.debug.print("  {d}. '{s}': count={d}\n", .{ displayed + 1, std.fmt.fmtSliceEscapeLower(&buf), item.count });
+
+                    displayed += 1;
+                }
+
+                total_strings += displayed;
+            }
+
+            if (MY_LEN >= 4) {
                 var heap = &self.heap;
                 var counts = &self.actual_counts;
 
                 const count = heap.count();
                 total_strings += count;
 
-                std.debug.print("\nLength {d}: {d} strings\n", .{ len, count });
+                std.debug.print("\nLength {d}: {d} strings\n", .{ MY_LEN, count });
 
                 // Only print details for a few sample lengths to keep output manageable
                 if (true) {
@@ -388,8 +505,8 @@ pub fn StringFrequencyManager(
                         try results.append(heap.remove());
                     }
 
-                    // Print top 10 strings with error stats
-                    std.debug.print("Top strings of length {d}:\n", .{len});
+                    // Print top strings with error stats
+                    std.debug.print("Top strings of length {d}:\n", .{MY_LEN});
 
                     var total_error: f64 = 0;
                     var total_error_pct: f64 = 0;
@@ -429,7 +546,7 @@ pub fn StringFrequencyManager(
 
                     if (displayed > 0) {
                         const avg_error_pct = total_error_pct / @as(f64, @floatFromInt(displayed));
-                        std.debug.print("  Average error for length {d}: {d:.2}%\n", .{ len, avg_error_pct });
+                        std.debug.print("  Average error for length {d}: {d:.2}%\n", .{ MY_LEN, avg_error_pct });
                     }
                 }
             }
