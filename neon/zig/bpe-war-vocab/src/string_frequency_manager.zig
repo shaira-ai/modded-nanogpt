@@ -151,6 +151,23 @@ pub fn StringFrequencyManager(
             return @as(u24, @bitCast(substring[0..3].*));
         }
 
+        pub fn length2_token_from_index(self: *Self, index: u16) [2]u8 {
+            _ = self;
+            var token: [2]u8 = undefined;
+            token[0] = @intCast((index >> 8) & 0xFF);
+            token[1] = @intCast(index & 0xFF);
+            return token;
+        }
+
+        pub fn length3_token_from_index(self: *Self, index: u32) [3]u8 {
+            _ = self;
+            var token: [3]u8 = undefined;
+            token[0] = @intCast((index >> 16) & 0xFF);
+            token[1] = @intCast((index >> 8) & 0xFF);
+            token[2] = @intCast(index & 0xFF);
+            return token;
+        }
+
         // PASS 1: Build the Count-Min Sketch
         pub fn buildCMS(self: *Self, document: []const u8) !void {
             //const start_time = time.nanoTimestamp();
@@ -258,7 +275,7 @@ pub fn StringFrequencyManager(
             const max_n_hashes = 10 * 1024;
             var doc_to_pass = document;
 
-            for (0..document.len-MY_LEN+1) |i| {
+            for (0..document.len - MY_LEN + 1) |i| {
                 if (n_hashes == max_n_hashes) {
                     try self.flushSecondPass(doc_to_pass, hashes, n_hashes);
                     n_hashes = 0;
@@ -270,7 +287,7 @@ pub fn StringFrequencyManager(
             }
 
             if (n_hashes > 0) {
-               try self.flushSecondPass(doc_to_pass, hashes, n_hashes);
+                try self.flushSecondPass(doc_to_pass, hashes, n_hashes);
             }
 
             //const elapsed = time.nanoTimestamp() - start_time;

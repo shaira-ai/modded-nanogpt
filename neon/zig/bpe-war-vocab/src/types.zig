@@ -9,6 +9,11 @@ pub const FreqString = struct {
     content: []const u8,
     frequency: usize,
     length: usize,
+
+    pub fn compare(context: void, a: FreqString, b: FreqString) std.math.Order {
+        _ = context;
+        return std.math.order(b.frequency, a.frequency);
+    }
 };
 
 pub const StringInfo = struct {

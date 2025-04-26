@@ -689,5 +689,181 @@ pub fn ParallelAnalyzer(
                 std.debug.print("[ParallelAnalyzer] Results displayed\n", .{});
             }
         }
+
+        /// Save token set to binary format
+        pub fn saveTokensToBinaryFormat(self: *Self, output_path: []const u8) !void {
+            const start_time = time.nanoTimestamp();
+
+            if (self.debug) {
+                std.debug.print("[ParallelAnalyzer] Saving token set to binary format: {s}\n", .{output_path});
+            }
+
+            // Open output file
+            const file = try fs.cwd().createFile(output_path, .{});
+            defer file.close();
+
+            const writer = file.writer();
+
+            var header: [256]u32 = [_]u32{0} ** 256;
+
+            const manager = if (self.manager) |m| m else self.coordinator.workers[0].sfm;
+
+            if (MY_LEN < 4) {
+                if (MY_LEN == 2) {
+                    var token_count: u32 = 0;
+                    for (manager.length2_counters) |count| {
+                        if (count > 0) token_count += 1;
+                    }
+
+                    header[1] = @intCast(@min(token_count, top_k));
+
+                    if (self.debug) {
+                        std.debug.print("[ParallelAnalyzer] Length 2: {d} tokens\n", .{header[1]});
+                    }
+                } else if (MY_LEN == 3) {
+                    var token_count: u32 = 0;
+                    for (manager.length3_counters) |count| {
+                        if (count > 0) token_count += 1;
+                    }
+
+                    header[2] = @intCast(@min(token_count, top_k));
+
+                    if (self.debug) {
+                        std.debug.print("[ParallelAnalyzer] Length 3: {d} tokens\n", .{header[2]});
+                    }
+                }
+            } else {
+                var token_count_by_length = std.AutoHashMap(usize, usize).init(self.allocator);
+                defer token_count_by_length.deinit();
+
+                for (manager.heap.items) |candidate| {
+                    const length = candidate.string.len;
+
+                    if (length == 0 or length > 256) continue;
+
+                    const current = token_count_by_length.get(length) orelse 0;
+                    try token_count_by_length.put(length, current + 1);
+                }
+
+                var lengths_it = token_count_by_length.iterator();
+                while (lengths_it.next()) |entry| {
+                    const length = entry.key_ptr.*;
+                    const count = entry.value_ptr.*;
+
+                    if (length > 0 and length <= 256) {
+                        header[length - 1] = @intCast(count);
+
+                        if (self.debug) {
+                            std.debug.print("[ParallelAnalyzer] Length {d}: {d} tokens\n", .{ length, count });
+                        }
+                    }
+                }
+            }
+
+            // Write header
+            try writer.writeAll(std.mem.asBytes(&header));
+
+            // Now write the tokens, grouped by length
+            if (MY_LEN < 4) {
+                if (MY_LEN == 2) {
+                    const TokenPair16 = struct { index: u16, count: usize };
+
+                    var token_pairs = std.ArrayList(TokenPair16).init(self.allocator);
+                    defer token_pairs.deinit();
+
+                    for (manager.length2_counters, 0..) |count, index| {
+                        if (count > 0) {
+                            try token_pairs.append(.{ .index = @intCast(index), .count = count });
+                        }
+                    }
+
+                    const TokenSorter = struct {
+                        fn compare(_: void, a: TokenPair16, b: TokenPair16) bool {
+                            return a.count > b.count;
+                        }
+                    };
+
+                    std.sort.insertion(TokenPair16, token_pairs.items, {}, TokenSorter.compare);
+
+                    const tokens_to_write = @min(token_pairs.items.len, top_k);
+                    for (token_pairs.items[0..tokens_to_write]) |item| {
+                        const token = manager.length2_token_from_index(item.index);
+                        try writer.writeAll(&token);
+                    }
+                } else if (MY_LEN == 3) {
+                    const TokenPair32 = struct { index: u32, count: usize };
+
+                    var token_pairs = std.ArrayList(TokenPair32).init(self.allocator);
+                    defer token_pairs.deinit();
+
+                    var total_nonzero: usize = 0;
+                    for (manager.length3_counters, 0..) |count, index| {
+                        if (count > 0) {
+                            try token_pairs.append(.{ .index = @intCast(index), .count = count });
+                            total_nonzero += 1;
+                        }
+                    }
+
+                    const TokenSorter = struct {
+                        fn compare(_: void, a: TokenPair32, b: TokenPair32) bool {
+                            return a.count > b.count;
+                        }
+                    };
+
+                    std.sort.pdq(TokenPair32, token_pairs.items, {}, TokenSorter.compare);
+
+                    // Write sorted tokens (up to top_k)
+                    const tokens_to_write = @min(token_pairs.items.len, top_k);
+                    for (token_pairs.items[0..tokens_to_write]) |item| {
+                        const token = manager.length3_token_from_index(item.index);
+                        try writer.writeAll(&token);
+                    }
+
+                    std.debug.print("[ParallelAnalyzer] Length 3 tokens written successfully\n", .{});
+                }
+            } else {
+                var length_arrays = std.AutoHashMap(usize, std.ArrayList([]const u8)).init(self.allocator);
+                defer {
+                    var len_it = length_arrays.iterator();
+                    while (len_it.next()) |entry| {
+                        entry.value_ptr.*.deinit();
+                    }
+                    length_arrays.deinit();
+                }
+
+                for (manager.heap.items) |candidate| {
+                    const length = candidate.string.len;
+
+                    if (length == 0 or length > 256) continue;
+
+                    if (!length_arrays.contains(length)) {
+                        try length_arrays.put(length, std.ArrayList([]const u8).init(self.allocator));
+                    }
+
+                    try length_arrays.getPtr(length).?.append(candidate.string);
+                }
+
+                for (1..257) |length| {
+                    if (length_arrays.get(@intCast(length))) |token_list| {
+                        for (token_list.items) |token| {
+                            try writer.writeAll(token);
+                        }
+                    }
+                }
+            }
+
+            const total_tokens = blk: {
+                var sum: usize = 0;
+                for (header) |count| {
+                    sum += count;
+                }
+                break :blk sum;
+            };
+
+            const elapsed = time.nanoTimestamp() - start_time;
+            if (self.debug) {
+                std.debug.print("[ParallelAnalyzer] Token set written in {d:.2}ms, {d} total tokens\n", .{ @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms, total_tokens });
+            }
+        }
     };
 }

@@ -239,6 +239,15 @@ pub fn main() !void {
     std.debug.print("\n=== RESULTS ===\n", .{});
     try analyzer.getResults();
 
+    // Save tokens to binary format
+    std.debug.print("\n=== SAVING TOKEN SET TO BINARY FORMAT ===\n", .{});
+    const token_set_path = "tokenset.bin";
+    _ = timer.lap();
+    try analyzer.saveTokensToBinaryFormat(token_set_path);
+    const save_token_time = timer.lap();
+    const save_token_ms = @as(f64, @floatFromInt(save_token_time)) / time.ns_per_ms;
+    std.debug.print("Token set saved to {s} in {d:.2}ms\n", .{ token_set_path, save_token_ms });
+
     // Display overall statistics
     const total_time = timer.read();
     const total_ms = @as(f64, @floatFromInt(total_time)) / time.ns_per_ms;
