@@ -183,25 +183,24 @@ pub fn StringFrequencyManager(
             //std.debug.print("[TIMING] buildCMS ({d} bytes): {d:.2}ms\n", .{ document.len, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
         }
 
-        fn processString(self: *Self, substring: []const u8) !void {
-            if (MY_LEN < 4) {
-                return;
-            }
+        fn processString(
+            self: *Self,
+            substring: []const u8,
+            hash: u64,
+            guess_count: usize,
+        ) !void {
             var heap = &self.heap;
             var counts = &self.actual_counts;
-            var scratch: [num_hashes]u64 = undefined;
-            self.cms.getHashes(&scratch, @ptrCast(substring.ptr));
 
             // Check if we're already tracking this string
-            const maybe_value_ptr = counts.getPtr(substring, scratch[0]);
+            const maybe_value_ptr = counts.getPtr(substring, hash);
             if (maybe_value_ptr) |value_ptr| {
                 //std.debug.print("Already tracking '{s}'\n", .{substring});
                 // Already tracking, just increment the actual count
                 value_ptr.* += 1;
                 return;
             }
-            const guess_count = self.cms.queryOne(scratch);
-            var new_item = CandidateString.init(@constCast(substring), scratch[0], guess_count);
+            var new_item = CandidateString.init(@constCast(substring), hash, guess_count);
             if (heap.count() < top_k) {
                 //std.debug.print("Adding '{s}' to heap\n", .{substring});
                 // Haven't reached capacity yet, add the string
@@ -210,7 +209,7 @@ pub fn StringFrequencyManager(
                 new_item.string = str_copy;
 
                 try heap.add(new_item);
-                counts.insertKnownNotPresent(str_copy, scratch[0], 1);
+                counts.insertKnownNotPresent(str_copy, hash, 1);
             } else if (CandidateString.lessThan(undefined, heap.peek().?, new_item) == .lt) {
                 // Current string has higher estimated count than our minimum
                 const evicted = heap.remove();
@@ -221,35 +220,57 @@ pub fn StringFrequencyManager(
                 new_item.string = str_copy;
 
                 try heap.add(new_item);
-                counts.insertKnownNotPresent(str_copy, scratch[0], 1);
+                counts.insertKnownNotPresent(str_copy, hash, 1);
+            }
+        }
+
+        fn flushSecondPass(
+            self: *Self,
+            document: []const u8,
+            hashes: [][num_hashes]u64,
+            n_hashes: usize,
+        ) !void {
+            const prefetch_ahead_amt = 60 / cms_depth;
+            for (0..prefetch_ahead_amt) |i| {
+                self.actual_counts.prefetch(hashes[i][0]);
+                self.cms.prefetch(hashes[i]);
+            }
+            for (0..n_hashes -| prefetch_ahead_amt) |i| {
+                const guess_count = self.cms.queryOne(hashes[i]);
+                try self.processString(document[i .. i + MY_LEN], hashes[i][0], guess_count);
+                self.actual_counts.prefetch(hashes[i + prefetch_ahead_amt][0]);
+                self.cms.prefetch(hashes[i + prefetch_ahead_amt]);
+            }
+            for (n_hashes -| prefetch_ahead_amt..n_hashes) |i| {
+                const guess_count = self.cms.queryOne(hashes[i]);
+                try self.processString(document[i .. i + MY_LEN], hashes[i][0], guess_count);
             }
         }
 
         // PASS 2: Identify top-K strings and calculate actual counts
         pub fn processDocumentSecondPass(self: *Self, document: []const u8) !void {
-            //const start_time = time.nanoTimestamp();
+            if (MY_LEN < 4) {
+                return;
+            }
+            const hashes: [][num_hashes]u64 = &self.cms.hashes;
+            var n_hashes: usize = 0;
+            //const max_n_hashes = hashes.len;
+            const max_n_hashes = 10 * 1024;
+            var doc_to_pass = document;
 
-            for (0..document.len) |i| {
-                const max_len = @min(max_length, document.len - i);
-                // if (max_len < 2) {
-                //     continue;
-                // }
-
-                // const guess_count_2 = self.length2_counters[length2ToIndex(document[i .. i + 2])];
-                // try self.processString(document[i .. i + 2], guess_count_2);
-
-                // if (max_len < 3) {
-                //     continue;
-                // }
-
-                // const guess_count_3 = self.length3_counters[length3ToIndex(document[i .. i + 3])];
-                // try self.processString(document[i .. i + 3], guess_count_3);
-
-                if (max_len < MY_LEN) {
-                    continue;
+            for (0..document.len-MY_LEN+1) |i| {
+                if (n_hashes == max_n_hashes) {
+                    try self.flushSecondPass(doc_to_pass, hashes, n_hashes);
+                    n_hashes = 0;
+                    doc_to_pass = document[i..];
                 }
+                self.cms.getHashes(&hashes[n_hashes], @ptrCast(&document[i]));
+                n_hashes += 1;
+                //try self.processString(document[i .. i + MY_LEN]);
+            }
 
-                try self.processString(document[i .. i + MY_LEN]);
+            if (n_hashes > 0) {
+               try self.flushSecondPass(doc_to_pass, hashes, n_hashes);
             }
 
             //const elapsed = time.nanoTimestamp() - start_time;

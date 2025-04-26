@@ -2,7 +2,7 @@ const std = @import("std");
 const time = std.time;
 
 pub const N_LENGTHS = 253;
-pub const MY_LEN = 3;
+pub const MY_LEN = 10;
 
 /// Count-Min Sketch implementation for efficiently approximating string frequencies
 /// Uses xxhash for fast hashing and implements conservative updating
@@ -96,7 +96,7 @@ pub fn CountMinSketch(
             return @as(SmallHashType, @truncate(whole_hashes >> shift));
         }
 
-        inline fn prefetch(self: *Self, hashes: [num_hashes]u64) void {
+        pub inline fn prefetch(self: *Self, hashes: [num_hashes]u64) void {
             inline for (0..depth) |i| {
                 @prefetch(&self.counters[i][readHashFromHashes(hashes, i)], .{});
             }
@@ -178,11 +178,11 @@ pub fn CountMinSketch(
             for (0..prefetch_ahead_amt) |i| {
                 self.prefetch(hashes[i]);
             }
-            for (0..N_LENGTHS - prefetch_ahead_amt) |i| {
+            for (0..N_LENGTHS -| prefetch_ahead_amt) |i| {
                 dst[i] = self.queryOne(hashes[i]);
                 self.prefetch(hashes[i + prefetch_ahead_amt]);
             }
-            for (N_LENGTHS - prefetch_ahead_amt..N_LENGTHS) |i| {
+            for (N_LENGTHS -| prefetch_ahead_amt..N_LENGTHS) |i| {
                 dst[i] = self.queryOne(hashes[i]);
             }
         }

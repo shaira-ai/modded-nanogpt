@@ -175,7 +175,7 @@ pub fn XxHash3(
             );
         }
 
-        inline fn mix16(seed: u64, input: []const u8, secret: []const u8) u64 {
+        inline fn mix16(seed: u64, input: [*]const u8, secret: [*]const u8) u64 {
             const blk: [4]u64 = @bitCast([_][16]u8{ input[0..16].*, secret[0..16].* });
             disableAutoVectorization(seed);
 
@@ -187,7 +187,7 @@ pub fn XxHash3(
 
         // Public API - Oneshot
 
-        pub noinline fn hash(noalias dst_: [*]u64, seed: [VEC_WIDTH]u64, noalias input: *const [256]u8) void {
+        pub noinline fn hash(noalias dst_: [*]u64, seed: [VEC_WIDTH]u64, noalias input: [*]const u8) void {
             if (min_length < 4) {
                 @compileError("min_length must be >= 4");
             }
@@ -431,7 +431,7 @@ pub fn XxHash3(
             }
         }
 
-        pub inline fn hashSingle(noalias dst_: [*]u64, seed: [VEC_WIDTH]u64, noalias input: *const [256]u8) void {
+        pub inline fn hashSingle(noalias dst_: [*]u64, seed: [VEC_WIDTH]u64, noalias input: [*]const u8) void {
             @setEvalBranchQuota(1_000_000);
             const secret = &default_secret;
             var dst = dst_;
