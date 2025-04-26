@@ -648,12 +648,6 @@ pub fn Coordinator(
 
         pub fn shutdownWorkers(self: *Self) void {
             for (0..self.num_workers) |i| {
-                const msg = message.createShutdownMessage(i);
-                const result = self.input_queues[i].push(msg);
-                const n_pushed: usize = if (result) 1 else 0;
-                self.n_outstanding_jobs[i] += n_pushed;
-            }
-            for (0..self.num_workers) |i| {
                 while (self.n_outstanding_jobs[i] > 0) {
                     if (self.output_queues[i].pop()) |worker_msg| {
                         self.n_outstanding_jobs[i] -= 1;
@@ -662,6 +656,11 @@ pub fn Coordinator(
                         std.time.sleep(1 * std.time.ns_per_ms);
                     }
                 }
+            }
+
+            for (0..self.num_workers) |i| {
+                const msg = message.createShutdownMessage(i);
+                _ = self.input_queues[i].push(msg);
             }
         }
 
