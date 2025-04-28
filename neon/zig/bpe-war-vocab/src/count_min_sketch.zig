@@ -118,7 +118,7 @@ pub fn CountMinSketch(
         }
 
         /// Add all prefixes of a string with conservative updating
-        pub noinline fn addPrefixes(self: *Self, string: [*]const u8, len: usize) void {
+        pub fn addPrefixes(self: *Self, string: [*]const u8, len: usize) void {
             if (len < MY_LEN) {
                 return;
             }
@@ -130,12 +130,12 @@ pub fn CountMinSketch(
             self.hash_idx += 1;
         }
 
-        pub inline fn getHashes(self: *Self, dst: [*]u64, string: [*]const u8) void {
+        pub fn getHashes(self: *Self, dst: [*]u64, string: [*]const u8) void {
             FakeXxHash.hash(dst, self.hash_seeds, @ptrCast(string));
         }
 
         /// Flush all remaining strings
-        pub noinline fn flush(self: *Self) void {
+        pub fn flush(self: *Self) void {
             @setEvalBranchQuota(1_000_000);
             const guess_prefetch_amt = 60 / depth;
             inline for (guess_prefetch_amt..guess_prefetch_amt+1) |prefetch_ahead_amt| {
@@ -156,7 +156,7 @@ pub fn CountMinSketch(
             self.hash_idx = 0;
         }
 
-        pub inline fn queryOne(self: *Self, hashes: [num_hashes]u64) u64 {
+        pub fn queryOne(self: *Self, hashes: [num_hashes]u64) u64 {
             var min_value: u64 = std.math.maxInt(u64);
             var big_hashes: [depth]u64 = undefined;
             inline for (0..depth) |i| {

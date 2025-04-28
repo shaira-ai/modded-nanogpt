@@ -796,7 +796,7 @@ pub fn Coordinator(
 
                 // If we didn't process any messages, sleep a bit to avoid spinning
                 if (!did_anything) {
-                    std.time.sleep(1);
+                    //std.time.sleep(1);
                 }
             }
 

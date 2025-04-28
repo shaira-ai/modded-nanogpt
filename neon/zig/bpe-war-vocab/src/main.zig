@@ -6,14 +6,120 @@ const time = std.time;
 const parallel = @import("parallel.zig");
 const fineweb = @import("data_loader.zig");
 
+const input_files_ = [_][]const u8{
+    "fineweb_train_000001.bin",
+    "fineweb_train_000002.bin",
+    "fineweb_train_000003.bin",
+    "fineweb_train_000004.bin",
+    "fineweb_train_000005.bin",
+    "fineweb_train_000006.bin",
+    "fineweb_train_000007.bin",
+    "fineweb_train_000008.bin",
+    "fineweb_train_000009.bin",
+    "fineweb_train_000010.bin",
+    "fineweb_train_000011.bin",
+    "fineweb_train_000012.bin",
+    "fineweb_train_000013.bin",
+    "fineweb_train_000014.bin",
+    "fineweb_train_000015.bin",
+    "fineweb_train_000016.bin",
+    "fineweb_train_000017.bin",
+    "fineweb_train_000018.bin",
+    "fineweb_train_000019.bin",
+    "fineweb_train_000020.bin",
+    "fineweb_train_000021.bin",
+    "fineweb_train_000022.bin",
+    "fineweb_train_000023.bin",
+    "fineweb_train_000024.bin",
+    "fineweb_train_000025.bin",
+    "fineweb_train_000026.bin",
+    "fineweb_train_000027.bin",
+    "fineweb_train_000028.bin",
+    "fineweb_train_000029.bin",
+    "fineweb_train_000030.bin",
+    "fineweb_train_000031.bin",
+    "fineweb_train_000032.bin",
+    "fineweb_train_000033.bin",
+    "fineweb_train_000034.bin",
+    "fineweb_train_000035.bin",
+    "fineweb_train_000036.bin",
+    "fineweb_train_000037.bin",
+    "fineweb_train_000038.bin",
+    "fineweb_train_000039.bin",
+    "fineweb_train_000040.bin",
+    "fineweb_train_000041.bin",
+    "fineweb_train_000042.bin",
+    "fineweb_train_000043.bin",
+    "fineweb_train_000044.bin",
+    "fineweb_train_000045.bin",
+    "fineweb_train_000046.bin",
+    "fineweb_train_000047.bin",
+    "fineweb_train_000048.bin",
+    "fineweb_train_000049.bin",
+    "fineweb_train_000050.bin",
+    "fineweb_train_000051.bin",
+    "fineweb_train_000052.bin",
+    "fineweb_train_000053.bin",
+    "fineweb_train_000054.bin",
+    "fineweb_train_000055.bin",
+    "fineweb_train_000056.bin",
+    "fineweb_train_000057.bin",
+    "fineweb_train_000058.bin",
+    "fineweb_train_000059.bin",
+    "fineweb_train_000060.bin",
+    "fineweb_train_000061.bin",
+    "fineweb_train_000062.bin",
+    "fineweb_train_000063.bin",
+    "fineweb_train_000064.bin",
+    "fineweb_train_000065.bin",
+    "fineweb_train_000066.bin",
+    "fineweb_train_000067.bin",
+    "fineweb_train_000068.bin",
+    "fineweb_train_000069.bin",
+    "fineweb_train_000070.bin",
+    "fineweb_train_000071.bin",
+    "fineweb_train_000072.bin",
+    "fineweb_train_000073.bin",
+    "fineweb_train_000074.bin",
+    "fineweb_train_000075.bin",
+    "fineweb_train_000076.bin",
+    "fineweb_train_000077.bin",
+    "fineweb_train_000078.bin",
+    "fineweb_train_000079.bin",
+    "fineweb_train_000080.bin",
+    "fineweb_train_000081.bin",
+    "fineweb_train_000082.bin",
+    "fineweb_train_000083.bin",
+    "fineweb_train_000084.bin",
+    "fineweb_train_000085.bin",
+    "fineweb_train_000086.bin",
+    "fineweb_train_000087.bin",
+    "fineweb_train_000088.bin",
+    "fineweb_train_000089.bin",
+    "fineweb_train_000090.bin",
+    "fineweb_train_000091.bin",
+    "fineweb_train_000092.bin",
+    "fineweb_train_000093.bin",
+    "fineweb_train_000094.bin",
+    "fineweb_train_000095.bin",
+    "fineweb_train_000096.bin",
+    "fineweb_train_000097.bin",
+    "fineweb_train_000098.bin",
+    "fineweb_train_000099.bin",
+    "fineweb_train_000100.bin",
+    "fineweb_train_000101.bin",
+    "fineweb_train_000102.bin",
+    "fineweb_train_000103.bin",
+};
+
 pub fn main() !void {
     // Use this instead if you want fast compile times
-    // try MainHaver(10).main();
+    //try MainHaver(10).main(input_files_[0..2], 6);
     try anyMain();
 }
 
 pub fn anyMain() !void {
-    var mains: [257]*const fn() anyerror!void = undefined;
+    var mains: [257]*const fn([]const []const u8, usize) anyerror!void = undefined;
     inline for (2..257) |i| {
         mains[i] = MainHaver(i).main;
     }
@@ -21,139 +127,42 @@ pub fn anyMain() !void {
     var args_iterator = std.process.args();
     _ = args_iterator.skip();
     const first_arg = args_iterator.next() orelse {
-        std.debug.print("Error: Expected at least one argument\n", .{});
+        std.debug.print("Error: Expected at least three arguments\n", .{});
         std.process.exit(1);
     };
-    const value = try std.fmt.parseUnsigned(usize, first_arg, 10);
-    if (value >= 2 and value < 257) {
-        try mains[value]();
+    const which = try std.fmt.parseUnsigned(usize, first_arg, 10);
+    const second_arg = args_iterator.next() orelse {
+        std.debug.print("Error: Expected at least three arguments\n", .{});
+        std.process.exit(1);
+    };
+    const n_threads = try std.fmt.parseUnsigned(usize, second_arg, 10);
+    const third_arg = args_iterator.next() orelse {
+        std.debug.print("Error: Expected at least three arguments\n", .{});
+        std.process.exit(1);
+    };
+    const n_files = try std.fmt.parseUnsigned(usize, third_arg, 10);
+    if (which >= 2 and which < 257) {
+        try mains[which](input_files_[0..n_files], n_threads);
     }
 }
 
 pub fn MainHaver(MY_LEN: comptime_int) type {
     return struct {
-        pub fn main() anyerror!void {
+        pub fn main(input_files: []const []const u8, num_threads: usize) anyerror!void {
             const allocator = std.heap.c_allocator;
             var timer = try std.time.Timer.start();
 
             // Configure parameters
-            const top_k = 10000; // Track top 10000 strings per length
+            const top_k = 1000000; // Track top 10000 strings per length
             const cms_width = 1 << 24; // ~16 million counters per hash function
             const cms_depth = 10;
 
             const available_cores = try std.Thread.getCpuCount();
-            const num_threads = 10;
 
             const debug = true;
 
             // Flag to skip disk I/O and keep data in memory between passes
             const skip_disk_io = true;
-
-            const input_files = [_][]const u8{
-                "fineweb_train_000001.bin",
-                "fineweb_train_000002.bin",
-                // "fineweb_train_000003.bin",
-                // "fineweb_train_000004.bin",
-                // "fineweb_train_000005.bin",
-                // "fineweb_train_000006.bin",
-                // "fineweb_train_000007.bin",
-                // "fineweb_train_000008.bin",
-                // "fineweb_train_000009.bin",
-                // "fineweb_train_000010.bin",
-                // "fineweb_train_000011.bin",
-                // "fineweb_train_000012.bin",
-                // "fineweb_train_000013.bin",
-                // "fineweb_train_000014.bin",
-                // "fineweb_train_000015.bin",
-                // "fineweb_train_000016.bin",
-                // "fineweb_train_000017.bin",
-                // "fineweb_train_000018.bin",
-                // "fineweb_train_000019.bin",
-                // "fineweb_train_000020.bin",
-                // "fineweb_train_000021.bin",
-                // "fineweb_train_000022.bin",
-                // "fineweb_train_000023.bin",
-                // "fineweb_train_000024.bin",
-                // "fineweb_train_000025.bin",
-                // "fineweb_train_000026.bin",
-                // "fineweb_train_000027.bin",
-                // "fineweb_train_000028.bin",
-                // "fineweb_train_000029.bin",
-                // "fineweb_train_000030.bin",
-                // "fineweb_train_000031.bin",
-                // "fineweb_train_000032.bin",
-                // "fineweb_train_000033.bin",
-                // "fineweb_train_000034.bin",
-                // "fineweb_train_000035.bin",
-                // "fineweb_train_000036.bin",
-                // "fineweb_train_000037.bin",
-                // "fineweb_train_000038.bin",
-                // "fineweb_train_000039.bin",
-                // "fineweb_train_000040.bin",
-                // "fineweb_train_000041.bin",
-                // "fineweb_train_000042.bin",
-                // "fineweb_train_000043.bin",
-                // "fineweb_train_000044.bin",
-                // "fineweb_train_000045.bin",
-                // "fineweb_train_000046.bin",
-                // "fineweb_train_000047.bin",
-                // "fineweb_train_000048.bin",
-                // "fineweb_train_000049.bin",
-                // "fineweb_train_000050.bin",
-                // "fineweb_train_000051.bin",
-                // "fineweb_train_000052.bin",
-                // "fineweb_train_000053.bin",
-                // "fineweb_train_000054.bin",
-                // "fineweb_train_000055.bin",
-                // "fineweb_train_000056.bin",
-                // "fineweb_train_000057.bin",
-                // "fineweb_train_000058.bin",
-                // "fineweb_train_000059.bin",
-                // "fineweb_train_000060.bin",
-                // "fineweb_train_000061.bin",
-                // "fineweb_train_000062.bin",
-                // "fineweb_train_000063.bin",
-                // "fineweb_train_000064.bin",
-                // "fineweb_train_000065.bin",
-                // "fineweb_train_000066.bin",
-                // "fineweb_train_000067.bin",
-                // "fineweb_train_000068.bin",
-                // "fineweb_train_000069.bin",
-                // "fineweb_train_000070.bin",
-                // "fineweb_train_000071.bin",
-                // "fineweb_train_000072.bin",
-                // "fineweb_train_000073.bin",
-                // "fineweb_train_000074.bin",
-                // "fineweb_train_000075.bin",
-                // "fineweb_train_000076.bin",
-                // "fineweb_train_000077.bin",
-                // "fineweb_train_000078.bin",
-                // "fineweb_train_000079.bin",
-                // "fineweb_train_000080.bin",
-                // "fineweb_train_000081.bin",
-                // "fineweb_train_000082.bin",
-                // "fineweb_train_000083.bin",
-                // "fineweb_train_000084.bin",
-                // "fineweb_train_000085.bin",
-                // "fineweb_train_000086.bin",
-                // "fineweb_train_000087.bin",
-                // "fineweb_train_000088.bin",
-                // "fineweb_train_000089.bin",
-                // "fineweb_train_000090.bin",
-                // "fineweb_train_000091.bin",
-                // "fineweb_train_000092.bin",
-                // "fineweb_train_000093.bin",
-                // "fineweb_train_000094.bin",
-                // "fineweb_train_000095.bin",
-                // "fineweb_train_000096.bin",
-                // "fineweb_train_000097.bin",
-                // "fineweb_train_000098.bin",
-                // "fineweb_train_000099.bin",
-                // "fineweb_train_000100.bin",
-                // "fineweb_train_000101.bin",
-                // "fineweb_train_000102.bin",
-                // "fineweb_train_000103.bin",
-            };
 
             const vocab_file = "vocab.json";
             const saved_data_path = "fineweb_first_pass_parallel.bin";
@@ -177,7 +186,7 @@ pub fn MainHaver(MY_LEN: comptime_int) type {
             const ParallelAnalyzer = parallel.ParallelAnalyzer(cms_width, cms_depth, MY_LEN, top_k);
 
             // Create analyzer with specific files
-            var analyzer = try ParallelAnalyzer.init(allocator, num_threads, &input_files, vocab_file, saved_data_path, debug);
+            var analyzer = try ParallelAnalyzer.init(allocator, num_threads, input_files, vocab_file, saved_data_path, debug);
             defer analyzer.deinit();
 
             // Check if saved data exists
@@ -267,7 +276,8 @@ pub fn MainHaver(MY_LEN: comptime_int) type {
 
             // Save tokens to binary format
             std.debug.print("\n=== SAVING TOKEN SET TO BINARY FORMAT ===\n", .{});
-            const token_set_path = "tokenset.bin";
+            var buf: [1024]u8 = undefined;
+            const token_set_path = try std.fmt.bufPrint(&buf, "tokenset_{d}.bin", .{MY_LEN});
             _ = timer.lap();
             try analyzer.saveTokensToBinaryFormat(token_set_path);
             const save_token_time = timer.lap();

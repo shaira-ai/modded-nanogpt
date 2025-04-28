@@ -45,6 +45,9 @@ pub fn Worker(
         /// Worker state
         running: bool = false,
 
+        // is my sfm ready to be used?
+        sfm_ready: bool = false,
+
         /// Initialize a new worker
         pub fn init(
             allocator: Allocator,
@@ -58,15 +61,11 @@ pub fn Worker(
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
 
-            // Create the SFM (which will create its own CMS)
-            const sfm = try SFMType.init(allocator);
-            errdefer sfm.deinit();
-
             // Initialize the worker with pointers to the queues
             self.* = .{
                 .id = id,
                 .allocator = allocator,
-                .sfm = sfm,
+                .sfm = undefined,
                 .input_queue = input_queue, // Store the pointer
                 .output_queue = output_queue, // Store the pointer
             };
@@ -147,19 +146,6 @@ pub fn Worker(
             }
         }
 
-        /// Merge CMS with global CMS
-        fn mergeCMS(self: *Self, global_cms: *CMS) !void {
-            const start_time = time.nanoTimestamp();
-
-            // Get the CMS from our SFM and merge it into the global CMS
-            try global_cms.merge(self.sfm.cms);
-
-            if (debug) {
-                const elapsed = time.nanoTimestamp() - start_time;
-                std.debug.print("[Worker {d}] mergeCMS: {d:.2}ms\n", .{ self.id, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
-            }
-        }
-
         /// Dump state to a file
         fn dumpState(self: *Self, path: []const u8) !void {
             const start_time = time.nanoTimestamp();
@@ -213,7 +199,9 @@ pub fn Worker(
                 // },
                 .MergeCMS => |cms_data| {
                     const other_cms = @as(*CMS, @ptrCast(@alignCast(cms_data.cms)));
-                    try self.sfm.cms.merge(other_cms);
+                    if (MY_LEN >= 4) {
+                        try self.sfm.cms.merge(other_cms);
+                    }
 
                     // Create a response that includes a pointer to our local CMS
                     const response = message.createMergedCMSMessage(self.id);
@@ -284,6 +272,12 @@ pub fn Worker(
 
         /// Main worker loop
         fn run(self: *Self) !void {
+            if (!self.sfm_ready) {
+                // Create the SFM (which will create its own CMS)
+                self.sfm = try SFMType.init(self.allocator);
+                self.sfm_ready = true;
+            }
+
             if (debug) {
                 std.debug.print("[Worker {d}] started running\n", .{self.id});
             }
@@ -305,7 +299,7 @@ pub fn Worker(
                     };
                 } else {
                     // No messages, sleep for a bit
-                    std.time.sleep(1 * std.time.ns_per_ms); // 300ms
+                    //std.time.sleep(1 * std.time.ns_per_ms); // 300ms
                 }
             }
 

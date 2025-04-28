@@ -462,7 +462,7 @@ pub fn StringFrequencyManager(
                 var total_error: f64 = 0;
                 var total_error_pct: f64 = 0;
 
-                const display_count = @min(1000, results.items.len);
+                const display_count = @min(1000000,results.items.len);
 
                 // Display in descending order (highest frequency first)
                 var i: usize = results.items.len;

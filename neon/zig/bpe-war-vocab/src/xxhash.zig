@@ -187,7 +187,7 @@ pub fn XxHash3(
 
         // Public API - Oneshot
 
-        pub noinline fn hash(noalias dst_: [*]u64, seed: [VEC_WIDTH]u64, noalias input: [*]const u8) void {
+        pub fn hash(noalias dst_: [*]u64, seed: [VEC_WIDTH]u64, noalias input: [*]const u8) void {
             if (min_length < 4) {
                 @compileError("min_length must be >= 4");
             }

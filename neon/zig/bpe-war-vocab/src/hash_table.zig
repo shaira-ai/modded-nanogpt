@@ -40,7 +40,7 @@ pub fn HashTable(comptime RHT_POW: u6) type {
             @prefetch(&self.xs[hash & RHT_MASK], .{});
         }
 
-        pub inline fn getPtr(self: *Self, key: []const u8, hash: u64) ?*u64 {
+        pub fn getPtr(self: *Self, key: []const u8, hash: u64) ?*u64 {
             var bucknum: u64 = hash & RHT_MASK;
             const xs = self.xs;
             while (true) {
@@ -58,7 +58,8 @@ pub fn HashTable(comptime RHT_POW: u6) type {
             noalias xs: [*]Entry,
             noalias key_: []const u8,
             hash_: u64,
-            value_: u64) void {
+            value_: u64,
+        ) void {
             var key = key_;
             var hash = hash_;
             var value = value_;
@@ -88,14 +89,15 @@ pub fn HashTable(comptime RHT_POW: u6) type {
             }
         }
 
-        pub inline fn insertKnownNotPresent(self: *Self, key: []const u8, hash: u64, value: u64) void {
+        pub fn insertKnownNotPresent(self: *Self, key: []const u8, hash: u64, value: u64) void {
             return insertKnownNotPresentInner(self.xs, key, hash, value);
         }
 
         inline fn deleteKnownPresentInner(
             noalias xs: [*]Entry,
-            key: []const u8,
-            hash: u64) u64 {
+            noalias key: []const u8,
+            hash: u64,
+        ) u64 {
             var bucknum = hash & RHT_MASK;
             var ret: u64 = 0;
             while (true) {
@@ -124,7 +126,7 @@ pub fn HashTable(comptime RHT_POW: u6) type {
             return ret;
         }
 
-        pub inline fn deleteKnownPresent(self: *Self, key: []const u8, hash: u64) u64 {
+        pub fn deleteKnownPresent(self: *Self, key: []const u8, hash: u64) u64 {
             return deleteKnownPresentInner(self.xs, key, hash);
         }
     };
