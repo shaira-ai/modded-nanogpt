@@ -139,7 +139,7 @@ pub fn Coordinator(
             errdefer allocator.free(n_outstanding_jobs);
             @memset(n_outstanding_jobs, 0);
 
-            const queue_depth = 40;
+            const queue_depth = 80;
 
             // Create pending documents list
             const pending_documents = try allocator.alloc([]const u8, num_workers * queue_depth);
@@ -796,7 +796,7 @@ pub fn Coordinator(
 
                 // If we didn't process any messages, sleep a bit to avoid spinning
                 if (!did_anything) {
-                    //std.time.sleep(1);
+                    std.time.sleep(1);
                 }
             }
 

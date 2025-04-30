@@ -5,9 +5,15 @@ const N_LENGTHS = @import("count_min_sketch.zig").N_LENGTHS;
 const HashTable = @import("hash_table.zig").HashTable;
 const fs = std.fs;
 const native_endian = @import("builtin").target.cpu.arch.endian();
+const huge_pages_plz = @import("huge_pages_plz.zig");
+const FixedBufferAllocator = std.heap.FixedBufferAllocator;
+const builtin = @import("builtin");
+const native_os = builtin.os.tag;
 
 // File format version for serialization
 const FILE_FORMAT_VERSION: u32 = 1;
+const EMPTY_USIZE_SLICE: []usize = &[_]usize{};
+const EMPTY_BYTE_SLICE: []u8 = &[_]u8{};
 
 const SerializationHeader = extern struct {
     magic: [4]u8, // "SFMF" --> String Frequency Manager File
@@ -71,6 +77,7 @@ pub fn StringFrequencyManager(
         };
 
         allocator: std.mem.Allocator,
+        fba: FixedBufferAllocator,
         cms: *CMS,
         length2_counters: []usize,
         length3_counters: []usize,
@@ -88,9 +95,21 @@ pub fn StringFrequencyManager(
             const self = try allocator.create(Self);
             errdefer allocator.destroy(self);
 
+
+            var huge_allocator = allocator;
+            var fba: FixedBufferAllocator = FixedBufferAllocator.init(EMPTY_BYTE_SLICE);
+            if (native_os == .linux) {
+                const slab = try huge_pages_plz.allocateHugePages(2 * 1024 * 1024 * 1024);
+                fba = FixedBufferAllocator.init(slab);
+                huge_allocator = fba.allocator();
+            }
+
             // Create the Count-Min Sketch
-            const cms = try CMS.init(allocator);
+            const cms = try CMS.init(huge_allocator);
             errdefer cms.deinit();
+
+            const actual_counts = try HashTable(get_RHT_POW(top_k)).init(huge_allocator);
+            const heap = std.PriorityQueue(CandidateString, void, CandidateString.lessThan).init(huge_allocator, {});
 
             // Initialize heaps and count maps
             // const heaps = try allocator.alloc(std.PriorityQueue(CandidateString, void, CandidateString.lessThan), max_length + 1);
@@ -101,18 +120,19 @@ pub fn StringFrequencyManager(
             // for (actual_counts) |*map| {
             //     map.* = std.StringHashMap(usize).init(allocator);
             // }
-            const len2_counters = try allocator.alloc(usize, 0x10000);
-            const len3_counters = try allocator.alloc(usize, 0x1000000);
+            const len2_counters = if (MY_LEN == 2) try allocator.alloc(usize, 0x10000) else EMPTY_USIZE_SLICE;
+            const len3_counters = if (MY_LEN == 3) try allocator.alloc(usize, 0x1000000) else EMPTY_USIZE_SLICE;
             @memset(len2_counters, 0);
             @memset(len3_counters, 0);
 
             self.* = .{
                 .allocator = allocator,
+                .fba = fba,
                 .cms = cms,
                 .length2_counters = len2_counters,
                 .length3_counters = len3_counters,
-                .heap = std.PriorityQueue(CandidateString, void, CandidateString.lessThan).init(allocator, {}),
-                .actual_counts = try HashTable(get_RHT_POW(top_k)).init(allocator),
+                .heap = heap,
+                .actual_counts = actual_counts,
             };
 
             const elapsed = time.nanoTimestamp() - start_time;
@@ -132,9 +152,14 @@ pub fn StringFrequencyManager(
                 const item = self.heap.remove();
                 self.allocator.free(item.string);
             }
-            self.heap.deinit();
 
-            self.actual_counts.deinit();
+            if (native_os == .linux) {
+                huge_pages_plz.freeHugePages(self.fba.buffer);
+            } else {
+                self.heap.deinit();
+                self.actual_counts.deinit();
+            }
+
             self.allocator.destroy(self);
 
             const elapsed = time.nanoTimestamp() - start_time;
