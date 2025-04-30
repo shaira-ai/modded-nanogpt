@@ -107,12 +107,12 @@ pub fn allocateHugePages(size: usize) ![]u8 {
     }
 }
 
-pub fn freeHugePages(slice: []align(std.mem.page_size) u8) void {
+pub fn freeHugePages(slice: []u8) void {
     if (native_os != .linux) {
         return;
     }
 
     // We don't need to know what page size was used for allocation
     // munmap works regardless of the page size
-    posix.munmap(slice);
+    posix.munmap(@alignCast(slice));
 }

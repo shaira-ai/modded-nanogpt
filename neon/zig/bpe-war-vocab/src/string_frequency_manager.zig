@@ -14,6 +14,7 @@ const native_os = builtin.os.tag;
 const FILE_FORMAT_VERSION: u32 = 1;
 const EMPTY_USIZE_SLICE: []usize = &[_]usize{};
 const EMPTY_BYTE_SLICE: []u8 = &[_]u8{};
+const USE_HUGE_PAGES = native_os == .linux and false;
 
 const SerializationHeader = extern struct {
     magic: [4]u8, // "SFMF" --> String Frequency Manager File
@@ -98,7 +99,7 @@ pub fn StringFrequencyManager(
 
             var huge_allocator = allocator;
             var fba: FixedBufferAllocator = FixedBufferAllocator.init(EMPTY_BYTE_SLICE);
-            if (native_os == .linux) {
+            if (USE_HUGE_PAGES) {
                 const slab = try huge_pages_plz.allocateHugePages(2 * 1024 * 1024 * 1024);
                 fba = FixedBufferAllocator.init(slab);
                 huge_allocator = fba.allocator();
@@ -109,7 +110,8 @@ pub fn StringFrequencyManager(
             errdefer cms.deinit();
 
             const actual_counts = try HashTable(get_RHT_POW(top_k)).init(huge_allocator);
-            const heap = std.PriorityQueue(CandidateString, void, CandidateString.lessThan).init(huge_allocator, {});
+            var heap = std.PriorityQueue(CandidateString, void, CandidateString.lessThan).init(huge_allocator, {});
+            try heap.ensureTotalCapacity(top_k + 420);
 
             // Initialize heaps and count maps
             // const heaps = try allocator.alloc(std.PriorityQueue(CandidateString, void, CandidateString.lessThan), max_length + 1);
@@ -134,6 +136,9 @@ pub fn StringFrequencyManager(
                 .heap = heap,
                 .actual_counts = actual_counts,
             };
+            if (USE_HUGE_PAGES) {
+                self.heap.allocator = self.fba.allocator();
+            }
 
             const elapsed = time.nanoTimestamp() - start_time;
             std.debug.print("[TIMING] StringFrequencyManager.init: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
@@ -153,7 +158,7 @@ pub fn StringFrequencyManager(
                 self.allocator.free(item.string);
             }
 
-            if (native_os == .linux) {
+            if (USE_HUGE_PAGES) {
                 huge_pages_plz.freeHugePages(self.fba.buffer);
             } else {
                 self.heap.deinit();
