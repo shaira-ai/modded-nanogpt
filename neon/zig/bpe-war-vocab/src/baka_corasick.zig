@@ -70,6 +70,19 @@ pub const BakaCorasick = struct {
         return state_id;
     }
 
+    pub fn copyFrom(self: *Self, other: *Self) !void {
+        if (self.capacity < other.capacity) {
+            self.allocator.free(self.transitions);
+            self.allocator.free(self.info);
+            self.capacity = other.capacity;
+            self.transitions = try self.allocator.alloc([256]u32, self.capacity);
+            self.info = try self.allocator.alloc(StateInfo, self.capacity);
+        }
+        self.len = other.len;
+        @memcpy(self.transitions[0..self.len], other.transitions[0..self.len]);
+        @memcpy(self.info[0..self.len], other.info[0..self.len]);
+    }
+
     // Insert a new token/word (only builds the trie structure without suffix links)
     pub fn insert(self: *Self, token_str: []const u8, token_id: u32) !void {
         var current_state: u32 = 0; // Start at root
