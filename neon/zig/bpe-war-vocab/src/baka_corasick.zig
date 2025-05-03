@@ -67,13 +67,6 @@ pub const BakaCorasick = struct {
         }
         const state_id = @as(u32, @intCast(self.len));
         self.len += 1;
-        @memset(&self.transitions[state_id], 0);
-        self.info[state_id] = .{
-            .blue = 0,
-            .green = 0,
-            .depth = 0,
-            .token_id = NO_TOKEN,
-        };
         return state_id;
     }
 
@@ -129,8 +122,12 @@ pub const BakaCorasick = struct {
         for (0..256) |i| {
             const c: u8 = @intCast(i);
             const child = self.transitions[0][c];
+            const my_depth = self.info[0].depth;
             if (child != 0) {
-                try queue.push(self.allocator, child);
+                const child_depth = self.info[child].depth;
+                if (child_depth > my_depth) {
+                    try queue.push(self.allocator, child);
+                }
             }
         }
 
@@ -143,26 +140,30 @@ pub const BakaCorasick = struct {
             }
             self.info[current].green = dict_suffix;
             const current_suffix = self.info[current].blue;
+            const my_depth = self.info[current].depth;
             // Add all children to the queue and compute their suffix links
             for (0..256) |i| {
                 const c: u8 = @intCast(i);
                 const child = self.transitions[current][c];
 
                 if (child != 0) {
-                    // Start from the suffix link of the current node
-                    var suffix_node = current_suffix;
+                    const child_depth = self.info[child].depth;
+                    if (child_depth > my_depth) {
+                        // Start from the suffix link of the current node
+                        var suffix_node = current_suffix;
 
-                    // Follow suffix links until finding a node that has the current character
-                    // or until reaching the root
-                    while (suffix_node != 0 and self.transitions[suffix_node][c] == 0) {
-                        suffix_node = self.info[suffix_node].blue;
+                        // Follow suffix links until finding a node that has the current character
+                        // or until reaching the root
+                        while (suffix_node != 0 and self.transitions[suffix_node][c] == 0) {
+                            suffix_node = self.info[suffix_node].blue;
+                        }
+
+                        // Set the suffix link for the child
+                        self.info[child].blue = self.transitions[suffix_node][c];
+
+                        // Add child to the queue
+                        try queue.push(self.allocator, child);
                     }
-
-                    // Set the suffix link for the child
-                    self.info[child].blue = self.transitions[suffix_node][c];
-
-                    // Add child to the queue
-                    try queue.push(self.allocator, child);
                 }
             }
         }
@@ -171,17 +172,25 @@ pub const BakaCorasick = struct {
         for (0..256) |i| {
             const c: u8 = @intCast(i);
             const child = self.transitions[0][c];
+            const my_depth = self.info[0].depth;
             if (child != 0) {
-                try queue.push(self.allocator, child);
+                const child_depth = self.info[child].depth;
+                if (child_depth > my_depth) {
+                    try queue.push(self.allocator, child);
+                }
             }
         }
         while (queue.pop()) |current| {
             const current_suffix = self.info[current].blue;
+            const my_depth = self.info[current].depth;
             for (0..256) |i| {
                 const c: u8 = @intCast(i);
                 const child = self.transitions[current][c];
                 if (child != 0) {
-                    try queue.push(self.allocator, child);
+                    const child_depth = self.info[child].depth;
+                    if (child_depth > my_depth) {
+                        try queue.push(self.allocator, child);
+                    }
                 }
                 if (child == 0) {
                     var suffix_node = current_suffix;
