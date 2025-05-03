@@ -67,16 +67,23 @@ pub const BakaCorasick = struct {
         }
         const state_id = @as(u32, @intCast(self.len));
         self.len += 1;
+        @memset(&self.transitions[state_id], 0);
+        self.info[state_id] = .{
+            .blue = 0,
+            .green = 0,
+            .depth = 0,
+            .token_id = NO_TOKEN,
+        };
         return state_id;
     }
 
     pub fn copyFrom(self: *Self, other: *Self) !void {
         if (self.capacity < other.capacity) {
-            self.allocator.free(self.transitions);
-            self.allocator.free(self.info);
+            self.allocator.free(self.transitions[0..self.capacity]);
+            self.allocator.free(self.info[0..self.capacity]);
             self.capacity = other.capacity;
-            self.transitions = try self.allocator.alloc([256]u32, self.capacity);
-            self.info = try self.allocator.alloc(StateInfo, self.capacity);
+            self.transitions = (try self.allocator.alloc([256]u32, self.capacity)).ptr;
+            self.info = (try self.allocator.alloc(StateInfo, self.capacity)).ptr;
         }
         self.len = other.len;
         @memcpy(self.transitions[0..self.len], other.transitions[0..self.len]);
