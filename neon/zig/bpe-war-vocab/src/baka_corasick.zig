@@ -89,8 +89,10 @@ pub const BakaCorasick = struct {
 
         // Build the trie path for this token
         for (token_str, 0..) |c, i| {
+            const my_depth = self.info[current_state].depth;
             const old_next = self.transitions[current_state][c];
-            if (old_next == 0) {
+            const old_next_depth = self.info[old_next].depth;
+            if (old_next_depth <= my_depth) {
                 // Create a new state
                 const next_state = try self.allocState();
                 self.transitions[current_state][c] = next_state;
