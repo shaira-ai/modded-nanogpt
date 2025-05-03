@@ -186,13 +186,9 @@ pub const BakaCorasick = struct {
             for (0..256) |i| {
                 const c: u8 = @intCast(i);
                 const child = self.transitions[current][c];
-                if (child != 0) {
-                    const child_depth = self.info[child].depth;
-                    if (child_depth > my_depth) {
-                        try queue.push(self.allocator, child);
-                    }
-                }
-                if (child == 0) {
+                if (self.info[child].depth > my_depth) {
+                    try queue.push(self.allocator, child);
+                } else {
                     var suffix_node = current_suffix;
                     while (suffix_node != 0 and self.transitions[suffix_node][c] == 0) {
                         suffix_node = self.info[suffix_node].blue;
