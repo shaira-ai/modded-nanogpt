@@ -76,6 +76,7 @@ fn printUsage(program_name: []const u8) !void {
 fn filterTokenSets(allocator: Allocator, input_path: []const u8, output_path: []const u8) !void {
     const input_file = try fs.cwd().openFile(input_path, .{});
     defer input_file.close();
+
     const output_file = try fs.cwd().createFile(output_path, .{});
     defer output_file.close();
 
@@ -97,12 +98,17 @@ fn filterTokenSets(allocator: Allocator, input_path: []const u8, output_path: []
         .remaining_tokens = 0,
     };
 
+    try output_file.writeAll(std.mem.asBytes(&output_header));
+    var file_position: u64 = MAX_TOKEN_LENGTH * @sizeOf(u32);
+
     for (input_header, 0..) |count, length_idx| {
         const length = length_idx + 1;
         if (count == 0) continue;
 
         std.debug.print("Processing {d} tokens of length {d}...\n", .{ count, length });
         stats.total_tokens += count;
+
+        try output_file.seekTo(file_position);
 
         const tokens_per_buffer = BUFFER_SIZE / length;
         const buffer_size_in_bytes = tokens_per_buffer * length;
@@ -115,6 +121,12 @@ fn filterTokenSets(allocator: Allocator, input_path: []const u8, output_path: []
 
         var tokens_remaining: u32 = 0;
         var tokens_left = count;
+        var input_position: u64 = MAX_TOKEN_LENGTH * @sizeOf(u32);
+
+        for (0..length_idx) |i| {
+            input_position += input_header[i] * (i + 1);
+        }
+        try input_file.seekTo(input_position);
 
         while (tokens_left > 0) {
             const tokens_to_read = @min(tokens_left, tokens_per_buffer);
@@ -159,7 +171,9 @@ fn filterTokenSets(allocator: Allocator, input_path: []const u8, output_path: []
             }
 
             if (filtered_bytes > 0) {
+                try output_file.seekTo(file_position);
                 try output_file.writeAll(filtered_buffer[0..filtered_bytes]);
+                file_position += filtered_bytes;
             }
 
             tokens_left -= @intCast(complete_tokens);
