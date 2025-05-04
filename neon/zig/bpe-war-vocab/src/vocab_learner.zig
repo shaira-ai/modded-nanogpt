@@ -239,6 +239,12 @@ pub const VocabLearner = struct {
         // Free token IDs map
         self.vocab_token_ids.deinit();
 
+        var gpt_it = self.gpt_token_to_string.iterator();
+        while (gpt_it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.gpt_token_to_string.deinit();
+
         // Clean up BakaCorasick instances
         deinitBakaCorasick(&self.vocab_automaton, self.allocator);
         deinitBakaCorasick(&self.eval_automaton, self.allocator);
@@ -312,7 +318,7 @@ pub const VocabLearner = struct {
 
         for (header, 0..) |count, i| {
             const length = i + 1;
-            if (count == 0) continue;
+            if (count == 0 or length > 15) continue;
 
             if (self.debug) {
                 std.debug.print("Processing {d} tokens of length {d}...\n", .{ count, length });
@@ -1628,7 +1634,7 @@ pub fn main() !void {
 
     const debug = true;
 
-    var learner = try VocabLearner.init(allocator, tokenset_path, corpus_paths, 10000, debug);
+    var learner = try VocabLearner.init(allocator, tokenset_path, corpus_paths, 500, debug);
     defer learner.deinit();
 
     // check if everything initialized properly
