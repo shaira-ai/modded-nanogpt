@@ -173,7 +173,7 @@ pub const VocabLearner = struct {
     eval_automaton: BakaCorasick,
     current_step: u32,
     document_sampler: *DocumentSampler,
-
+    gpt_token_to_string: std.AutoHashMap(u16, []const u8),
     // Parameters
     max_vocab_size: u32,
     top_k_candidates: u32,
@@ -198,6 +198,7 @@ pub const VocabLearner = struct {
             .eval_automaton = try BakaCorasick.init(allocator),
             .current_step = 0,
             .document_sampler = try DocumentSampler.init(allocator, corpus_paths, debug),
+            .gpt_token_to_string = std.AutoHashMap(u16, []const u8).init(allocator),
             .max_vocab_size = max_vocab_size,
             .top_k_candidates = 200,
             .batch_size = 10,
@@ -311,7 +312,7 @@ pub const VocabLearner = struct {
 
         for (header, 0..) |count, i| {
             const length = i + 1;
-            if (count == 0 or length > 10) continue;
+            if (count == 0) continue;
 
             if (self.debug) {
                 std.debug.print("Processing {d} tokens of length {d}...\n", .{ count, length });
@@ -378,37 +379,97 @@ pub const VocabLearner = struct {
         }
     }
 
-    // Process entire corpus to calculate token occurrences
-    pub fn processCorpusForOccurrences(self: *VocabLearner) !void {
+    pub fn loadGPTVocabulary(self: *VocabLearner, vocab_path: []const u8) !void {
         const start_time = std.time.milliTimestamp();
 
         if (self.debug) {
-            std.debug.print("Processing corpus to calculate token occurrences...\n", .{});
+            std.debug.print("Loading GPT vocabulary from {s}...\n", .{vocab_path});
         }
 
-        if (self.debug) {
-            std.debug.print("Building search automaton for all candidate tokens...\n", .{});
+        const file = try std.fs.cwd().openFile(vocab_path, .{});
+        defer file.close();
+
+        const file_size = try file.getEndPos();
+        const json_buffer = try self.allocator.alloc(u8, file_size);
+        defer self.allocator.free(json_buffer);
+
+        const bytes_read = try file.readAll(json_buffer);
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, json_buffer[0..bytes_read], .{});
+        defer parsed.deinit();
+
+        const root = parsed.value;
+        if (root != .object) {
+            return error.InvalidJsonFormat;
         }
 
-        var candidate_automaton = try BakaCorasick.init(self.allocator);
-        defer deinitBakaCorasick(&candidate_automaton, self.allocator);
+        // Clear any existing entries
+        self.gpt_token_to_string.clearRetainingCapacity();
 
-        var token_id: u32 = 0;
-        var it = self.candidate_stats.iterator();
+        // Add mapping for each token
+        var it = root.object.iterator();
         while (it.next()) |entry| {
-            const token = entry.key_ptr.*;
-            try candidate_automaton.insert(token, token_id);
-            token_id += 1;
-        }
+            const token_str = entry.key_ptr.*;
+            const token_id = @as(u16, @intCast(entry.value_ptr.integer));
 
-        try candidate_automaton.computeSuffixLinks();
+            // Allocate and store the string
+            const str_copy = try self.allocator.dupe(u8, token_str);
+            errdefer self.allocator.free(str_copy);
+
+            try self.gpt_token_to_string.put(token_id, str_copy);
+        }
 
         if (self.debug) {
-            std.debug.print("Search automaton built with {d} states\n", .{candidate_automaton.len});
+            std.debug.print("Loaded {d} GPT tokens from vocabulary\n", .{self.gpt_token_to_string.count()});
         }
 
-        var total_bytes_processed: usize = 0;
+        const elapsed_ms = std.time.milliTimestamp() - start_time;
+        if (self.debug) {
+            std.debug.print("Loaded GPT vocabulary in {d}ms\n", .{elapsed_ms});
+        }
+    }
 
+    // Add this function to directly count token ID occurrences
+    pub fn processCorpusWithTokenIDs(self: *VocabLearner) !void {
+        const start_time = std.time.milliTimestamp();
+
+        if (self.debug) {
+            std.debug.print("Processing corpus using direct token ID counting...\n", .{});
+        }
+
+        // Load vocabulary if not already loaded
+        if (self.gpt_token_to_string.count() == 0) {
+            try self.loadGPTVocabulary("vocab.json");
+        }
+
+        // Create reverse mapping (string -> token ID)
+        var string_to_token_id = std.StringHashMap(u16).init(self.allocator);
+        defer string_to_token_id.deinit();
+
+        var vocab_it = self.gpt_token_to_string.iterator();
+        while (vocab_it.next()) |entry| {
+            try string_to_token_id.put(entry.value_ptr.*, entry.key_ptr.*);
+        }
+
+        // Create a set of token IDs we're interested in
+        var target_token_ids = std.AutoHashMap(u16, *TokenStats).init(self.allocator);
+        defer target_token_ids.deinit();
+
+        // Map candidate tokens to their token IDs
+        var candidates_it = self.candidate_stats.iterator();
+        while (candidates_it.next()) |entry| {
+            const token = entry.key_ptr.*;
+            const stats = entry.value_ptr.*;
+
+            if (string_to_token_id.get(token)) |token_id| {
+                try target_token_ids.put(token_id, stats);
+            }
+        }
+
+        if (self.debug) {
+            std.debug.print("Mapped {d} candidate tokens to GPT token IDs\n", .{target_token_ids.count()});
+        }
+
+        // Process each corpus file
         for (self.document_sampler.corpus_paths, 0..) |corpus_path, file_idx| {
             const file_start_time = std.time.milliTimestamp();
 
@@ -426,6 +487,7 @@ pub const VocabLearner = struct {
                 std.debug.print("  File size: {d:.2} MB\n", .{@as(f64, @floatFromInt(data_size)) / (1024.0 * 1024.0)});
             }
 
+            // Skip header
             if (file_size > 1024) {
                 try file.seekTo(1024);
             }
@@ -434,111 +496,31 @@ pub const VocabLearner = struct {
             var buffer = try self.allocator.alloc(u8, CHUNK_SIZE);
             defer self.allocator.free(buffer);
 
-            // Allocate a covered bitmap for the entire chunk
-            var covered = try self.allocator.alloc(bool, CHUNK_SIZE);
-            defer self.allocator.free(covered);
-
             var bytes_processed: usize = 0;
-            var chunks_processed: usize = 0;
             var last_progress_time = std.time.milliTimestamp();
             const progress_interval_ms = 2000;
 
-            // Read and process chunks
+            // Process file in chunks
             while (true) {
                 const bytes_read = try file.readAll(buffer);
                 if (bytes_read == 0) break;
 
-                // Reset the covered bitmap
-                @memset(covered[0..bytes_read], false);
+                // Process complete token IDs (2 bytes each)
+                const complete_tokens = bytes_read / 2;
 
-                var token_to_stats_map = try self.allocator.alloc(?*TokenStats, token_id);
-                defer self.allocator.free(token_to_stats_map);
-                @memset(token_to_stats_map, null);
+                for (0..complete_tokens) |i| {
+                    const token_offset = i * 2;
+                    const token_id = std.mem.bytesToValue(u16, buffer[token_offset .. token_offset + 2][0..2]);
 
-                // Build a mapping from token ID to stats
-                var map_it = self.candidate_stats.iterator();
-                var map_token_id: u32 = 0;
-                while (map_it.next()) |entry| {
-                    token_to_stats_map[map_token_id] = entry.value_ptr.*;
-                    map_token_id += 1;
-                }
-
-                // Process all matches in one pass
-                var current_state: u32 = 0;
-                for (buffer[0..bytes_read], 0..) |byte, i| {
-                    // Transition to the next state
-                    current_state = candidate_automaton.transitions[current_state][byte];
-
-                    // Check if we have a token match
-                    if (candidate_automaton.info[current_state].token_id != BakaCorasick.NO_TOKEN) {
-                        const matched_token_id = candidate_automaton.info[current_state].token_id;
-                        const matched_token_depth = candidate_automaton.info[current_state].depth;
-
-                        // Check if this match is not covered
-                        var is_covered = false;
-                        const match_start = i + 1 - matched_token_depth;
-                        for (match_start..match_start + matched_token_depth) |j| {
-                            if (covered[j]) {
-                                is_covered = true;
-                                break;
-                            }
-                        }
-
-                        if (!is_covered) {
-                            // Mark positions as covered
-                            for (match_start..match_start + matched_token_depth) |j| {
-                                covered[j] = true;
-                            }
-
-                            // Increment the non-overlapping occurrence count
-                            if (matched_token_id < token_to_stats_map.len and
-                                token_to_stats_map[matched_token_id] != null)
-                            {
-                                token_to_stats_map[matched_token_id].?.n_nonoverlapping_occurrences += 1;
-                            }
-                        }
-                    }
-
-                    // Check for suffix matches too (follow green arcs)
-                    var suffix = candidate_automaton.info[current_state].green;
-                    while (suffix != 0) {
-                        if (candidate_automaton.info[suffix].token_id != BakaCorasick.NO_TOKEN) {
-                            const matched_token_id = candidate_automaton.info[suffix].token_id;
-                            const matched_token_depth = candidate_automaton.info[suffix].depth;
-
-                            // Check if this match is not covered
-                            var is_covered = false;
-                            const match_start = i + 1 - matched_token_depth;
-                            for (match_start..match_start + matched_token_depth) |j| {
-                                if (covered[j]) {
-                                    is_covered = true;
-                                    break;
-                                }
-                            }
-
-                            if (!is_covered) {
-                                // Mark positions as covered
-                                for (match_start..match_start + matched_token_depth) |j| {
-                                    covered[j] = true;
-                                }
-
-                                // Increment the non-overlapping occurrence count
-                                if (matched_token_id < token_to_stats_map.len and
-                                    token_to_stats_map[matched_token_id] != null)
-                                {
-                                    token_to_stats_map[matched_token_id].?.n_nonoverlapping_occurrences += 1;
-                                }
-                            }
-                        }
-                        suffix = candidate_automaton.info[suffix].green;
+                    // If this is a token we're interested in, increment its count
+                    if (target_token_ids.get(token_id)) |stats| {
+                        stats.n_nonoverlapping_occurrences += 1;
                     }
                 }
 
                 bytes_processed += bytes_read;
-                total_bytes_processed += bytes_read;
-                chunks_processed += 1;
 
-                // Report progress based on time interval
+                // Progress reporting
                 const current_time = std.time.milliTimestamp();
                 if (self.debug and current_time - last_progress_time >= progress_interval_ms) {
                     const mb_processed = @as(f64, @floatFromInt(bytes_processed)) / (1024.0 * 1024.0);
@@ -557,10 +539,17 @@ pub const VocabLearner = struct {
             }
         }
 
+        // Print token stats if debugging
+        if (self.debug) {
+            if (self.candidate_stats.get(" professional")) |stats| {
+                std.debug.print("After processing: ' professional' occurrences: {d}\n", .{stats.n_nonoverlapping_occurrences});
+            }
+        }
+
         // Calculate total processing statistics
         const elapsed_sec = @as(f64, @floatFromInt(std.time.milliTimestamp() - start_time)) / 1000.0;
         if (self.debug) {
-            std.debug.print("Completed corpus processing: {d:.2} MB in {d:.2}s\n", .{ @as(f64, @floatFromInt(total_bytes_processed)) / (1024.0 * 1024.0), elapsed_sec });
+            std.debug.print("Completed corpus processing in {d:.2}s\n", .{elapsed_sec});
         }
 
         // Update initial bounds after counting occurrences
@@ -1102,18 +1091,6 @@ pub const VocabLearner = struct {
                     candidate_stats.missed_gain_from_superstring_used_computed_at = self.current_step;
 
                     updated_count += 1;
-
-                    if (self.debug and updated_count <= 5) {
-                        std.debug.print("  Updated missed gain for: '", .{});
-                        for (candidate) |b| {
-                            if (b >= 32 and b < 127) {
-                                std.debug.print("{c}", .{b});
-                            } else {
-                                std.debug.print("\\x{x:0>2}", .{b});
-                            }
-                        }
-                        std.debug.print("' (+{d})\n", .{additional_missed_gain});
-                    }
                 }
             }
 
@@ -1259,7 +1236,7 @@ pub const VocabLearner = struct {
         }
 
         // Process corpus to update token statistics
-        try self.processCorpusForOccurrences();
+        try self.processCorpusWithTokenIDs();
 
         const elapsed_ms = std.time.milliTimestamp() - start_time;
         if (self.debug) {
@@ -1658,7 +1635,7 @@ pub fn main() !void {
     try learner.checkPhase1Initialization();
 
     // Phase 2: Process corpus and calculate token occurrences
-    try learner.processCorpusForOccurrences();
+    try learner.processCorpusWithTokenIDs();
     try learner.checkPhase2CorpusProcessing();
 
     // Phase 3: Build vocabulary through iterative selection
