@@ -112,33 +112,96 @@ pub const DocumentSampler = struct {
             documents.deinit();
         }
 
-        const corpus_size = self.corpus_paths.len;
-        if (corpus_size == 0) return error.EmptyCorpus;
+        // First, build a list of actual files from corpus_paths
+        var all_files = ArrayList([]const u8).init(self.allocator);
+        defer {
+            for (all_files.items) |path| {
+                self.allocator.free(path);
+            }
+            all_files.deinit();
+        }
 
-        // For each document sample requested
-        for (0..count) |i| {
-            _ = i;
+        // Process each corpus path
+        for (self.corpus_paths) |corpus_path| {
+            // Check if path is a directory
+            var is_dir_path = false;
+            {
+                var dir_check = std.fs.cwd().openDir(corpus_path, .{}) catch |err| {
+                    if (err == error.NotDir) {
+                        // It's a file, check if it's a .bin file
+                        if (std.mem.endsWith(u8, corpus_path, ".bin")) {
+                            try all_files.append(try self.allocator.dupe(u8, corpus_path));
+                        }
+                    }
+                    continue;
+                };
+                defer dir_check.close();
+                is_dir_path = true;
+            }
 
+            // If it's a directory, find all .bin files in it
+            if (is_dir_path) {
+                var dir = try std.fs.cwd().openDir(corpus_path, .{ .iterate = true });
+                defer dir.close();
+
+                var iter = dir.iterate();
+                while (try iter.next()) |entry| {
+                    if (entry.kind == .file) {
+                        if (std.mem.endsWith(u8, entry.name, ".bin")) {
+                            // Construct full path
+                            const full_path = try std.fs.path.join(self.allocator, &[_][]const u8{ corpus_path, entry.name });
+                            try all_files.append(full_path);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (all_files.items.len == 0) {
+            if (self.debug) {
+                std.debug.print("Warning: No .bin files found in corpus paths\n", .{});
+            }
+            return error.NoFilesFound;
+        }
+
+        if (self.debug) {
+            std.debug.print("Found {d} .bin files for sampling\n", .{all_files.items.len});
+        }
+
+        // Now sample from the files list
+        for (0..count) |_| {
             // Choose a random file
-            const file_idx = self.prng.uintLessThan(usize, corpus_size);
-            const file = try std.fs.cwd().openFile(self.corpus_paths[file_idx], .{});
+            const file_idx = self.prng.uintLessThan(usize, all_files.items.len);
+            const file_path = all_files.items[file_idx];
+
+            const file = try std.fs.cwd().openFile(file_path, .{});
             defer file.close();
 
             const file_size = try file.getEndPos();
-            const content_size = file_size - @min(file_size, 1024);
 
-            const max_chunk_size = 1024 * 1024;
+            // Skip header
+            const header_size = 1024;
+            const content_size = file_size - @min(file_size, header_size);
+
+            if (content_size == 0) continue;
+
+            const max_chunk_size = 1024 * 1024; // 1MB chunks for sampling
             const chunk_size = @min(max_chunk_size, content_size);
 
             const max_offset = if (content_size > chunk_size) content_size - chunk_size else 0;
             const offset = if (max_offset > 0) self.prng.uintLessThan(usize, max_offset) else 0;
 
-            try file.seekTo(1024 + offset); // Skip header + random offset
+            try file.seekTo(header_size + offset);
 
             var content = try self.allocator.alloc(u8, chunk_size);
             errdefer self.allocator.free(content);
 
             const bytes_read = try file.readAll(content);
+            if (bytes_read == 0) {
+                self.allocator.free(content);
+                continue;
+            }
+
             if (bytes_read < chunk_size) {
                 const actual_content = try self.allocator.realloc(content, bytes_read);
                 content = actual_content;
@@ -147,7 +210,34 @@ pub const DocumentSampler = struct {
             try documents.append(content);
         }
 
+        if (self.debug) {
+            var total_size: usize = 0;
+            var empty_count: usize = 0;
+            for (documents.items) |doc| {
+                total_size += doc.len;
+                if (doc.len == 0) empty_count += 1;
+            }
+
+            std.debug.print("Sampled {d} documents ({d} empty), total size: {d} bytes\n", .{ documents.items.len, empty_count, total_size });
+        }
+
         return documents;
+    }
+
+    // Helper function to check if content is valid text
+    fn containsValidText(content: []const u8) bool {
+        if (content.len == 0) return false;
+
+        // Look for printable ASCII as a simple heuristic
+        var printable_count: usize = 0;
+        for (content) |byte| {
+            if (byte >= 32 and byte < 127) {
+                printable_count += 1;
+            }
+        }
+
+        // If at least 30% is printable text, consider it valid
+        return printable_count >= content.len / 3;
     }
 
     pub fn loadDocument(self: *DocumentSampler, path: []const u8) ![]const u8 {
@@ -880,98 +970,51 @@ pub const VocabLearner = struct {
 
     // Calculate initial bounds for candidate tokens
     fn calculateInitialBounds(self: *VocabLearner) !void {
-        const start_time = std.time.milliTimestamp();
+        var token_it = self.candidate_stats.iterator();
+        while (token_it.next()) |entry| {
+            const token_str = entry.key_ptr.*;
+            var stats = entry.value_ptr.*;
 
-        if (self.debug) {
-            std.debug.print("Calculating initial bounds for candidate tokens...\n", .{});
-        }
+            if (self.vocab_token_ids.contains(token_str)) continue;
 
-        var candidates_processed: usize = 0;
-        const total_candidates = self.candidate_stats.count();
-
-        var it = self.candidate_stats.iterator();
-        while (it.next()) |entry| {
-            const token = entry.key_ptr.*;
-            const stats = entry.value_ptr.*;
-
-            // Calculate token length benefit (length - 1) * occurrences
-            const token_length = token.len;
+            const token_length = token_str.len;
             const occurrences = stats.n_nonoverlapping_occurrences;
+            stats.max_gain_for_nonoverlapping_occurrences = @as(i32, @intCast(occurrences)) *
+                @as(i32, @intCast(token_length - 1));
 
-            // Only tokens of length >= 2 provide compression benefit
-            if (token_length >= 2) {
-                const max_gain = @as(i32, @intCast(token_length - 1)) * @as(i32, @intCast(occurrences));
-                stats.max_gain_for_nonoverlapping_occurrences = max_gain;
-            } else {
-                stats.max_gain_for_nonoverlapping_occurrences = 0;
-            }
-
-            // Set calculation step
-            stats.max_gain_for_nonoverlapping_occurrences_computed_at = self.current_step;
-            stats.missed_gain_from_superstring_used_computed_at = self.current_step;
-
-            // Initialize other fields
-            stats.est_n_uses = 0;
-            // Reset missed gain
             stats.missed_gain_from_superstring_used = 0;
 
-            // For each token in the vocabulary, check if our candidate is a substring
+            // Look for vocabulary tokens that contain this candidate as substring
             for (self.vocab.items) |vocab_token| {
-                // Skip single-byte tokens and tokens shorter than the candidate
-                if (vocab_token.len <= 1 or vocab_token.len < token_length) continue;
+                if (vocab_token.len <= 1 or vocab_token.len < token_str.len) continue;
 
-                // Check if candidate is a substring of the vocabulary token
-                if (std.mem.indexOf(u8, vocab_token, token) != null) {
-                    // Count how many times the candidate appears in the vocab token
-                    var count: u32 = 0;
-                    var pos: usize = 0;
+                var count: u32 = 0;
+                var pos: usize = 0;
 
-                    while (pos <= vocab_token.len - token.len) {
-                        const found_pos = std.mem.indexOfPos(u8, vocab_token, pos, token);
-                        if (found_pos == null) break;
-                        count += 1;
-                        pos = found_pos.? + token.len;
+                while (pos <= vocab_token.len - token_str.len) {
+                    const found_pos = std.mem.indexOfPos(u8, vocab_token, pos, token_str);
+                    if (found_pos == null) break;
+                    count += 1;
+                    pos = found_pos.? + token_str.len;
+                }
+
+                if (count > 0) {
+                    var vocab_token_actual_uses: u32 = 0;
+
+                    if (self.candidate_stats.get(vocab_token)) |vocab_stats| {
+                        vocab_token_actual_uses = vocab_stats.n_nonoverlapping_occurrences;
                     }
 
-                    //TODO:
-                    // Estimate how many times the vocab token will be used
-                    const vocab_token_est_uses = @min(100, occurrences / 10);
-
-                    // Calculate missed gain: for each time the vocab token is used,
-                    // the candidate token will miss (count * (token_length - 1)) bytes of compression
-                    const missed = @as(i32, @intCast(count * vocab_token_est_uses)) *
-                        @as(i32, @intCast(token_length - 1));
+                    const missed = @as(i32, @intCast(count * vocab_token_actual_uses)) *
+                        @as(i32, @intCast(token_str.len - 1));
 
                     stats.missed_gain_from_superstring_used += missed;
-
-                    if (self.debug) {
-                        std.debug.print("  Token '", .{});
-                        for (token) |b| {
-                            if (b >= 32 and b < 127) {
-                                std.debug.print("{c}", .{b});
-                            } else {
-                                std.debug.print("\\x{x:0>2}", .{b});
-                            }
-                        }
-                        std.debug.print("' is substring of '", .{});
-                        for (vocab_token) |b| {
-                            if (b >= 32 and b < 127) {
-                                std.debug.print("{c}", .{b});
-                            } else {
-                                std.debug.print("\\x{x:0>2}", .{b});
-                            }
-                        }
-                        std.debug.print("' (missed gain: {d})\n", .{missed});
-                    }
                 }
             }
 
-            candidates_processed += 1;
-        }
-
-        const elapsed_sec = @as(f64, @floatFromInt(std.time.milliTimestamp() - start_time)) / 1000.0;
-        if (self.debug) {
-            std.debug.print("Calculated initial bounds for {d} tokens in {d:.2}s\n", .{ total_candidates, elapsed_sec });
+            // Update timestamps
+            stats.max_gain_for_nonoverlapping_occurrences_computed_at = self.current_step;
+            stats.missed_gain_from_superstring_used_computed_at = self.current_step;
         }
     }
 
@@ -1004,6 +1047,9 @@ pub const VocabLearner = struct {
             std.debug.print("Starting vocabulary building process...\n", .{});
         }
 
+        var consecutive_zero_adds: usize = 0; // Explicitly typed as usize
+        const max_consecutive_zero_adds: usize = 3; // Also explicitly typed
+
         while (self.vocab.items.len < self.max_vocab_size) {
             const iteration_start = std.time.milliTimestamp();
             self.current_step += 1;
@@ -1025,15 +1071,90 @@ pub const VocabLearner = struct {
                 sample_docs.deinit();
             }
 
+            // Validate document sample
+            var empty_docs: usize = 0;
+            for (sample_docs.items) |doc| {
+                if (doc.len == 0) empty_docs += 1;
+            }
+
+            if (empty_docs == sample_docs.items.len) {
+                if (self.debug) {
+                    std.debug.print("Warning: All sampled documents are empty!\n", .{});
+                }
+            }
+
             // 3. Evaluate candidates on the sampled documents
-            try self.evaluateCandidatesOnDocuments(&top_candidates, sample_docs.items);
+            const eval_start = std.time.milliTimestamp();
+            try self.evaluateCandidatesOnDocumentsDP(&top_candidates, sample_docs.items);
+            const eval_time = std.time.milliTimestamp() - eval_start;
+
+            // Check if evaluation was suspiciously quick (less than 10ms for 10K docs)
+            if (eval_time < 10 and self.debug) {
+                std.debug.print("Warning: Evaluation completed very quickly ({d}ms). Possible issue with processing.\n", .{eval_time});
+            }
+
+            // Check the candidates have actual uses
+            var candidates_with_uses: usize = 0;
+            for (top_candidates.items) |stats| {
+                if (stats.est_n_uses > 0) candidates_with_uses += 1;
+            }
+
+            if (candidates_with_uses == 0) {
+                if (self.debug) {
+                    std.debug.print("Warning: No candidates have non-zero uses!\n", .{});
+                }
+
+                consecutive_zero_adds += 1;
+
+                // If we've had multiple iterations with no useful candidates, take drastic action
+                if (consecutive_zero_adds >= max_consecutive_zero_adds) {
+                    if (self.debug) {
+                        std.debug.print("Detected loop condition: {d} consecutive iterations with no useful tokens.\n", .{consecutive_zero_adds});
+                        std.debug.print("Performing full corpus scan to recalculate statistics...\n", .{});
+                    }
+
+                    // Perform a full corpus scan to refresh statistics
+                    try self.performFullCorpusScan();
+
+                    // After the scan, mark tokens with consistently zero uses as "bad candidates"
+                    // by artificially reducing their value bounds
+                    var it = self.candidate_stats.iterator();
+                    var updated_count: usize = 0;
+                    while (it.next()) |entry| {
+                        const stats = entry.value_ptr.*;
+                        if (stats.est_n_uses == 0) {
+                            // Drastically reduce its value to avoid selection
+                            stats.max_gain_for_nonoverlapping_occurrences = 0;
+                            stats.missed_gain_from_superstring_used = 10000; // Large penalty
+                            updated_count += 1;
+                        }
+                    }
+
+                    if (self.debug and updated_count > 0) {
+                        std.debug.print("Penalized {d} candidates with zero uses to break selection loop.\n", .{updated_count});
+                    }
+
+                    consecutive_zero_adds = 0; // Reset counter
+                }
+            } else {
+                consecutive_zero_adds = 0; // Reset counter when we find useful candidates
+            }
 
             // 4. Select tokens for addition (nearly-non-interdependent batch)
             const tokens_to_add = try self.selectNearlyNonInterdependentBatch(&top_candidates, self.batch_size);
             defer tokens_to_add.deinit();
 
             // 5. Add selected tokens to vocabulary
+            const vocab_size_before = self.vocab.items.len;
             try self.addTokensToVocabulary(&tokens_to_add);
+            const tokens_actually_added = self.vocab.items.len - vocab_size_before;
+
+            // If no tokens were added, but we had tokens to add, there might be an issue
+            if (tokens_actually_added == 0 and tokens_to_add.items.len > 0) {
+                if (self.debug) {
+                    std.debug.print("Note: All {d} selected tokens were skipped due to zero uses.\n", .{tokens_to_add.items.len});
+                }
+            }
 
             // 6. Periodically remove random tokens
             if (self.current_step % 500 == 0 and self.vocab.items.len > 300) {
@@ -1051,11 +1172,17 @@ pub const VocabLearner = struct {
                 std.debug.print("Iteration {d} completed in {d}ms. Vocabulary size: {d}\n", .{ self.current_step, iteration_elapsed, self.vocab.items.len });
             }
 
-            if (tokens_to_add.items.len == 0) {
-                if (self.debug) {
-                    std.debug.print("No tokens added in this iteration. Exiting.\n", .{});
+            // Exit conditions
+            if (tokens_actually_added == 0) {
+                consecutive_zero_adds += 1;
+                if (consecutive_zero_adds >= max_consecutive_zero_adds * 2) {
+                    if (self.debug) {
+                        std.debug.print("No tokens added for {d} consecutive iterations. Exiting.\n", .{consecutive_zero_adds});
+                    }
+                    break;
                 }
-                break;
+            } else {
+                consecutive_zero_adds = 0;
             }
         }
 
@@ -1371,9 +1498,27 @@ pub const VocabLearner = struct {
         }
 
         var tokens_added: usize = 0;
+        var tokens_skipped: usize = 0;
 
         for (sorted_tokens.items) |stats| {
             const token = stats.token;
+
+            // Skip tokens with zero uses - THIS IS THE KEY CHANGE
+            if (stats.est_n_uses == 0) {
+                if (self.debug) {
+                    std.debug.print("  Skipped token: ", .{});
+                    for (token) |byte| {
+                        if (byte >= 32 and byte < 127) {
+                            std.debug.print("{c}", .{byte});
+                        } else {
+                            std.debug.print("\\x{x:0>2}", .{byte});
+                        }
+                    }
+                    std.debug.print(" (length: {d}, uses: 0)\n", .{token.len});
+                }
+                tokens_skipped += 1;
+                continue; // Skip this token completely
+            }
 
             const token_copy = try self.allocator.dupe(u8, token);
             errdefer self.allocator.free(token_copy);
@@ -1447,6 +1592,9 @@ pub const VocabLearner = struct {
         const elapsed_ms = std.time.milliTimestamp() - start_time;
         if (self.debug) {
             std.debug.print("Added {d} tokens to vocabulary in {d}ms. New vocabulary size: {d}\n", .{ tokens_added, elapsed_ms, self.vocab.items.len });
+            if (tokens_skipped > 0) {
+                std.debug.print("  (Skipped {d} tokens with zero uses)\n", .{tokens_skipped});
+            }
         }
     }
 
@@ -1928,501 +2076,6 @@ pub const VocabLearner = struct {
         }
 
         return learner;
-    }
-
-    fn evaluateCandidatesOnDocumentsDP(self: *VocabLearner, candidates: *const ArrayList(*TokenStats), documents: []const []const u8) !void {
-        const start_time = std.time.milliTimestamp();
-
-        if (self.debug) {
-            std.debug.print("Evaluating {d} candidates on {d} documents using parallelized DP...\n", .{ candidates.items.len, documents.len });
-        }
-
-        // Reset estimated uses for all candidates
-        for (candidates.items) |stats| {
-            stats.est_n_uses = 0;
-        }
-
-        // Early-stopping thresholds (tokens with more savings than this can stop early)
-        const early_stop_threshold: u32 = 500;
-        var tokens_reached_threshold = std.AutoHashMap(usize, bool).init(self.allocator);
-        defer tokens_reached_threshold.deinit();
-
-        // Sample a smaller number of documents (we don't need to process all 10k)
-        const sample_size = @min(1000, documents.len); // Using 200 documents instead of 1000
-        const sample_docs = try self.allocator.alloc([]const u8, sample_size);
-        defer self.allocator.free(sample_docs);
-
-        // Select sample documents, prioritizing smaller ones for faster processing
-        var doc_sizes = try self.allocator.alloc(DocInfo, documents.len);
-        defer self.allocator.free(doc_sizes);
-
-        for (documents, 0..) |doc, i| {
-            doc_sizes[i] = DocInfo{ .idx = i, .size = doc.len };
-        }
-
-        // Sort documents by size (ascending)
-        std.sort.block(DocInfo, doc_sizes, {}, struct {
-            fn lessThan(_: void, a: DocInfo, b: DocInfo) bool {
-                // Skip empty documents
-                if (a.size == 0) return false;
-                if (b.size == 0) return true;
-                return a.size < b.size;
-            }
-        }.lessThan);
-
-        // Choose smaller documents with a preference, but include some larger ones
-        const smaller_docs_count = sample_size / 5 * 4; // Calculate 80% of the sample, avoid overflow
-
-        for (0..sample_size) |i| {
-            // Use 80% smaller documents, 20% random documents
-            var doc_idx: usize = 0;
-
-            if (i < smaller_docs_count) {
-                // For the first 80%, use smaller documents
-                if (i < doc_sizes.len) {
-                    doc_idx = doc_sizes[i].idx;
-                } else {
-                    doc_idx = i % documents.len;
-                }
-            } else {
-                // For the remaining 20%, use some larger documents
-                if (documents.len > 0) {
-                    // Safely take from the end of the array
-                    const offset = i % documents.len;
-                    if (offset < documents.len) {
-                        doc_idx = doc_sizes[documents.len - 1 - offset].idx;
-                    } else {
-                        doc_idx = i % documents.len;
-                    }
-                } else {
-                    doc_idx = 0;
-                }
-            }
-
-            sample_docs[i] = documents[doc_idx];
-        }
-
-        // Track documents processed and candidates with impact
-        var docs_processed: usize = 0;
-        var candidates_with_impact: usize = 0;
-
-        // 1. Create a single combined automaton (vocab + candidates) - ONLY ONCE
-        if (self.debug) {
-            std.debug.print("Creating combined automaton with vocabulary and candidate tokens...\n", .{});
-        }
-
-        var combined_automaton = try BakaCorasick.init(self.allocator);
-        defer deinitBakaCorasick(&combined_automaton, self.allocator);
-
-        // Add vocabulary tokens
-        for (self.vocab.items, 0..) |token, i| {
-            try combined_automaton.insert(token, @intCast(i));
-        }
-
-        // Add candidate tokens with flag
-        for (candidates.items, 0..) |stats, i| {
-            try combined_automaton.insert(stats.token, CANDIDATE_TOKEN_FLAG | @as(u32, @intCast(i)));
-        }
-
-        try combined_automaton.computeSuffixLinks();
-
-        if (self.debug) {
-            std.debug.print("Combined automaton created with {d} states\n", .{combined_automaton.len});
-        }
-
-        // Parallelize document processing using thread pool
-        // Determine number of threads based on CPU cores
-        const num_threads = 10;
-
-        if (self.debug) {
-            std.debug.print("Using {d} threads for parallel processing\n", .{num_threads});
-        }
-
-        // Process documents in batches
-        const batch_size = @min(num_threads * 2, sample_size);
-        var batch_start: usize = 0;
-
-        // Create a mutex for thread-safe updates to the token statistics
-        var mutex = std.Thread.Mutex{};
-
-        // Track global stopping condition
-        var all_tokens_reached_threshold = false;
-
-        while (batch_start < sample_size and !all_tokens_reached_threshold) {
-            const batch_end = @min(batch_start + batch_size, sample_size);
-            const current_batch_size = batch_end - batch_start;
-
-            // Prepare thread contexts
-            var threads = try self.allocator.alloc(std.Thread, current_batch_size);
-            defer self.allocator.free(threads);
-
-            var results = try self.allocator.alloc(std.AutoHashMap(usize, u32), current_batch_size);
-            defer self.allocator.free(results);
-
-            // Initialize result maps
-            for (0..current_batch_size) |i| {
-                results[i] = std.AutoHashMap(usize, u32).init(self.allocator);
-            }
-            defer {
-                for (0..current_batch_size) |i| {
-                    results[i].deinit();
-                }
-            }
-
-            // Thread worker function
-            const ThreadContext = struct {
-                learner: *VocabLearner,
-                candidates: *const ArrayList(*TokenStats),
-                document: []const u8,
-                doc_idx: usize,
-                automaton: *BakaCorasick,
-                result_map: *std.AutoHashMap(usize, u32),
-                mutex: *std.Thread.Mutex,
-                tokens_reached_threshold: *std.AutoHashMap(usize, bool),
-                early_stop_threshold: u32,
-            };
-
-            const workerFn = struct {
-                fn processDocument(ctx: ThreadContext) void {
-                    if (ctx.document.len == 0) return;
-
-                    // For very large documents, only process the first part
-                    const max_doc_size = 30000; // 30KB is enough for a representative sample
-                    const doc_size = @min(ctx.document.len, max_doc_size);
-                    const doc = ctx.document[0..doc_size];
-
-                    // 1. Find all token positions in a single scan
-                    var token_end_positions = std.AutoHashMap(usize, std.ArrayList(TokenMatch)).init(ctx.learner.allocator);
-                    defer {
-                        var it = token_end_positions.iterator();
-                        while (it.next()) |entry| {
-                            entry.value_ptr.*.deinit();
-                        }
-                        token_end_positions.deinit();
-                    }
-
-                    // Also track which candidates appear in this document and their positions
-                    var candidate_positions = ctx.learner.allocator.alloc(std.ArrayList(usize), ctx.candidates.items.len) catch return;
-                    defer {
-                        for (candidate_positions) |*pos_list| {
-                            pos_list.deinit();
-                        }
-                        ctx.learner.allocator.free(candidate_positions);
-                    }
-
-                    for (0..ctx.candidates.items.len) |i| {
-                        candidate_positions[i] = std.ArrayList(usize).init(ctx.learner.allocator);
-                    }
-
-                    // Scan document with combined automaton
-                    var current_state: u32 = 0;
-                    for (doc, 0..) |byte, i| {
-                        current_state = ctx.automaton.transitions[current_state][byte];
-
-                        if (ctx.automaton.info[current_state].token_id != BakaCorasick.NO_TOKEN) {
-                            const token_id = ctx.automaton.info[current_state].token_id;
-                            const token_len = ctx.automaton.info[current_state].depth;
-                            const end_pos = i + 1;
-
-                            const is_candidate = (token_id & CANDIDATE_TOKEN_FLAG) != 0;
-                            const actual_id = token_id & ~CANDIDATE_TOKEN_FLAG;
-
-                            // Record this match
-                            var matches = token_end_positions.get(end_pos);
-                            if (matches == null) {
-                                token_end_positions.put(end_pos, std.ArrayList(TokenMatch).init(ctx.learner.allocator)) catch continue;
-                                matches = token_end_positions.get(end_pos);
-                            }
-
-                            matches.?.append(TokenMatch{
-                                .len = token_len,
-                                .is_candidate = is_candidate,
-                                .id = actual_id,
-                            }) catch continue;
-
-                            // If it's a candidate, also track its position
-                            if (is_candidate and actual_id < candidate_positions.len) {
-                                // Check if this token has already reached threshold
-                                ctx.mutex.lock();
-                                const reached_threshold = ctx.tokens_reached_threshold.get(actual_id) != null;
-                                ctx.mutex.unlock();
-
-                                if (!reached_threshold) {
-                                    candidate_positions[actual_id].append(end_pos) catch continue;
-                                }
-                            }
-                        }
-
-                        var suffix = ctx.automaton.info[current_state].green;
-                        while (suffix != 0) {
-                            if (ctx.automaton.info[suffix].token_id != BakaCorasick.NO_TOKEN) {
-                                const token_id = ctx.automaton.info[suffix].token_id;
-                                const token_len = ctx.automaton.info[suffix].depth;
-                                const end_pos = i + 1;
-
-                                const is_candidate = (token_id & CANDIDATE_TOKEN_FLAG) != 0;
-                                const actual_id = token_id & ~CANDIDATE_TOKEN_FLAG;
-
-                                // Record this match
-                                var matches = token_end_positions.get(end_pos);
-                                if (matches == null) {
-                                    token_end_positions.put(end_pos, std.ArrayList(TokenMatch).init(ctx.learner.allocator)) catch continue;
-                                    matches = token_end_positions.get(end_pos);
-                                }
-
-                                matches.?.append(TokenMatch{
-                                    .len = token_len,
-                                    .is_candidate = is_candidate,
-                                    .id = actual_id,
-                                }) catch continue;
-
-                                // If it's a candidate, also track its position
-                                if (is_candidate and actual_id < candidate_positions.len) {
-                                    // Check if this token has already reached threshold
-                                    ctx.mutex.lock();
-                                    const reached_threshold = ctx.tokens_reached_threshold.get(actual_id) != null;
-                                    ctx.mutex.unlock();
-
-                                    if (!reached_threshold) {
-                                        candidate_positions[actual_id].append(end_pos) catch continue;
-                                    }
-                                }
-                            }
-                            suffix = ctx.automaton.info[suffix].green;
-                        }
-                    }
-
-                    // Find which candidates appear in this document
-                    var candidates_in_doc = std.ArrayList(usize).init(ctx.learner.allocator);
-                    defer candidates_in_doc.deinit();
-
-                    for (0..ctx.candidates.items.len) |i| {
-                        // Check if this token has already reached threshold
-                        ctx.mutex.lock();
-                        const reached_threshold = ctx.tokens_reached_threshold.get(i) != null;
-                        ctx.mutex.unlock();
-
-                        if (!reached_threshold and candidate_positions[i].items.len > 0) {
-                            candidates_in_doc.append(i) catch continue;
-                        }
-                    }
-
-                    if (candidates_in_doc.items.len == 0) return;
-
-                    // 2. Solve base DP problem with current vocabulary
-                    var costs = ctx.learner.allocator.alloc(u32, doc.len + 1) catch return;
-                    defer ctx.learner.allocator.free(costs);
-
-                    var masks = ctx.learner.allocator.alloc(u64, doc.len + 1) catch return;
-                    defer ctx.learner.allocator.free(masks);
-
-                    // Initialize arrays
-                    @memset(costs, std.math.maxInt(u32));
-                    costs[0] = 0;
-                    @memset(masks, 0);
-
-                    // Solve base DP
-                    for (1..doc.len + 1) |i| {
-                        // Always consider 1-byte token (implicit)
-                        if (i >= 1 and costs[i - 1] + 1 < costs[i]) {
-                            costs[i] = costs[i - 1] + 1;
-                        }
-
-                        // Consider vocabulary tokens ending at position i
-                        if (token_end_positions.get(i)) |token_matches| {
-                            for (token_matches.items) |match| {
-                                // Skip candidate tokens for base solution
-                                if (match.is_candidate) continue;
-
-                                const start = i - match.len;
-                                if (costs[start] + 1 < costs[i]) {
-                                    costs[i] = costs[start] + 1;
-
-                                    // Set bit for this token length
-                                    if (match.len >= 2 and match.len <= 65) {
-                                        masks[i] |= (@as(u64, 1) << @intCast(match.len - 2));
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Store base token count
-                    const base_token_count = costs[doc.len];
-
-                    // 3. For each candidate, recalculate from where it first appears
-                    for (candidates_in_doc.items) |candidate_idx| {
-                        // Check again if this token has already reached threshold
-                        ctx.mutex.lock();
-                        const reached_threshold = ctx.tokens_reached_threshold.get(candidate_idx) != null;
-                        ctx.mutex.unlock();
-
-                        if (reached_threshold) continue;
-
-                        const token = ctx.candidates.items[candidate_idx].token;
-                        const token_positions = candidate_positions[candidate_idx].items;
-
-                        if (token_positions.len == 0) continue;
-
-                        // Copy costs array
-                        var candidate_costs = ctx.learner.allocator.dupe(u32, costs) catch continue;
-                        defer ctx.learner.allocator.free(candidate_costs);
-
-                        // Find first position
-                        var first_pos = doc.len;
-                        for (token_positions) |pos| {
-                            if (pos < first_pos) {
-                                first_pos = pos;
-                            }
-                        }
-
-                        // Recalculate from first position
-                        for (first_pos..doc.len + 1) |i| {
-                            // Check if this position is end of candidate token
-                            var is_token_end = false;
-                            for (token_positions) |pos| {
-                                if (pos == i) {
-                                    is_token_end = true;
-                                    break;
-                                }
-                            }
-
-                            if (is_token_end) {
-                                // Consider using candidate token
-                                const start = i - token.len;
-                                if (start < candidate_costs.len and
-                                    candidate_costs[start] + 1 < candidate_costs[i])
-                                {
-                                    candidate_costs[i] = candidate_costs[start] + 1;
-                                }
-                            }
-
-                            // Process existing tokens using bitmasks
-                            const mask = masks[i];
-                            const cnt = @popCount(mask);
-
-                            if (cnt > 0) {
-                                var temp_mask = mask;
-                                for (0..cnt) |_| {
-                                    const tz = @ctz(temp_mask);
-                                    const lookback_amt = tz + 2;
-
-                                    if (i >= lookback_amt) {
-                                        const start = i - lookback_amt;
-                                        if (candidate_costs[start] + 1 < candidate_costs[i]) {
-                                            candidate_costs[i] = candidate_costs[start] + 1;
-                                        }
-                                    }
-
-                                    // More efficient bit clearing as suggested by sasuke
-                                    temp_mask &= temp_mask - 1;
-                                }
-                            }
-
-                            // Always consider 1-byte token
-                            if (i >= 1 and candidate_costs[i - 1] + 1 < candidate_costs[i]) {
-                                candidate_costs[i] = candidate_costs[i - 1] + 1;
-                            }
-                        }
-
-                        // Calculate tokens saved
-                        const candidate_token_count = candidate_costs[doc.len];
-
-                        if (base_token_count > candidate_token_count) {
-                            const tokens_saved = base_token_count - candidate_token_count;
-
-                            // Store result in thread-local hashmap
-                            ctx.result_map.put(candidate_idx, @intCast(tokens_saved)) catch continue;
-
-                            // Check for early stopping threshold
-                            if (tokens_saved >= ctx.early_stop_threshold) {
-                                ctx.mutex.lock();
-                                ctx.tokens_reached_threshold.put(candidate_idx, true) catch {};
-                                ctx.mutex.unlock();
-                            }
-                        }
-                    }
-                }
-            }.processDocument;
-
-            // Start worker threads
-            for (0..current_batch_size) |i| {
-                const thread_doc_idx = batch_start + i;
-                const document = sample_docs[thread_doc_idx];
-
-                const thread_context = ThreadContext{
-                    .learner = self,
-                    .candidates = candidates,
-                    .document = document,
-                    .doc_idx = thread_doc_idx,
-                    .automaton = &combined_automaton,
-                    .result_map = &results[i],
-                    .mutex = &mutex,
-                    .tokens_reached_threshold = &tokens_reached_threshold,
-                    .early_stop_threshold = early_stop_threshold,
-                };
-
-                threads[i] = try std.Thread.spawn(.{}, workerFn, .{thread_context});
-            }
-
-            // Wait for worker threads to complete
-            for (0..current_batch_size) |i| {
-                threads[i].join();
-            }
-
-            // Update global stats from thread results
-            var batch_docs_processed: usize = 0;
-
-            for (0..current_batch_size) |i| {
-                var thread_result = &results[i];
-
-                if (thread_result.count() > 0) {
-                    batch_docs_processed += 1;
-
-                    var it = thread_result.iterator();
-                    while (it.next()) |entry| {
-                        const candidate_idx = entry.key_ptr.*;
-                        const tokens_saved = entry.value_ptr.*;
-
-                        mutex.lock();
-                        candidates.items[candidate_idx].est_n_uses += tokens_saved;
-                        mutex.unlock();
-
-                        candidates_with_impact += 1;
-                    }
-                }
-            }
-
-            docs_processed += batch_docs_processed;
-
-            // Check if all tokens have reached threshold
-            mutex.lock();
-            all_tokens_reached_threshold = tokens_reached_threshold.count() == candidates.items.len;
-            mutex.unlock();
-
-            if (all_tokens_reached_threshold and self.debug) {
-                std.debug.print("  All tokens reached early stopping threshold\n", .{});
-            }
-
-            batch_start = batch_end;
-        }
-
-        // Scale results to match the sample size
-        const scale_factor = if (docs_processed > 0)
-            @as(f32, @floatFromInt(sample_size)) / @as(f32, @floatFromInt(docs_processed))
-        else
-            1.0;
-
-        if (scale_factor != 1.0) {
-            for (candidates.items) |stats| {
-                stats.est_n_uses = @intCast(@as(u32, @intFromFloat(@as(f32, @floatFromInt(stats.est_n_uses)) * scale_factor)));
-            }
-        }
-
-        const elapsed_ms = std.time.milliTimestamp() - start_time;
-        if (self.debug) {
-            std.debug.print("Evaluated {d} documents with DP, {d} candidates had impact. Completed in {d}ms\n", .{ docs_processed, candidates_with_impact, elapsed_ms });
-        }
     }
 };
 
