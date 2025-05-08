@@ -463,7 +463,7 @@ pub const VocabLearner = struct {
         }
     }
 
-    pub fn processCorpusWithRawText(self: *VocabLearner) !void {
+    pub fn processCorpus(self: *VocabLearner) !void {
         const start_time = std.time.milliTimestamp();
 
         if (self.debug) {
@@ -522,7 +522,6 @@ pub const VocabLearner = struct {
             std.debug.print("Automaton built with {d} states\n", .{combined_automaton.len});
         }
 
-        // Thread context for parallel file processing
         const ThreadContext = struct {
             learner: *VocabLearner,
             corpus_path: []const u8,
@@ -677,19 +676,31 @@ pub const VocabLearner = struct {
                 var token_counts = std.AutoHashMap(u32, u32).init(ctx.learner.allocator);
                 defer token_counts.deinit();
 
+                // Keep track of used positions in the text
+                var used_positions = ctx.learner.allocator.alloc(bool, text.len) catch return;
+                defer ctx.learner.allocator.free(used_positions);
+                @memset(used_positions, false);
+
+                // First pass: collect best matches at each position
+                var position_matches = ctx.learner.allocator.alloc(?struct { token_id: u32, len: usize }, text.len) catch return;
+                defer ctx.learner.allocator.free(position_matches);
+                for (0..position_matches.len) |i| {
+                    position_matches[i] = null;
+                }
+
                 // Scan text with the automaton
                 var current_state: u32 = 0;
-                for (text) |byte| {
+                for (text, 0..) |byte, pos| {
                     current_state = ctx.automaton.transitions[current_state][byte];
 
+                    // Check if this state represents a match
                     if (ctx.automaton.info[current_state].token_id != BakaCorasick.NO_TOKEN) {
                         const token_id = ctx.automaton.info[current_state].token_id;
+                        const token_len = ctx.automaton.info[current_state].depth;
 
-                        // Count this match
-                        if (token_counts.getPtr(token_id)) |count_ptr| {
-                            count_ptr.* += 1;
-                        } else {
-                            token_counts.put(token_id, 1) catch continue;
+                        // Store this match if it's longer than existing match at this end position
+                        if (position_matches[pos] == null or position_matches[pos].?.len < token_len) {
+                            position_matches[pos] = .{ .token_id = token_id, .len = token_len };
                         }
                     }
 
@@ -698,15 +709,44 @@ pub const VocabLearner = struct {
                     while (suffix != 0) {
                         if (ctx.automaton.info[suffix].token_id != BakaCorasick.NO_TOKEN) {
                             const token_id = ctx.automaton.info[suffix].token_id;
+                            const token_len = ctx.automaton.info[suffix].depth;
 
-                            // Count this match too
-                            if (token_counts.getPtr(token_id)) |count_ptr| {
-                                count_ptr.* += 1;
-                            } else {
-                                token_counts.put(token_id, 1) catch continue;
+                            // Store this match if it's longer than existing match at this end position
+                            if (position_matches[pos] == null or position_matches[pos].?.len < token_len) {
+                                position_matches[pos] = .{ .token_id = token_id, .len = token_len };
                             }
                         }
                         suffix = ctx.automaton.info[suffix].green;
+                    }
+                }
+
+                // Second pass: process matches in order of end position (which is naturally the case)
+                for (position_matches, 0..) |match_opt, pos| {
+                    if (match_opt) |match| {
+                        const start_pos = pos + 1 - match.len;
+
+                        // Check if any position in this match is already used
+                        var is_valid = true;
+                        for (start_pos..pos + 1) |i| {
+                            if (used_positions[i]) {
+                                is_valid = false;
+                                break;
+                            }
+                        }
+
+                        if (is_valid) {
+                            // Count this match
+                            if (token_counts.getPtr(match.token_id)) |count_ptr| {
+                                count_ptr.* += 1;
+                            } else {
+                                token_counts.put(match.token_id, 1) catch continue;
+                            }
+
+                            // Mark positions as used
+                            for (start_pos..pos + 1) |i| {
+                                used_positions[i] = true;
+                            }
+                        }
                     }
                 }
 
@@ -1518,7 +1558,7 @@ pub const VocabLearner = struct {
         }
 
         // Process corpus to update token statistics
-        try self.processCorpusWithRawText();
+        try self.processCorpus();
 
         const elapsed_ms = std.time.milliTimestamp() - start_time;
         if (self.debug) {
@@ -2405,14 +2445,14 @@ pub fn main() !void {
 
     const debug = true;
 
-    var learner = try VocabLearner.init(allocator, tokenset_path, corpus_paths, 500, debug);
+    var learner = try VocabLearner.init(allocator, tokenset_path, corpus_paths, 2000, debug);
     defer learner.deinit();
 
     // check if everything initialized properly
     try learner.checkPhase1Initialization();
 
     // Phase 2: Process corpus and calculate token occurrences
-    try learner.processCorpusWithRawText();
+    try learner.processCorpus();
     try learner.checkPhase2CorpusProcessing();
 
     // Phase 3: Build vocabulary through iterative selection
