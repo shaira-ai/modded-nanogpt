@@ -305,7 +305,6 @@ pub const VocabLearner = struct {
 
     // Tracking
     last_full_corpus_scan: u32,
-    full_corpus_scan_interval: u32,
     debug: bool,
 
     pub fn init(allocator: Allocator, input_tokenset_path: []const u8, corpus_paths: []const []const u8, max_vocab_size: u32, debug: bool) !*VocabLearner {
@@ -328,7 +327,6 @@ pub const VocabLearner = struct {
             .batch_size = 10,
             .sample_size = 10000,
             .last_full_corpus_scan = 0,
-            .full_corpus_scan_interval = 100,
             .debug = debug,
         };
 
@@ -1100,12 +1098,6 @@ pub const VocabLearner = struct {
                 try self.removeRandomTokens(5);
             }
 
-            // 7. Periodically perform full corpus scan
-            if (self.current_step % self.full_corpus_scan_interval == 0) {
-                try self.performFullCorpusScan();
-                self.last_full_corpus_scan = self.current_step;
-            }
-
             const iteration_elapsed = std.time.milliTimestamp() - iteration_start;
             if (self.debug) {
                 std.debug.print("Iteration {d} completed in {d}ms. Vocabulary size: {d}\n", .{ self.current_step, iteration_elapsed, self.vocab.items.len });
@@ -1626,28 +1618,6 @@ pub const VocabLearner = struct {
         }
     }
 
-    fn performFullCorpusScan(self: *VocabLearner) !void {
-        const start_time = std.time.milliTimestamp();
-
-        if (self.debug) {
-            std.debug.print("Performing full corpus scan...\n", .{});
-        }
-
-        // Reset occurrence counts
-        var it = self.candidate_stats.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.*.n_nonoverlapping_occurrences = 0;
-        }
-
-        // Process corpus to update token statistics
-        try self.processCorpus();
-
-        const elapsed_ms = std.time.milliTimestamp() - start_time;
-        if (self.debug) {
-            std.debug.print("Full corpus scan completed in {d}ms\n", .{elapsed_ms});
-        }
-    }
-
     // Greedy tokenization algorithm
     fn tokenizeGreedy(self: *VocabLearner, automaton: *BakaCorasick, text: []const u8) !ArrayList(u32) {
         var tokens = ArrayList(u32).init(self.allocator);
@@ -1826,7 +1796,6 @@ pub const VocabLearner = struct {
             .batch_size = 10,
             .sample_size = 5,
             .last_full_corpus_scan = 0,
-            .full_corpus_scan_interval = 5000,
             .debug = debug,
             .simple_prng = std.Random.DefaultPrng.init(blk: {
                 var seed: u64 = undefined;
@@ -1960,7 +1929,6 @@ pub const VocabLearner = struct {
             .batch_size = 10,
             .sample_size = 5,
             .last_full_corpus_scan = 0,
-            .full_corpus_scan_interval = 5000,
             .debug = debug,
             .simple_prng = std.Random.DefaultPrng.init(blk: {
                 var seed: u64 = undefined;
