@@ -103,7 +103,7 @@ pub const DocumentSampler = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn sampleDocuments(self: *DocumentSampler, count: usize) !ArrayList([]const u8) {
+    pub fn sampleDocuments(self: *DocumentSampler, count: usize, max_doc_size: ?usize) !ArrayList([]const u8) {
         if (self.debug) {
             std.debug.print("Sampling {d} documents\n", .{count});
         }
@@ -172,7 +172,6 @@ pub const DocumentSampler = struct {
             std.debug.print("Found {d} .bin files for sampling\n", .{all_files.items.len});
         }
 
-        // Now sample from the files list
         for (0..count) |_| {
             // Choose a random file
             const file_idx = self.prng.uintLessThan(usize, all_files.items.len);
@@ -189,7 +188,7 @@ pub const DocumentSampler = struct {
 
             if (content_size == 0) continue;
 
-            const max_chunk_size = 1024 * 1024; // 1MB chunks for sampling
+            const max_chunk_size = max_doc_size orelse (1024 * 1024);
             const chunk_size = @min(max_chunk_size, content_size);
 
             const max_offset = if (content_size > chunk_size) content_size - chunk_size else 0;
@@ -329,7 +328,7 @@ pub const VocabLearner = struct {
             .batch_size = 10,
             .sample_size = 10000,
             .last_full_corpus_scan = 0,
-            .full_corpus_scan_interval = 5000,
+            .full_corpus_scan_interval = 100,
             .debug = debug,
         };
 
@@ -1065,7 +1064,9 @@ pub const VocabLearner = struct {
             defer top_candidates.deinit();
 
             // 2. Sample documents from the corpus
-            const sample_docs = try self.document_sampler.sampleDocuments(self.sample_size);
+            const sample_size = 100; // Limited sample for DP
+            const max_doc_size = 10 * 1024; // 10KB limit
+            const sample_docs = try self.document_sampler.sampleDocuments(sample_size, max_doc_size);
             defer {
                 for (sample_docs.items) |doc| {
                     self.allocator.free(doc);
@@ -1074,7 +1075,18 @@ pub const VocabLearner = struct {
             }
 
             // 3. Evaluate candidates on the sampled documents
-            try self.evaluateCandidatesOnDocumentsDP(&top_candidates, sample_docs.items);
+            var dp_eval_frequency: u32 = 1;
+            if (self.vocab.items.len >= 5_000) {
+                dp_eval_frequency = 5;
+            }
+            if (self.vocab.items.len >= 30_000) {
+                dp_eval_frequency = 20;
+            }
+
+            // Only run DP eval periodically
+            if (self.current_step % dp_eval_frequency == 0) {
+                try self.evaluateCandidatesOnDocumentsDP(&top_candidates, sample_docs.items);
+            }
 
             // 4. Select tokens for addition (nearly-non-interdependent batch)
             const tokens_to_add = try self.selectNearlyNonInterdependentBatch(&top_candidates, self.batch_size);
@@ -2007,36 +2019,8 @@ pub const VocabLearner = struct {
             std.debug.print("Evaluating {d} candidates on {d} documents using DP...\n", .{ candidates.items.len, documents.len });
         }
 
-        // Reset estimated uses for all candidates
         for (candidates.items) |stats| {
             stats.est_n_uses = 0;
-        }
-
-        // Use fewer documents with limited size for DP evaluation
-        const max_sample_size = 100; // Just 100 documents
-        const max_doc_size = 10 * 1024; // 10KB per document
-
-        // Create document samples
-        var sample_docs = ArrayList(DocInfo).init(self.allocator);
-        defer sample_docs.deinit();
-
-        // Choose documents (could randomize if needed)
-        for (0..@min(max_sample_size * 2, documents.len)) |i| {
-            if (documents[i].len == 0) continue;
-
-            // Limit size
-            const sample_size = @min(documents[i].len, max_doc_size);
-            try sample_docs.append(DocInfo{ .idx = i, .size = sample_size });
-
-            if (sample_docs.items.len >= max_sample_size) break;
-        }
-
-        if (self.debug) {
-            var total_size: usize = 0;
-            for (sample_docs.items) |doc| {
-                total_size += doc.size;
-            }
-            std.debug.print("Using {d} documents for DP evaluation, total size: {d} KB\n", .{ sample_docs.items.len, total_size / 1024 });
         }
 
         // Convert binary token IDs to text for proper evaluation
@@ -2048,38 +2032,32 @@ pub const VocabLearner = struct {
             converted_documents.deinit();
         }
 
-        // Convert token IDs to text (similar to processCorpus)
-        for (sample_docs.items) |doc_info| {
-            const bin_data = documents[doc_info.idx][0..doc_info.size];
+        for (documents) |doc_data| {
             var text_buffer = ArrayList(u8).init(self.allocator);
 
-            // Process in 2-byte chunks
-            const complete_tokens = bin_data.len / 2;
+            const complete_tokens = doc_data.len / 2;
             for (0..complete_tokens) |i| {
                 const token_offset = i * 2;
-                if (token_offset + 2 > bin_data.len) break;
+                if (token_offset + 2 > doc_data.len) break;
 
-                const token_id = std.mem.bytesToValue(u16, bin_data[token_offset..][0..2]);
+                const token_id = std.mem.bytesToValue(u16, doc_data[token_offset..][0..2]);
 
-                // Get string for this token
                 if (self.gpt_token_to_string.get(token_id)) |token_str| {
                     try text_buffer.appendSlice(token_str);
                 }
             }
 
-            // Fix: Handle the error from toOwnedSlice() separately
             const owned_slice = try text_buffer.toOwnedSlice();
             try converted_documents.append(owned_slice);
         }
 
-        if (sample_docs.items.len == 0) {
+        if (converted_documents.items.len == 0) {
             if (self.debug) {
                 std.debug.print("No valid documents for DP evaluation, skipping\n", .{});
             }
             return;
         }
 
-        // Create combined automaton
         if (self.debug) {
             std.debug.print("Creating combined automaton with vocabulary and candidate tokens...\n", .{});
         }
@@ -2087,94 +2065,137 @@ pub const VocabLearner = struct {
         var combined_automaton = try BakaCorasick.init(self.allocator);
         defer deinitBakaCorasick(&combined_automaton, self.allocator);
 
-        // DEBUG: Track tokens added to automaton
-        var vocab_tokens_added: usize = 0;
-        var candidate_tokens_added: usize = 0;
-
         // Add vocabulary tokens
         for (self.vocab.items, 0..) |token, i| {
             try combined_automaton.insert(token, @intCast(i));
-            vocab_tokens_added += 1;
         }
 
         // Add candidate tokens with flag
         for (candidates.items, 0..) |stats, i| {
             try combined_automaton.insert(stats.token, CANDIDATE_TOKEN_FLAG | @as(u32, @intCast(i)));
-            candidate_tokens_added += 1;
         }
 
         try combined_automaton.computeSuffixLinks();
 
         if (self.debug) {
             std.debug.print("Combined automaton created with {d} states\n", .{combined_automaton.len});
-            std.debug.print("Added {d} vocabulary tokens and {d} candidate tokens to automaton\n", .{ vocab_tokens_added, candidate_tokens_added });
-
-            // DEBUG: Show first few vocabulary and candidate tokens
-            std.debug.print("Sample of vocabulary tokens:\n", .{});
-            const vocab_to_show = @min(5, self.vocab.items.len);
-            for (0..vocab_to_show) |i| {
-                std.debug.print("  {d}. ", .{i});
-                for (self.vocab.items[i]) |byte| {
-                    if (byte >= 32 and byte < 127) {
-                        std.debug.print("{c}", .{byte});
-                    } else {
-                        std.debug.print("\\x{x:0>2}", .{byte});
-                    }
-                }
-                std.debug.print(" (ID: {d})\n", .{i});
-            }
-
-            std.debug.print("Sample of candidate tokens:\n", .{});
-            const cand_to_show = @min(5, candidates.items.len);
-            for (0..cand_to_show) |i| {
-                std.debug.print("  {d}. ", .{i});
-                for (candidates.items[i].token) |byte| {
-                    if (byte >= 32 and byte < 127) {
-                        std.debug.print("{c}", .{byte});
-                    } else {
-                        std.debug.print("\\x{x:0>2}", .{byte});
-                    }
-                }
-                std.debug.print(" (ID: {d} with flag: {d})\n", .{ i, CANDIDATE_TOKEN_FLAG | @as(u32, @intCast(i)) });
-            }
+            std.debug.print("Added {d} vocabulary tokens and {d} candidate tokens to automaton\n", .{ self.vocab.items.len, candidates.items.len });
         }
 
-        // Process documents sequentially for simplicity in debugging
-        var results = DpEvalResult{
-            .tokens_saved = try self.allocator.alloc(u32, candidates.items.len),
-        };
-        defer self.allocator.free(results.tokens_saved);
-        @memset(results.tokens_saved, 0);
+        const available_cores = try std.Thread.getCpuCount();
+        const num_threads = @max(1, available_cores);
+
+        // Allocate results array to store token savings counts
+        var total_tokens_saved = try self.allocator.alloc(u32, candidates.items.len);
+        defer self.allocator.free(total_tokens_saved);
+        @memset(total_tokens_saved, 0);
 
         if (self.debug) {
-            std.debug.print("\nStarting document-by-document processing:\n", .{});
+            std.debug.print("Using {d} threads for parallel DP evaluation\n", .{num_threads});
         }
 
-        // Process each document
-        for (0..sample_docs.items.len) |doc_idx| {
-            const info = sample_docs.items[doc_idx];
-            const document = documents[info.idx][0..info.size];
+        // Create threads and per-thread results
+        var threads = try self.allocator.alloc(std.Thread, num_threads);
+        defer self.allocator.free(threads);
 
-            if (self.debug and doc_idx < 2) {
-                std.debug.print("\nProcessing document {d} (size: {d} bytes)\n", .{ doc_idx, document.len });
+        var per_thread_results = try self.allocator.alloc([]u32, num_threads);
+        defer self.allocator.free(per_thread_results);
+
+        for (0..num_threads) |i| {
+            per_thread_results[i] = try self.allocator.alloc(u32, candidates.items.len);
+            @memset(per_thread_results[i], 0);
+        }
+        defer {
+            for (0..num_threads) |i| {
+                self.allocator.free(per_thread_results[i]);
             }
+        }
 
-            processDpDocument(self, &combined_automaton, candidates, converted_documents.items[doc_idx], doc_idx, &results, self.debug);
+        var progress_mutex = std.Thread.Mutex{};
+        var total_processed: usize = 0;
 
-            // Print progress
-            if (self.debug and (doc_idx + 1) % 10 == 0) {
-                const progress = (doc_idx + 1) * 100 / sample_docs.items.len;
-                std.debug.print("\rProcessing documents: {d}% ({d}/{d})", .{ progress, doc_idx + 1, sample_docs.items.len });
+        const docs_per_thread = (converted_documents.items.len + num_threads - 1) / num_threads;
+
+        for (0..num_threads) |thread_idx| {
+            const start_doc = thread_idx * docs_per_thread;
+            const end_doc = @min(start_doc + docs_per_thread, converted_documents.items.len);
+
+            if (start_doc >= end_doc) continue;
+
+            const ThreadContext = struct {
+                learner: *VocabLearner,
+                automaton: *BakaCorasick,
+                candidates: *const ArrayList(*TokenStats),
+                documents: []const []const u8,
+                start_doc: usize,
+                end_doc: usize,
+                results: []u32,
+                progress_mutex: *std.Thread.Mutex,
+                total_processed: *usize,
+                total_docs: usize,
+                debug: bool,
+            };
+
+            const context = ThreadContext{
+                .learner = self,
+                .automaton = &combined_automaton,
+                .candidates = candidates,
+                .documents = converted_documents.items,
+                .start_doc = start_doc,
+                .end_doc = end_doc,
+                .results = per_thread_results[thread_idx],
+                .progress_mutex = &progress_mutex,
+                .total_processed = &total_processed,
+                .total_docs = converted_documents.items.len,
+                .debug = self.debug,
+            };
+
+            threads[thread_idx] = try std.Thread.spawn(.{}, struct {
+                fn processDocumentRange(ctx: ThreadContext) void {
+                    // Process each document in the assigned range
+                    for (ctx.start_doc..ctx.end_doc) |doc_idx| {
+                        const document = ctx.documents[doc_idx];
+
+                        // Skip empty documents
+                        if (document.len == 0) continue;
+
+                        processDocumentDp(ctx.learner, ctx.automaton, ctx.candidates, document, ctx.results);
+
+                        // Update progress
+                        ctx.progress_mutex.lock();
+                        ctx.total_processed.* += 1;
+
+                        if (ctx.debug) {
+                            const progress = ctx.total_processed.*;
+                            printProgressBar(progress, ctx.total_docs, 50);
+                        }
+                        ctx.progress_mutex.unlock();
+                    }
+                }
+            }.processDocumentRange, .{context});
+        }
+
+        // Wait for all threads to complete
+        for (0..num_threads) |i| {
+            if (i * docs_per_thread < converted_documents.items.len) {
+                threads[i].join();
+            }
+        }
+
+        // Combine results from all threads
+        for (0..candidates.items.len) |candidate_idx| {
+            for (0..num_threads) |thread_idx| {
+                total_tokens_saved[candidate_idx] += per_thread_results[thread_idx][candidate_idx];
             }
         }
 
         if (self.debug) {
-            std.debug.print("\n", .{});
+            std.debug.print("\nParallel processing complete\n", .{});
         }
 
-        // Update candidate uses from results
+        // Update candidate token stats with results
         for (candidates.items, 0..) |stats, idx| {
-            stats.est_n_uses += results.tokens_saved[idx];
+            stats.est_n_uses += total_tokens_saved[idx];
         }
 
         const elapsed_ms = std.time.milliTimestamp() - start_time;
@@ -2187,8 +2208,7 @@ pub const VocabLearner = struct {
             // Count tokens with non-zero savings
             var tokens_with_savings: usize = 0;
             var total_savings: u32 = 0;
-            for (candidates.items, 0..) |stats, idx| {
-                _ = idx;
+            for (candidates.items) |stats| {
                 if (stats.est_n_uses > 0) {
                     tokens_with_savings += 1;
                     total_savings += stats.est_n_uses;
@@ -2198,7 +2218,7 @@ pub const VocabLearner = struct {
             std.debug.print("Tokens with non-zero savings: {d}/{d}\n", .{ tokens_with_savings, candidates.items.len });
             std.debug.print("Total token savings across all documents: {d}\n", .{total_savings});
 
-            // Create array of indices and sort by savings
+            // Display top tokens
             var indices = try self.allocator.alloc(usize, candidates.items.len);
             defer self.allocator.free(indices);
 
@@ -2220,9 +2240,7 @@ pub const VocabLearner = struct {
             for (0..show_count) |i| {
                 const idx = indices[i];
                 const stats = candidates.items[idx];
-                std.debug.print("  {d}. ", .{i + 1});
-                // Print token
-                std.debug.print("Token: \"", .{});
+                std.debug.print("  {d}. Token: \"", .{i + 1});
                 for (stats.token) |byte| {
                     if (byte >= 32 and byte < 127) {
                         std.debug.print("{c}", .{byte});
@@ -2235,31 +2253,9 @@ pub const VocabLearner = struct {
         }
     }
 
-    fn dpWorkerThread(task: *DpEvalTask, result: *DpEvalResult) void {
-        for (task.doc_range[0]..task.doc_range[1]) |doc_idx| {
-            const info = task.doc_infos[doc_idx];
-            const document = task.documents[info.idx][0..info.size];
-
-            // Skip empty documents
-            if (document.len == 0) continue;
-
-            processDpDocument(task, result, document);
-
-            // Update progress
-            task.progress_mutex.lock();
-            task.total_docs_processed.* += 1;
-            if (task.debug) {
-                const progress = task.total_docs_processed.*;
-                printProgressBar(progress, task.total_docs, 50);
-            }
-            task.progress_mutex.unlock();
-        }
-    }
-
-    fn processDpDocument(self: *VocabLearner, automaton: *BakaCorasick, candidates: *const ArrayList(*TokenStats), document: []const u8, doc_idx: usize, result: *DpEvalResult, debug: bool) void {
-        _ = doc_idx;
-        _ = debug;
-        // 1. Identify candidates that appear in this document using direct string matching
+    // Core DP processing function for a single document - used by both parallel and sequential paths
+    fn processDocumentDp(self: *VocabLearner, automaton: *BakaCorasick, candidates: *const ArrayList(*TokenStats), document: []const u8, results: []u32) void {
+        // 1. Identify candidates that appear in this document
         var candidates_in_doc = std.ArrayList(usize).init(self.allocator);
         defer candidates_in_doc.deinit();
 
@@ -2276,22 +2272,20 @@ pub const VocabLearner = struct {
             candidate_positions[i] = std.ArrayList(usize).init(self.allocator);
         }
 
-        // Directly search for each candidate token in the document
+        // Find all candidate token matches in the document
         for (candidates.items, 0..) |stats, i| {
             const token = stats.token;
-
-            // Simple substring search
             var pos: usize = 0;
+
             while (pos <= document.len - token.len) {
                 const found_pos = std.mem.indexOfPos(u8, document, pos, token);
                 if (found_pos == null) break;
 
                 const match_pos = found_pos.? + token.len;
-                candidate_positions[i].append(match_pos) catch continue;
+                candidate_positions[i].append(match_pos) catch break;
                 pos = found_pos.? + 1;
             }
 
-            // If we found any occurrences, add this candidate
             if (candidate_positions[i].items.len > 0) {
                 candidates_in_doc.append(i) catch continue;
             }
@@ -2311,7 +2305,6 @@ pub const VocabLearner = struct {
 
         // Scan document with automaton for vocabulary tokens
         var current_state: u32 = 0;
-
         for (document, 0..) |byte, pos| {
             current_state = automaton.transitions[current_state][byte];
 
@@ -2320,9 +2313,8 @@ pub const VocabLearner = struct {
                 const token_len = automaton.info[current_state].depth;
                 const end_pos = pos + 1;
 
-                // Only add vocabulary tokens here
+                // Only add vocabulary tokens here (not candidates)
                 if ((token_id & CANDIDATE_TOKEN_FLAG) == 0) {
-                    // Record match
                     var matches = token_end_positions.get(end_pos);
                     if (matches == null) {
                         const list = std.ArrayList(TokenMatch).init(self.allocator);
@@ -2376,8 +2368,7 @@ pub const VocabLearner = struct {
         // Initialize DP arrays
         for (0..base_costs.len) |i| base_costs[i] = std.math.maxInt(u32);
         base_costs[0] = 0;
-
-        for (0..base_masks.len) |i| base_masks[i] = 0;
+        @memset(base_masks, 0);
 
         // Solve base tokenization using DP
         for (1..document.len + 1) |i| {
@@ -2483,7 +2474,7 @@ pub const VocabLearner = struct {
 
             if (base_token_count > new_token_count) {
                 const tokens_saved = base_token_count - new_token_count;
-                result.tokens_saved[candidate_idx] += @intCast(tokens_saved);
+                results[candidate_idx] += @intCast(tokens_saved);
             }
         }
     }
