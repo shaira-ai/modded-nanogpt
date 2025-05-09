@@ -302,6 +302,7 @@ pub const VocabLearner = struct {
     top_k_candidates: u32,
     batch_size: u32,
     sample_size: u32,
+    processed_files: std.StringHashMap(void),
 
     // Tracking
     last_full_corpus_scan: u32,
@@ -322,6 +323,7 @@ pub const VocabLearner = struct {
             .current_step = 0,
             .document_sampler = try DocumentSampler.init(allocator, corpus_paths, debug),
             .gpt_token_to_string = std.AutoHashMap(u16, []const u8).init(allocator),
+            .processed_files = std.StringHashMap(void).init(allocator),
             .max_vocab_size = max_vocab_size,
             .top_k_candidates = 200,
             .batch_size = 10,
@@ -367,6 +369,12 @@ pub const VocabLearner = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.gpt_token_to_string.deinit();
+
+        var cache_it = self.processed_files.iterator();
+        while (cache_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.processed_files.deinit();
 
         // Clean up BakaCorasick instances
         deinitBakaCorasick(&self.vocab_automaton, self.allocator);
@@ -586,7 +594,6 @@ pub const VocabLearner = struct {
         var combined_automaton = try BakaCorasick.init(self.allocator);
         defer deinitBakaCorasick(&combined_automaton, self.allocator);
 
-        // Add all candidate tokens to the automaton
         var token_id_to_stats = std.AutoHashMap(u32, *TokenStats).init(self.allocator);
         defer token_id_to_stats.deinit();
 
@@ -594,17 +601,14 @@ pub const VocabLearner = struct {
             std.debug.print("Building search automaton with {d} candidate tokens...\n", .{self.candidate_stats.count()});
         }
 
-        // Add all candidate tokens to the automaton
         var candidates_it = self.candidate_stats.iterator();
         var id: u32 = 0;
         while (candidates_it.next()) |entry| {
             const token = entry.key_ptr.*;
             const stats = entry.value_ptr.*;
 
-            // Reset occurrence counts
             stats.n_nonoverlapping_occurrences = 0;
 
-            // Add to automaton
             try combined_automaton.insert(token, id);
             try token_id_to_stats.put(id, stats);
             id += 1;
@@ -635,14 +639,29 @@ pub const VocabLearner = struct {
             fn processFile(ctx: ThreadContext) void {
                 const file_start_time = std.time.milliTimestamp();
 
-                // Report file starting
+                // Lock once at the beginning
                 ctx.progress_mutex.lock();
                 if (ctx.learner.debug) {
                     std.debug.print("\n[{d}/{d}] Starting file: {s}\n", .{ ctx.file_idx + 1, ctx.total_files, ctx.corpus_path });
                 }
-                ctx.progress_mutex.unlock();
 
-                // Open binary file
+                // Check if this file has already been processed - use a separate lock
+                var is_already_processed = false;
+                ctx.mutex.lock();
+                if (ctx.learner.processed_files.contains(ctx.corpus_path)) {
+                    is_already_processed = true;
+                }
+                ctx.mutex.unlock();
+
+                if (is_already_processed) {
+                    if (ctx.learner.debug) {
+                        std.debug.print("  Skipping previously processed file: {s}\n", .{ctx.corpus_path});
+                    }
+                    ctx.progress_mutex.unlock(); // Unlock before returning
+                    return;
+                }
+                ctx.progress_mutex.unlock(); // Unlock after printing debug info
+
                 const file = std.fs.cwd().openFile(ctx.corpus_path, .{}) catch |err| {
                     ctx.progress_mutex.lock();
                     if (ctx.learner.debug) {
@@ -675,7 +694,6 @@ pub const VocabLearner = struct {
                     file.seekTo(1024) catch return;
                 }
 
-                // Read in chunks
                 const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB chunks
                 var buffer = ctx.learner.allocator.alloc(u8, CHUNK_SIZE) catch return;
                 defer ctx.learner.allocator.free(buffer);
@@ -686,9 +704,8 @@ pub const VocabLearner = struct {
 
                 var bytes_processed: usize = 0;
                 var last_progress_time = std.time.milliTimestamp();
-                const progress_interval_ms = 1000; // Update progress every second
+                const progress_interval_ms = 1000;
 
-                // Process file in chunks
                 while (true) {
                     const bytes_read = file.readAll(buffer) catch break;
                     if (bytes_read == 0) break;
@@ -753,34 +770,46 @@ pub const VocabLearner = struct {
                 }
 
                 const file_elapsed_sec = @as(f64, @floatFromInt(std.time.milliTimestamp() - file_start_time)) / 1000.0;
-                ctx.progress_mutex.lock();
+                ctx.mutex.lock();
+                const path_copy = ctx.learner.allocator.dupe(u8, ctx.corpus_path) catch {
+                    ctx.mutex.unlock();
+                    return;
+                };
+                ctx.learner.processed_files.put(path_copy, {}) catch {
+                    ctx.learner.allocator.free(path_copy);
+                    ctx.mutex.unlock();
+                    return;
+                };
+                ctx.mutex.unlock();
                 if (ctx.learner.debug) {
                     // Clear line first
                     std.debug.print("\r                                                                   \r", .{});
                     std.debug.print("  Completed file {d}/{d}: {s} in {d:.2}s\n", .{ ctx.file_idx + 1, ctx.total_files, ctx.corpus_path, file_elapsed_sec });
                 }
-                ctx.progress_mutex.unlock();
             }
 
             fn processText(ctx: ThreadContext, text: []const u8) void {
                 // Only do processing if we have text
                 if (text.len == 0) return;
 
-                // Find all tokens using Aho-Corasick
-                var token_counts = std.AutoHashMap(u32, u32).init(ctx.learner.allocator);
-                defer token_counts.deinit();
-
-                // Keep track of used positions in the text
-                var used_positions = ctx.learner.allocator.alloc(bool, text.len) catch return;
-                defer ctx.learner.allocator.free(used_positions);
-                @memset(used_positions, false);
-
-                // First pass: collect best matches at each position
-                var position_matches = ctx.learner.allocator.alloc(?struct { token_id: u32, len: usize }, text.len) catch return;
-                defer ctx.learner.allocator.free(position_matches);
-                for (0..position_matches.len) |i| {
-                    position_matches[i] = null;
+                var max_token_id: u32 = 0;
+                var id_it = ctx.token_id_to_stats.iterator();
+                while (id_it.next()) |entry| {
+                    const token_id = entry.key_ptr.*;
+                    if (token_id > max_token_id) {
+                        max_token_id = token_id;
+                    }
                 }
+
+                var last_used_positions = ctx.learner.allocator.alloc(usize, max_token_id + 1) catch return;
+                defer ctx.learner.allocator.free(last_used_positions);
+
+                var token_counts = ctx.learner.allocator.alloc(u32, max_token_id + 1) catch return;
+                defer ctx.learner.allocator.free(token_counts);
+
+                // Initialize arrays
+                @memset(last_used_positions, 0);
+                @memset(token_counts, 0);
 
                 // Scan text with the automaton
                 var current_state: u32 = 0;
@@ -790,11 +819,14 @@ pub const VocabLearner = struct {
                     // Check if this state represents a match
                     if (ctx.automaton.info[current_state].token_id != BakaCorasick.NO_TOKEN) {
                         const token_id = ctx.automaton.info[current_state].token_id;
-                        const token_len = ctx.automaton.info[current_state].depth;
+                        if (token_id <= max_token_id) {
+                            const token_len = ctx.automaton.info[current_state].depth;
+                            const start_pos = pos + 1 - token_len;
 
-                        // Store this match if it's longer than existing match at this end position
-                        if (position_matches[pos] == null or position_matches[pos].?.len < token_len) {
-                            position_matches[pos] = .{ .token_id = token_id, .len = token_len };
+                            if (start_pos >= last_used_positions[token_id]) {
+                                token_counts[token_id] += 1;
+                                last_used_positions[token_id] = pos + 1;
+                            }
                         }
                     }
 
@@ -803,64 +835,34 @@ pub const VocabLearner = struct {
                     while (suffix != 0) {
                         if (ctx.automaton.info[suffix].token_id != BakaCorasick.NO_TOKEN) {
                             const token_id = ctx.automaton.info[suffix].token_id;
-                            const token_len = ctx.automaton.info[suffix].depth;
+                            if (token_id <= max_token_id) {
+                                const token_len = ctx.automaton.info[suffix].depth;
+                                const start_pos = pos + 1 - token_len;
 
-                            // Store this match if it's longer than existing match at this end position
-                            if (position_matches[pos] == null or position_matches[pos].?.len < token_len) {
-                                position_matches[pos] = .{ .token_id = token_id, .len = token_len };
+                                if (start_pos >= last_used_positions[token_id]) {
+                                    token_counts[token_id] += 1;
+                                    last_used_positions[token_id] = pos + 1;
+                                }
                             }
                         }
                         suffix = ctx.automaton.info[suffix].green;
                     }
                 }
 
-                // Second pass: process matches in order of end position (which is naturally the case)
-                for (position_matches, 0..) |match_opt, pos| {
-                    if (match_opt) |match| {
-                        const start_pos = pos + 1 - match.len;
-
-                        // Check if any position in this match is already used
-                        var is_valid = true;
-                        for (start_pos..pos + 1) |i| {
-                            if (used_positions[i]) {
-                                is_valid = false;
-                                break;
-                            }
-                        }
-
-                        if (is_valid) {
-                            // Count this match
-                            if (token_counts.getPtr(match.token_id)) |count_ptr| {
-                                count_ptr.* += 1;
-                            } else {
-                                token_counts.put(match.token_id, 1) catch continue;
-                            }
-
-                            // Mark positions as used
-                            for (start_pos..pos + 1) |i| {
-                                used_positions[i] = true;
-                            }
-                        }
-                    }
-                }
-
-                // Update global counts with thread mutex
                 ctx.mutex.lock();
                 defer ctx.mutex.unlock();
 
-                var it = token_counts.iterator();
-                while (it.next()) |entry| {
-                    const token_id = entry.key_ptr.*;
-                    const count = entry.value_ptr.*;
-
-                    if (ctx.token_id_to_stats.get(token_id)) |stats| {
-                        stats.n_nonoverlapping_occurrences += count;
+                for (token_counts, 0..) |count, token_id_usize| {
+                    if (count > 0) {
+                        const token_id: u32 = @intCast(token_id_usize);
+                        if (ctx.token_id_to_stats.get(token_id)) |stats| {
+                            stats.n_nonoverlapping_occurrences += count;
+                        }
                     }
                 }
             }
         }.processFile;
 
-        // Process files in parallel
         const available_cores = try std.Thread.getCpuCount();
         const num_threads = @min(available_cores, corpus_files.items.len);
 
@@ -868,7 +870,6 @@ pub const VocabLearner = struct {
             std.debug.print("Processing {d} files using {d} threads\n", .{ corpus_files.items.len, num_threads });
         }
 
-        // Process files in batches
         const batch_size = num_threads;
         var batch_start: usize = 0;
         var batch_num: usize = 0;
@@ -2036,22 +2037,6 @@ pub const VocabLearner = struct {
                 total_size += doc.size;
             }
             std.debug.print("Using {d} documents for DP evaluation, total size: {d} KB\n", .{ sample_docs.items.len, total_size / 1024 });
-
-            // DEBUG: Show sample of document content
-            if (sample_docs.items.len > 0) {
-                const doc_idx = sample_docs.items[0].idx;
-                const doc_size = @min(sample_docs.items[0].size, 100);
-                std.debug.print("First document sample (first 100 bytes):\n", .{});
-                for (0..doc_size) |i| {
-                    const byte = documents[doc_idx][i];
-                    if (byte >= 32 and byte < 127) {
-                        std.debug.print("{c}", .{byte});
-                    } else {
-                        std.debug.print("\\x{x:0>2}", .{byte});
-                    }
-                }
-                std.debug.print("\n", .{});
-            }
         }
 
         // Convert binary token IDs to text for proper evaluation
@@ -2085,23 +2070,6 @@ pub const VocabLearner = struct {
             // Fix: Handle the error from toOwnedSlice() separately
             const owned_slice = try text_buffer.toOwnedSlice();
             try converted_documents.append(owned_slice);
-        }
-
-        if (self.debug) {
-            // Show a sample of the converted text
-            if (converted_documents.items.len > 0) {
-                const sample_len = @min(converted_documents.items[0].len, 100);
-                std.debug.print("First converted document sample (first 100 chars):\n", .{});
-                for (0..sample_len) |i| {
-                    const byte = converted_documents.items[0][i];
-                    if (byte >= 32 and byte < 127) {
-                        std.debug.print("{c}", .{byte});
-                    } else {
-                        std.debug.print("\\x{x:0>2}", .{byte});
-                    }
-                }
-                std.debug.print("\n", .{});
-            }
         }
 
         if (sample_docs.items.len == 0) {
