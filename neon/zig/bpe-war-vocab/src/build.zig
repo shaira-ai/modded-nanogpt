@@ -37,4 +37,22 @@ pub fn build(b: *std.Build) void {
     }
     const run_tokenset_filter_step = b.step("run-tokenset-filter", "Run the tokenset filter");
     run_tokenset_filter_step.dependOn(&run_tokenset_filter.step);
+
+    // Create executable for vocab_reader
+    const vocab_reader = b.addExecutable(.{
+        .name = "vocab_reader",
+        .root_source_file = b.path("vocab_reader.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(vocab_reader);
+
+    // Create executable for vocab_learner
+    const vocab_learner = b.addExecutable(.{
+        .name = "vocab_learner",
+        .root_source_file = b.path("vocab_learner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(vocab_learner);
 }

@@ -296,6 +296,7 @@ pub const VocabLearner = struct {
     current_step: u32,
     document_sampler: *DocumentSampler,
     gpt_token_to_string: std.AutoHashMap(u16, []const u8),
+    n_token_ids: u32,
     // Parameters
     max_vocab_size: u32,
     top_k_candidates: u32,
