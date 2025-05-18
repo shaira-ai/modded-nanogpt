@@ -461,6 +461,19 @@ pub const FinewebDataLoader = struct {
         return result;
     }
 
+    /// Get the next document as a string, handling multiple files, looping forever
+    pub fn nextDocumentStringLoop(self: *FinewebDataLoader) ![]u8 {
+        var document_maybe = try self.nextDocumentString();
+        if (document_maybe == null) {
+            try self.rewind();
+        }
+        document_maybe = try self.nextDocumentString();
+        if (document_maybe) |document| {
+            return document;
+        }
+        return error.YourCorpusHasNoDocuments;
+    }
+
     /// Convert a document (as token IDs) to a string
     pub fn documentToString(self: *FinewebDataLoader, document: []const usize) ![]u8 {
         //const start_time = time.nanoTimestamp();

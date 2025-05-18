@@ -70,6 +70,17 @@ pub const BakaCorasick = struct {
         return state_id;
     }
 
+    pub fn clear(self: *Self) void {
+        self.transitions[0] = .{0} ** 256;
+        self.info[0] = .{
+            .blue = 0,
+            .green = 0,
+            .depth = 0,
+            .token_id = NO_TOKEN,
+        };
+        self.len = 1;
+    }
+
     pub fn copyFrom(self: *Self, other: *Self) !void {
         if (self.capacity < other.capacity) {
             self.allocator.free(self.transitions[0..self.capacity]);
@@ -116,6 +127,20 @@ pub const BakaCorasick = struct {
 
     // Compute all suffix links (blue and green arcs) using BFS
     pub fn computeSuffixLinks(self: *Self) !void {
+        // for (self.info[0..self.len]) |*info| {
+        //     info.blue = 0;
+        //     info.green = 0;
+        // }
+        // for (self.transitions[0..self.len], 0..) |*transitions, i| {
+        //     for (0..256) |c| {
+        //         const depth = self.info[i].depth;
+        //         const child = transitions[c];
+        //         const child_depth = self.info[child].depth;
+        //         if (child_depth <= depth) {
+        //             transitions[c] = 0;
+        //         }
+        //     }
+        // }
         var queue = Queue(u32){};
         defer queue.deinit(self.allocator);
 
@@ -156,8 +181,14 @@ pub const BakaCorasick = struct {
 
                         // Follow suffix links until finding a node that has the current character
                         // or until reaching the root
-                        while (suffix_node != 0 and self.transitions[suffix_node][c] == 0) {
+                        var suffix_node_depth = self.info[suffix_node].depth;
+                        var suffix_node_child = self.transitions[suffix_node][c];
+                        var suffix_node_child_depth = self.info[suffix_node_child].depth;
+                        while (suffix_node != 0 and suffix_node_child_depth <= suffix_node_depth) {
                             suffix_node = self.info[suffix_node].blue;
+                            suffix_node_depth = self.info[suffix_node].depth;
+                            suffix_node_child = self.transitions[suffix_node][c];
+                            suffix_node_child_depth = self.info[suffix_node_child].depth;
                         }
 
                         // Set the suffix link for the child
