@@ -1,415 +1,641 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const fs = std.fs;
+const Thread = std.Thread;
 const time = std.time;
 
+const BakaCorasick = @import("baka_corasick.zig").BakaCorasick;
 const fineweb = @import("data_loader.zig").FinewebDataLoader;
-const SFM = @import("string_frequency_manager.zig").StringFrequencyManager;
-const CMS_F = @import("count_min_sketch.zig").CountMinSketch;
-const coordinator_mod = @import("coordinator.zig");
-const spsc = @import("spsc.zig");
-const CandidateString = @import("string_frequency_manager.zig").CandidateString;
+const VocabLearnerModule = @import("vocab_learner.zig");
+const SampleStats = VocabLearnerModule.SampleStats;
+const TokenStats = VocabLearnerModule.TokenStats;
+const MatchInfo = VocabLearnerModule.MatchInfo;
 
-/// Parallel string frequency analysis framework
-pub fn ParallelAnalyzer(
-    comptime cms_width: usize,
-    comptime cms_depth: usize,
-    comptime MY_LEN: comptime_int,
-    comptime top_k: usize,
-) type {
-    // Define types
-    const SFMType = SFM(cms_width, cms_depth, MY_LEN, top_k);
-    const Coordinator = coordinator_mod.Coordinator(cms_width, cms_depth, MY_LEN, top_k);
+// SPSC Queue implementation - reusing from provided files
+const cache_line_length = switch (@import("builtin").target.cpu.arch) {
+    .aarch64, .powerpc64 => 128,
+    .arm, .mips, .mips64, .riscv64 => 32,
+    .s390x => 256,
+    else => 64,
+};
+
+pub fn BoundedQueue(comptime T: type, comptime capacity: comptime_int) type {
+    std.debug.assert(std.math.isPowerOfTwo(capacity));
+    const mask = capacity - 1;
 
     return struct {
         const Self = @This();
 
-        allocator: Allocator,
-        coordinator: *Coordinator,
-        manager: ?*SFMType,
-        data_loader: *fineweb,
-        debug: bool,
-        num_threads: usize,
-        saved_data_path: []const u8,
+        // align to 2*cache_line_length to fight the next-line prefetcher
+        buffer: *[capacity]T align(2 * cache_line_length),
+        head: usize align(2 * cache_line_length),
+        tail: usize align(2 * cache_line_length),
 
-        pub fn init(
-            allocator: Allocator,
-            num_threads: usize,
-            data_files: []const []const u8,
-            vocab_file: []const u8,
-            saved_data_path: []const u8,
-            debug: bool,
-        ) !*Self {
-            const start_time = time.nanoTimestamp();
-
-            // Validate inputs
-            if (data_files.len == 0) {
-                std.debug.print("[ERROR] No files provided to ParallelAnalyzer.init\n", .{});
-                return error.NoFilesProvided;
-            }
-
-            // Create the analyzer
-            const self = try allocator.create(Self);
-            errdefer allocator.destroy(self);
-
-            // Initialize data loader with the files
-            var loader = try fineweb.init(allocator, data_files);
-            errdefer loader.deinit();
-            try loader.loadVocabulary(vocab_file);
-
-            // Initialize coordinator
-            var coordinator = try Coordinator.init(allocator, num_threads, loader, debug);
-            errdefer coordinator.deinit();
-
-            // Save the path
-            const saved_path = try allocator.dupe(u8, saved_data_path);
-            errdefer allocator.free(saved_path);
-
-            // Initialize the analyzer
-            self.* = .{
-                .allocator = allocator,
-                .coordinator = coordinator,
-                .manager = null,
-                .data_loader = loader,
-                .debug = debug,
-                .num_threads = num_threads,
-                .saved_data_path = saved_path,
-            };
-
-            if (debug) {
-                const elapsed = time.nanoTimestamp() - start_time;
-                std.debug.print("[ParallelAnalyzer] init: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
-
-                // Print file information
-                const status = loader.getFileStatus();
-                std.debug.print("[ParallelAnalyzer] Using {d} files for processing\n", .{status.total_files});
-
-                // Log the first few files
-                const max_to_show = @min(5, data_files.len);
-                for (data_files[0..max_to_show], 0..) |file, i| {
-                    std.debug.print("[ParallelAnalyzer] File {d}: {s}\n", .{ i + 1, file });
-                }
-                if (data_files.len > max_to_show) {
-                    std.debug.print("[ParallelAnalyzer] ... and {d} more files\n", .{data_files.len - max_to_show});
-                }
-            }
-
-            return self;
+        pub fn init(gpa: Allocator) !Self {
+            const buffer = try gpa.create([capacity]T);
+            return Self{ .buffer = buffer, .head = 0, .tail = 0 };
         }
 
-        /// Clean up resources
-        pub fn deinit(self: *Self) void {
-            const start_time = time.nanoTimestamp();
-
-            // Free the saved_data_path first
-            self.allocator.free(self.saved_data_path);
-
-            // Before deinitiing the coordinator, clean up any manager
-            if (self.manager) |manager| {
-                manager.deinit();
-                self.manager = null;
-            }
-
-            // The data_loader is owned by the coordinator, so don't deinit it separately
-
-            // Deinit coordinator (which will clean up its workers)
-            self.coordinator.deinit();
-            self.coordinator = undefined; // Don't access it after deinit
-
-            // Free self
-            self.allocator.destroy(self);
-
-            if (self.debug) {
-                const elapsed = time.nanoTimestamp() - start_time;
-                std.debug.print("[ParallelAnalyzer] deinit: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
-            }
+        pub fn deinit(self: *Self, gpa: Allocator) void {
+            gpa.destroy(self.buffer);
         }
 
-        /// Check if saved first pass data exists
-        pub fn hasSavedData(self: *Self) !bool {
-            const file = fs.cwd().openFile(self.saved_data_path, .{}) catch |err| {
-                if (err == error.FileNotFound) {
-                    return false;
-                }
-                return err;
-            };
-            file.close();
+        pub fn push(self: *Self, value: T) bool {
+            const head = @atomicLoad(usize, &self.head, .acquire);
+            const tail = self.tail;
+            if (head +% 1 -% tail > capacity) return false;
+            self.buffer[head & mask] = value;
+            @atomicStore(usize, &self.head, head +% 1, .release);
             return true;
         }
 
-        /// Run first pass using parallel processing
-        pub fn runFirstPass(self: *Self) !void {
-            if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] Starting first pass with {d} threads\n", .{self.num_threads});
-
-                // Print data source information
-                const status = self.data_loader.getFileStatus();
-                std.debug.print("[ParallelAnalyzer] Processing data from {d} files\n", .{status.total_files});
-            }
-
-            // Start the coordinator
-            try self.coordinator.start();
-
-            // Wait for completion
-            self.coordinator.wait();
-
-            if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] First pass completed\n", .{});
-            }
-        }
-
-        /// Prepare data for second pass directly in memory (skipping disk I/O)
-        pub fn prepareSecondPassInMemory(self: *Self) !void {
-            if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] Preparing data for second pass in memory\n", .{});
-            }
-
-            if (MY_LEN < 4) {
-                const start_time = time.nanoTimestamp();
-                var new_manager = try SFMType.init(self.allocator);
-                // Sum counters from all workers
-                for (self.coordinator.workers) |worker| {
-                    // Add each worker's length2 counters
-                    if (MY_LEN == 2) {
-                        for (0..new_manager.length2_counters.len) |i| {
-                            new_manager.length2_counters[i] += worker.sfm.length2_counters[i];
-                        }
-                    }
-
-                    // Add each worker's length3 counters
-                    if (MY_LEN == 3) {
-                        for (0..new_manager.length3_counters.len) |i| {
-                            new_manager.length3_counters[i] += worker.sfm.length3_counters[i];
-                        }
-                    }
-
-                    if (self.debug) {
-                        std.debug.print("[ParallelAnalyzer] Merged counters from worker {d}\n", .{worker.id});
-                    }
-                }
-                if (self.manager) |old_manager| {
-                    old_manager.deinit();
-                }
-                self.manager = new_manager;
-                const elapsed = time.nanoTimestamp() - start_time;
-                if (self.debug) {
-                    std.debug.print("[ParallelAnalyzer] Data prepared for second pass in {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
-                }
-            }
-        }
-
-        /// Save first pass data to disk
-        pub fn saveFirstPassData(self: *Self) !void {
-            if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] Saving first pass data to {s}\n", .{self.saved_data_path});
-            }
-
-            // Get access to the global CMS from coordinator
-            if (self.coordinator.global_cms) |global_cms| {
-                // Create a temporary SFM to save the data
-                var temp_sfm = try SFMType.init(self.allocator);
-                defer temp_sfm.deinit();
-
-                // Copy the global CMS data to the SFM
-                try temp_sfm.cms.merge(global_cms);
-
-                // Initialize temp counter arrays to zero
-                @memset(temp_sfm.length2_counters, 0);
-                @memset(temp_sfm.length3_counters, 0);
-
-                // Sum counters from all workers instead of just copying from worker 0
-                for (self.coordinator.workers) |worker| {
-                    // Add each worker's length2 counters
-                    for (0..temp_sfm.length2_counters.len) |i| {
-                        temp_sfm.length2_counters[i] += worker.sfm.length2_counters[i];
-                    }
-
-                    // Add each worker's length3 counters
-                    for (0..temp_sfm.length3_counters.len) |i| {
-                        temp_sfm.length3_counters[i] += worker.sfm.length3_counters[i];
-                    }
-
-                    if (self.debug) {
-                        std.debug.print("[ParallelAnalyzer] Merged counters from worker {d}\n", .{worker.id});
-                    }
-                }
-
-                // Save to disk
-                try temp_sfm.saveFirstPassToDisk(self.saved_data_path);
-
-                if (self.debug) {
-                    std.debug.print("[ParallelAnalyzer] First pass data saved successfully\n", .{});
-                }
-            } else {
-                std.debug.print("[ParallelAnalyzer] ERROR: No global CMS available for saving\n", .{});
-                return error.NoGlobalCMS;
-            }
-        }
-
-        /// Load first pass data from disk
-        pub fn loadFirstPassData(self: *Self) !void {
-            if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] Loading first pass data from {s}\n", .{self.saved_data_path});
-            }
-
-            // Load the data from disk
-            const manager = try SFMType.loadFirstPassFromDisk(self.allocator, self.saved_data_path);
-            self.manager = manager;
-
-            if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] First pass data loaded\n", .{});
-            }
-        }
-
-        /// Run second pass using parallel processing
-        pub fn runSecondPass(self: *Self) !void {
-            if (MY_LEN < 4) {
-                return;
-            }
-            const overall_start_time = time.nanoTimestamp();
-
-            if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] Starting second pass with {d} threads\n", .{self.num_threads});
-            }
-
-            // OPTIMIZATION: Reuse the existing data loader instead of creating a new one
-            const data_loader_start = time.nanoTimestamp();
-
-            // Rewind the data loader to start from the beginning
-            try self.data_loader.rewind();
-
-            const data_loader_time = time.nanoTimestamp() - data_loader_start;
-
-            if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] Data loader rewound in {d:.2}ms\n", .{@as(f64, @floatFromInt(data_loader_time)) / time.ns_per_ms});
-            }
-
-            // Share the global CMS with all workers
-
-            if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] Setting up workers to share global CMS\n", .{});
-            }
-
-            try self.coordinator.runSecondPass();
-
-            const total_time = time.nanoTimestamp() - overall_start_time;
-            if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] Second pass completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(total_time)) / time.ns_per_ms});
-            }
-        }
-
-        pub fn addSmallStringsToHeap(self: *Self) !void {
-            const manager = if (self.manager) |m| m else self.coordinator.workers[0].sfm;
-            try manager.addSmallStringsToHeap();
-        }
-
-        pub fn getResults(self: *Self) !void {
-            if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] Getting results\n", .{});
-            }
-
-            if (self.manager) |manager| {
-                try manager.getResults();
-            } else {
-                try self.coordinator.workers[0].sfm.getResults();
-            }
-            if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] Results displayed\n", .{});
-            }
-        }
-
-        /// Save token set to binary format
-        pub fn saveTokensToBinaryFormat(self: *Self, output_path: []const u8) !void {
-            const start_time = time.nanoTimestamp();
-
-            if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] Saving token set to binary format: {s}\n", .{output_path});
-            }
-
-            // Open output file
-            const file = try fs.cwd().createFile(output_path, .{});
-            defer file.close();
-
-            const writer = file.writer();
-
-            var header: [256]u32 = [_]u32{0} ** 256;
-
-            const manager = if (self.manager) |m| m else self.coordinator.workers[0].sfm;
-
-            var token_count_by_length = std.AutoHashMap(usize, usize).init(self.allocator);
-            defer token_count_by_length.deinit();
-
-            for (manager.heap.items) |candidate| {
-                const length = candidate.string.len;
-
-                if (length == 0 or length > 256) continue;
-
-                const current = token_count_by_length.get(length) orelse 0;
-                try token_count_by_length.put(length, current + 1);
-            }
-
-            var lengths_it = token_count_by_length.iterator();
-            while (lengths_it.next()) |entry| {
-                const length = entry.key_ptr.*;
-                const count = entry.value_ptr.*;
-
-                if (length > 0 and length <= 256) {
-                    header[length - 1] = @intCast(count);
-
-                    if (self.debug) {
-                        std.debug.print("[ParallelAnalyzer] Length {d}: {d} tokens\n", .{ length, count });
-                    }
-                }
-            }
-
-            // Write header
-            try writer.writeAll(std.mem.asBytes(&header));
-
-            // Now write the tokens, grouped by length
-            var length_arrays = std.AutoHashMap(usize, std.ArrayList([]const u8)).init(self.allocator);
-            defer {
-                var len_it = length_arrays.iterator();
-                while (len_it.next()) |entry| {
-                    entry.value_ptr.*.deinit();
-                }
-                length_arrays.deinit();
-            }
-
-            while(manager.heap.count() > 0) {
-                const candidate = manager.heap.remove();
-                const length = candidate.string.len;
-
-                if (length == 0 or length > 256) continue;
-
-                if (!length_arrays.contains(length)) {
-                    try length_arrays.put(length, std.ArrayList([]const u8).init(self.allocator));
-                }
-
-                try length_arrays.getPtr(length).?.append(candidate.string);
-            }
-
-            for (1..257) |length| {
-                if (length_arrays.get(@intCast(length))) |token_list| {
-                    var idx: usize = 0;
-                    while (idx < token_list.items.len) : (idx += 1) {
-                        const token = token_list.items[token_list.items.len - idx - 1];
-                        try writer.writeAll(token);
-                    }
-                }
-            }
-
-            const total_tokens = blk: {
-                var sum: usize = 0;
-                for (header) |count| {
-                    sum += count;
-                }
-                break :blk sum;
-            };
-
-            const elapsed = time.nanoTimestamp() - start_time;
-            if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] Token set written in {d:.2}ms, {d} total tokens\n", .{ @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms, total_tokens });
-            }
+        pub fn pop(self: *Self) ?T {
+            const tail = @atomicLoad(usize, &self.tail, .acquire);
+            const head = self.head;
+            if (tail -% head == 0) return null;
+            const value = self.buffer[tail & mask];
+            @atomicStore(usize, &self.tail, tail +% 1, .release);
+            return value;
         }
     };
 }
+
+// Message types
+const MessageType = enum {
+    ProcessDocument,
+    DocumentProcessed,
+    Shutdown,
+    Error,
+};
+
+const ProcessDocumentMessage = struct {
+    id: usize,
+    document: []const u8,
+};
+
+const DocumentProcessedMessage = struct {
+    id: usize,
+    worker_id: usize,
+    document_stats: []SampleStats,
+};
+
+const ErrorMessage = struct {
+    worker_id: usize,
+    message: []const u8,
+};
+
+const Message = union(MessageType) {
+    ProcessDocument: ProcessDocumentMessage,
+    DocumentProcessed: DocumentProcessedMessage,
+    Shutdown: usize, // worker id
+    Error: ErrorMessage,
+};
+
+fn deinitBakaCorasick(automaton: *BakaCorasick, allocator: Allocator) void {
+    allocator.free(automaton.transitions[0..automaton.capacity]);
+    allocator.free(automaton.info[0..automaton.capacity]);
+}
+
+// Worker implementation
+pub const Worker = struct {
+    allocator: Allocator,
+    id: usize,
+    vocab_learner: *VocabLearnerModule.VocabLearner,
+    candidate_automaton: *BakaCorasick, // Now just a reference to shared automaton
+    token_idx_to_least_end_pos: []u32,
+    lookbacks: std.ArrayList(u64),
+    dp_solution: std.ArrayList(u32),
+    matches: std.ArrayList(MatchInfo),
+    input_queue: *BoundedQueue(Message, 256),
+    output_queue: *BoundedQueue(Message, 256),
+    thread: ?Thread = null,
+    running: bool = false,
+    candidates_length: usize,
+    debug: bool,
+
+    pub fn init(
+        allocator: Allocator,
+        id: usize,
+        vocab_learner: *VocabLearnerModule.VocabLearner,
+        candidate_automaton: *BakaCorasick, // Now taking shared automaton
+        candidates_length: usize,
+        input_queue: *BoundedQueue(Message, 256),
+        output_queue: *BoundedQueue(Message, 256),
+        debug: bool,
+    ) !*Worker {
+        const worker = try allocator.create(Worker);
+        errdefer allocator.destroy(worker);
+
+        // Initialize data structures (each worker has its own)
+        const lookbacks = std.ArrayList(u64).init(allocator);
+        const dp_solution = std.ArrayList(u32).init(allocator);
+        const matches = std.ArrayList(MatchInfo).init(allocator);
+
+        const token_idx_to_least_end_pos = try allocator.alloc(u32, candidates_length);
+
+        worker.* = .{
+            .allocator = allocator,
+            .id = id,
+            .vocab_learner = vocab_learner,
+            .candidate_automaton = candidate_automaton, // Using shared automaton
+            .token_idx_to_least_end_pos = token_idx_to_least_end_pos,
+            .lookbacks = lookbacks,
+            .dp_solution = dp_solution,
+            .matches = matches,
+            .input_queue = input_queue,
+            .output_queue = output_queue,
+            .candidates_length = candidates_length,
+            .debug = debug,
+        };
+
+        return worker;
+    }
+
+    pub fn deinit(self: *Worker) void {
+        if (self.thread) |thread| {
+            thread.join();
+        }
+
+        // Don't deinit shared automaton, just our private data structures
+        self.lookbacks.deinit();
+        self.dp_solution.deinit();
+        self.matches.deinit();
+        self.allocator.free(self.token_idx_to_least_end_pos);
+        self.allocator.destroy(self);
+    }
+
+    pub fn start(self: *Worker) !void {
+        if (self.thread != null) return;
+
+        self.running = true;
+        self.thread = try Thread.spawn(.{}, Worker.run, .{self});
+
+        if (self.debug) {
+            std.debug.print("[Worker {d}] Started\n", .{self.id});
+        }
+    }
+
+    pub fn stop(self: *Worker) void {
+        self.running = false;
+    }
+
+    fn processDocument(self: *Worker, document: []const u8, doc_id: usize) !void {
+        // Create local copies of candidate stats for this document
+        var local_stats = try self.allocator.alloc(SampleStats, self.candidates_length);
+        defer self.allocator.free(local_stats);
+
+        // Initialize local stats with zero counts
+        for (0..self.candidates_length) |i| {
+            local_stats[i] = .{
+                .token_id = @intCast(i), // Store index for coordinator to map back
+                .sampled_occurrences = 0,
+                .sampled_savings = 0,
+            };
+        }
+
+        // Process the document using the evaluateCandidatesOnDocumentDP logic
+        try self.vocab_learner.evaluateCandidatesOnDocumentDP(
+            local_stats,
+            self.candidate_automaton,
+            document,
+            &self.lookbacks,
+            &self.dp_solution,
+            &self.matches,
+            self.token_idx_to_least_end_pos,
+        );
+
+        // Create copy of results to send back to coordinator
+        const result_stats = try self.allocator.dupe(SampleStats, local_stats);
+
+        // Send results
+        const result_msg = Message{
+            .DocumentProcessed = DocumentProcessedMessage{
+                .id = doc_id,
+                .worker_id = self.id,
+                .document_stats = result_stats,
+            },
+        };
+
+        var pushed = false;
+        while (!pushed) {
+            pushed = self.output_queue.push(result_msg);
+            if (!pushed) {
+                std.time.sleep(1 * std.time.ns_per_ms);
+            }
+        }
+    }
+
+    fn run(self: *Worker) !void {
+        if (self.debug) {
+            std.debug.print("[Worker {d}] Running\n", .{self.id});
+        }
+
+        while (self.running) {
+            if (self.input_queue.pop()) |msg| {
+                switch (msg) {
+                    .ProcessDocument => |process_data| {
+                        self.processDocument(process_data.document, process_data.id) catch |err| {
+                            const error_msg = try std.fmt.allocPrint(self.allocator, "Error processing document: {s}", .{@errorName(err)});
+                            const error_message = Message{
+                                .Error = ErrorMessage{
+                                    .worker_id = self.id,
+                                    .message = error_msg,
+                                },
+                            };
+                            _ = self.output_queue.push(error_message);
+                        };
+                    },
+                    .Shutdown => {
+                        if (self.debug) {
+                            std.debug.print("[Worker {d}] Shutting down\n", .{self.id});
+                        }
+                        self.running = false;
+                    },
+                    else => {
+                        if (self.debug) {
+                            std.debug.print("[Worker {d}] Unexpected message type\n", .{self.id});
+                        }
+                    },
+                }
+            } else {
+                // No messages, sleep a bit
+                std.time.sleep(1 * std.time.ns_per_ms);
+            }
+        }
+
+        if (self.debug) {
+            std.debug.print("[Worker {d}] Stopped\n", .{self.id});
+        }
+    }
+};
+
+// Coordinator implementation
+pub const ParallelDP = struct {
+    allocator: Allocator,
+    vocab_learner: *VocabLearnerModule.VocabLearner,
+    input_queues: []BoundedQueue(Message, 256),
+    output_queues: []BoundedQueue(Message, 256),
+    workers: []*Worker,
+    shared_automaton: BakaCorasick, // Now we keep a shared automaton
+    num_workers: usize,
+    debug: bool,
+    next_document_id: usize = 0,
+    pending_documents: std.AutoHashMap(usize, []const u8),
+    processed_count: usize = 0,
+
+    pub fn init(
+        allocator: Allocator,
+        vocab_learner: *VocabLearnerModule.VocabLearner,
+        debug: bool,
+    ) !*ParallelDP {
+        const coordinator = try allocator.create(ParallelDP);
+        errdefer allocator.destroy(coordinator);
+
+        // Determine number of workers based on CPU cores
+        const num_workers = try Thread.getCpuCount();
+
+        // Create queues
+        var input_queues = try allocator.alloc(BoundedQueue(Message, 256), num_workers);
+        errdefer allocator.free(input_queues);
+
+        var output_queues = try allocator.alloc(BoundedQueue(Message, 256), num_workers);
+        errdefer allocator.free(output_queues);
+
+        // Initialize queues
+        for (0..num_workers) |i| {
+            input_queues[i] = try BoundedQueue(Message, 256).init(allocator);
+            output_queues[i] = try BoundedQueue(Message, 256).init(allocator);
+        }
+
+        // Allocate worker array
+        const workers = try allocator.alloc(*Worker, num_workers);
+        errdefer allocator.free(workers);
+
+        // Initialize coordinator state
+        coordinator.* = .{
+            .allocator = allocator,
+            .vocab_learner = vocab_learner,
+            .input_queues = input_queues,
+            .output_queues = output_queues,
+            .workers = workers,
+            .shared_automaton = undefined, // Will be initialized in initWorkers
+            .num_workers = num_workers,
+            .debug = debug,
+            .pending_documents = std.AutoHashMap(usize, []const u8).init(allocator),
+        };
+
+        if (debug) {
+            std.debug.print("[ParallelDP] Initialized with {d} workers\n", .{num_workers});
+        }
+
+        return coordinator;
+    }
+
+    pub fn deinit(self: *ParallelDP) void {
+        // Stop and deinit all workers
+        for (0..self.num_workers) |i| {
+            self.workers[i].stop();
+            self.workers[i].deinit();
+
+            // Deinit queues
+            self.input_queues[i].deinit(self.allocator);
+            self.output_queues[i].deinit(self.allocator);
+        }
+
+        // Free the shared automaton
+        deinitBakaCorasick(&self.shared_automaton, self.allocator);
+
+        // Free remaining pending documents
+        var it = self.pending_documents.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.pending_documents.deinit();
+
+        // Free arrays
+        self.allocator.free(self.input_queues);
+        self.allocator.free(self.output_queues);
+        self.allocator.free(self.workers);
+
+        // Free self
+        self.allocator.destroy(self);
+    }
+
+    /// Initialize workers with the given candidates to evaluate
+    pub fn initWorkers(
+        self: *ParallelDP,
+        candidates: []SampleStats,
+        candidates_length: usize,
+    ) !void {
+        if (self.debug) {
+            std.debug.print("[ParallelDP] Initializing {d} workers with {d} candidates\n", .{ self.num_workers, candidates_length });
+        }
+
+        // Build a SINGLE automaton on the main thread
+        const automaton_start = time.nanoTimestamp();
+
+        // Initialize shared automaton
+        self.shared_automaton = try BakaCorasick.init(self.allocator);
+
+        // Add candidate tokens to the shared automaton
+        for (candidates[0..candidates_length], 0..) |stats, idx| {
+            const my_idx: u32 = @intCast(idx);
+            const token_id = stats.token_id;
+            const token_str = self.vocab_learner.getTokenStr(token_id);
+            try self.shared_automaton.insert(token_str, my_idx);
+        }
+
+        // Compute suffix links for the shared automaton
+        try self.shared_automaton.computeSuffixLinks();
+
+        const automaton_elapsed = time.nanoTimestamp() - automaton_start;
+        if (self.debug) {
+            std.debug.print("[ParallelDP] Built shared automaton in {d:.2}ms\n", .{@as(f64, @floatFromInt(automaton_elapsed)) / time.ns_per_ms});
+        }
+
+        // Create and start workers, sharing the automaton
+        for (0..self.num_workers) |i| {
+            self.workers[i] = try Worker.init(self.allocator, i, self.vocab_learner, &self.shared_automaton, // Share the automaton
+                candidates_length, &self.input_queues[i], &self.output_queues[i], self.debug);
+
+            try self.workers[i].start();
+        }
+    }
+
+    /// Process a batch of documents in parallel
+    pub fn processDocuments(
+        self: *ParallelDP,
+        loader: *fineweb,
+        sample_size: usize,
+        candidates: []SampleStats,
+        candidates_length: usize,
+    ) !void {
+        const start_time = time.nanoTimestamp();
+        // At the start of processDocuments in ParallelDP:
+        if (self.debug) {
+            const status = loader.getFileStatus();
+            std.debug.print("[ParallelDP] Document loader status: {d} files\n", .{status.total_files});
+
+            // Try to read a test document
+            const doc = try loader.nextDocumentStringLoop();
+            if (doc.len > 0) {
+                std.debug.print("[ParallelDP] Successfully read test document of length {d}\n", .{doc.len});
+                // Read another document to test the loop
+                const doc2 = try loader.nextDocumentStringLoop();
+                std.debug.print("[ParallelDP] Successfully read second test document of length {d}\n", .{doc2.len});
+            } else {
+                std.debug.print("[ParallelDP] Read empty document - loader may have issues\n", .{});
+            }
+
+            // Important: Rewind the loader to reset position after this test
+            try loader.rewind();
+        }
+        // Clear candidate stats before starting
+        for (candidates[0..candidates_length]) |*stats| {
+            stats.sampled_occurrences = 0;
+            stats.sampled_savings = 0;
+        }
+
+        // Initialize workers with shared automaton
+        try self.initWorkers(candidates, candidates_length);
+
+        // Process documents
+        var documents_processed: usize = 0;
+        var documents_submitted: usize = 0;
+        var worker_idx: usize = 0;
+
+        // Initial document feeding
+        const feed_per_worker = 4; // Number of documents to initially feed each worker
+        for (0..self.num_workers * feed_per_worker) |_| {
+            if (documents_submitted >= sample_size) break;
+
+            if (try loader.nextDocumentString()) |doc| {
+                const doc_copy = try self.allocator.dupe(u8, doc);
+                const doc_id = self.next_document_id;
+                self.next_document_id += 1;
+
+                try self.pending_documents.put(doc_id, doc_copy);
+
+                const msg = Message{
+                    .ProcessDocument = ProcessDocumentMessage{
+                        .id = doc_id,
+                        .document = doc_copy,
+                    },
+                };
+
+                // Try to push to a worker's queue
+                var pushed = false;
+                var attempts: usize = 0;
+                while (!pushed and attempts < self.num_workers) {
+                    pushed = self.input_queues[worker_idx].push(msg);
+                    if (!pushed) {
+                        worker_idx = (worker_idx + 1) % self.num_workers;
+                        attempts += 1;
+                    }
+                }
+
+                if (pushed) {
+                    documents_submitted += 1;
+                } else {
+                    // Couldn't push to any worker, free the document
+                    self.allocator.free(doc_copy);
+                    _ = self.pending_documents.remove(doc_id);
+                    if (self.debug) {
+                        std.debug.print("[ParallelDP] Warning: Couldn't submit document to any worker\n", .{});
+                    }
+                }
+            } else {
+                // No more documents
+                break;
+            }
+        }
+
+        if (self.debug) {
+            std.debug.print("[ParallelDP] Initially submitted {d} documents to workers\n", .{documents_submitted});
+        }
+
+        // Process results and feed more documents
+        while (documents_processed < sample_size and documents_processed < documents_submitted) {
+            // Check for results from all workers
+            var got_results = false;
+
+            for (0..self.num_workers) |i| {
+                if (self.output_queues[i].pop()) |msg| {
+                    got_results = true;
+
+                    switch (msg) {
+                        .DocumentProcessed => |processed| {
+                            // Update candidate statistics - using actual token IDs
+                            for (processed.document_stats, 0..) |stats, idx| {
+                                if (idx < candidates_length) {
+                                    candidates[idx].sampled_occurrences += stats.sampled_occurrences;
+                                    candidates[idx].sampled_savings += stats.sampled_savings;
+                                }
+                            }
+
+                            // Free the result stats
+                            self.allocator.free(processed.document_stats);
+
+                            // Remove document from pending
+                            if (self.pending_documents.fetchRemove(processed.id)) |entry| {
+                                self.allocator.free(entry.value);
+                            }
+
+                            documents_processed += 1;
+
+                            // Submit another document if we haven't reached the limit
+                            if (documents_submitted < sample_size) {
+                                if (try loader.nextDocumentString()) |doc| {
+                                    const doc_copy = try self.allocator.dupe(u8, doc);
+                                    const doc_id = self.next_document_id;
+                                    self.next_document_id += 1;
+
+                                    try self.pending_documents.put(doc_id, doc_copy);
+
+                                    const new_msg = Message{
+                                        .ProcessDocument = ProcessDocumentMessage{
+                                            .id = doc_id,
+                                            .document = doc_copy,
+                                        },
+                                    };
+
+                                    if (self.input_queues[i].push(new_msg)) {
+                                        documents_submitted += 1;
+                                    } else {
+                                        // Could not push, free the document
+                                        self.allocator.free(doc_copy);
+                                        _ = self.pending_documents.remove(doc_id);
+                                    }
+                                }
+                            }
+
+                            // Log progress
+                            if (self.debug and documents_processed % 1000 == 0) {
+                                std.debug.print("[ParallelDP] Processed {d}/{d} documents\n", .{ documents_processed, sample_size });
+                            }
+                        },
+                        .Error => |error_data| {
+                            std.debug.print("[ParallelDP] Worker {d} error: {s}\n", .{ error_data.worker_id, error_data.message });
+                            self.allocator.free(error_data.message);
+                        },
+                        else => {
+                            std.debug.print("[ParallelDP] Unexpected message from worker\n", .{});
+                        },
+                    }
+                }
+            }
+
+            if (!got_results) {
+                // No results, sleep a bit
+                std.time.sleep(1 * std.time.ns_per_ms);
+            }
+
+            // Check if we've processed all submitted documents and there are no more to submit
+            if (documents_processed == documents_submitted and documents_submitted < sample_size) {
+                if (try loader.nextDocumentString()) |doc| {
+                    const doc_copy = try self.allocator.dupe(u8, doc);
+                    const doc_id = self.next_document_id;
+                    self.next_document_id += 1;
+
+                    try self.pending_documents.put(doc_id, doc_copy);
+
+                    const new_msg = Message{
+                        .ProcessDocument = ProcessDocumentMessage{
+                            .id = doc_id,
+                            .document = doc_copy,
+                        },
+                    };
+
+                    // Try to push to any worker
+                    var pushed = false;
+                    for (0..self.num_workers) |i| {
+                        if (self.input_queues[i].push(new_msg)) {
+                            pushed = true;
+                            documents_submitted += 1;
+                            break;
+                        }
+                    }
+
+                    if (!pushed) {
+                        // Couldn't push to any worker, free the document
+                        self.allocator.free(doc_copy);
+                        _ = self.pending_documents.remove(doc_id);
+                    }
+                } else if (documents_processed == documents_submitted) {
+                    // No more documents and all processed
+                    break;
+                }
+            }
+        }
+
+        // Shutdown all workers
+        for (0..self.num_workers) |i| {
+            const msg = Message{
+                .Shutdown = i,
+            };
+
+            // Try to push shutdown message
+            var pushed = false;
+            while (!pushed) {
+                pushed = self.input_queues[i].push(msg);
+                if (!pushed) {
+                    std.time.sleep(1 * std.time.ns_per_ms);
+                }
+            }
+        }
+
+        // Wait for all workers to join
+        for (0..self.num_workers) |i| {
+            if (self.workers[i].thread) |thread| {
+                thread.join();
+                self.workers[i].thread = null;
+            }
+        }
+
+        self.processed_count += documents_processed;
+
+        const elapsed = time.nanoTimestamp() - start_time;
+        if (self.debug) {
+            std.debug.print("[ParallelDP] Processed {d} documents in {d:.2}ms\n", .{ documents_processed, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
+        }
+    }
+};

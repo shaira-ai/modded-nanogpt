@@ -3,6 +3,7 @@ const BakaCorasick = @import("baka_corasick.zig").BakaCorasick;
 const fineweb = @import("data_loader.zig").FinewebDataLoader;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
+const parallel = @import("parallel.zig");
 
 pub const TokenStats = extern struct {
     str_start_idx: u64,
@@ -13,24 +14,19 @@ pub const TokenStats = extern struct {
     sampled_savings: u64 = 0,
     sampled_step: u64 = 0,
     est_total_savings: f64 = 0,
-    //est_n_uses: u32 = 0,
-    //max_gain_for_nonoverlapping_occurrences: u32 = 0,
-    //max_gain_for_nonoverlapping_occurrences_computed_at: u32 = 0,
-    //missed_gain_from_superstring_used: u32 = 0,
-    //missed_gain_from_superstring_used_computed_at: u32 = 0,
 
     pub inline fn getCurrentValueBound(self: TokenStats) f64 {
         return self.est_total_savings;
     }
 };
 
-const SampleStats = struct {
+pub const SampleStats = struct {
     sampled_occurrences: u64 = 0,
     sampled_savings: u64 = 0,
     token_id: u32,
 };
 
-const MatchInfo = struct {
+pub const MatchInfo = struct {
     bits: u64,
     pub inline fn init(token_id: u32, end_pos: u32) MatchInfo {
         return .{
@@ -627,11 +623,6 @@ pub const VocabLearner = struct {
         var candidate_automaton = try BakaCorasick.init(self.allocator);
         defer deinitBakaCorasick(&candidate_automaton, self.allocator);
 
-        var lookbacks = std.ArrayList(u64).init(self.allocator);
-        var dp_solution = std.ArrayList(u32).init(self.allocator);
-        var matches = std.ArrayList(MatchInfo).init(self.allocator);
-        const token_idx_to_least_end_pos = try self.allocator.alloc(u32, self.top_k_candidates);
-
         while (self.vocab_size < self.max_vocab_size) {
             const max_acceptable = @min(accepted_current_step_tokens.len, self.max_vocab_size - self.vocab_size);
             const iteration_start = std.time.milliTimestamp();
@@ -690,20 +681,16 @@ pub const VocabLearner = struct {
                     std.debug.print("Added {d} candidate tokens to automaton\n", .{candidates_to_evaluate});
                 }
 
+                const parallel_dp = try parallel.ParallelDP.init(self.allocator, self, self.debug);
+                defer parallel_dp.deinit();
+
                 // -- Keep the document sampling and evaluation code --
-                const sample_size = self.sample_size;
-                for (0..sample_size) |_| {
-                    const doc = try self.loader.?.nextDocumentStringLoop();
-                    try self.evaluateCandidatesOnDocumentDP(
-                        top_k_candidates[0..candidates_to_evaluate],
-                        &candidate_automaton,
-                        doc,
-                        &lookbacks,
-                        &dp_solution,
-                        &matches,
-                        token_idx_to_least_end_pos,
-                    );
-                }
+                try parallel_dp.processDocuments(
+                    self.loader.?,
+                    self.sample_size,
+                    top_k_candidates,
+                    candidates_to_evaluate,
+                );
 
                 // Always update sampled_step for all evaluated tokens
                 for (top_k_candidates[0..candidates_to_evaluate]) |sample_stats| {
@@ -988,24 +975,52 @@ pub const VocabLearner = struct {
         };
         try file.writeAll(std.mem.asBytes(&header));
 
-        // Write each token
-        for (self.candidate_stats, 0..) |stats, i| {
-            if (!stats.is_in_vocab) continue;
+        // Write each token with sequential IDs
+        var sequential_id: u32 = 0;
+
+        // First, ensure the byte tokens (0-255) are saved with their original IDs
+        for (0..256) |i| {
             const token_id: u32 = @intCast(i);
+            if (!self.candidate_stats[token_id].is_in_vocab) {
+                // This shouldn't happen for byte tokens, but just in case
+                continue;
+            }
+
             const token_str = self.getTokenStr(token_id);
             const token_length: u32 = @intCast(token_str.len);
 
-            // Write token ID and length (convert to little-endian bytes)
+            // Write original token ID for byte tokens (0-255)
             var id_bytes: [4]u8 = undefined;
             var len_bytes: [4]u8 = undefined;
-            std.mem.writeInt(u32, &id_bytes, token_id, .little);
+            std.mem.writeInt(u32, &id_bytes, sequential_id, .little);
             std.mem.writeInt(u32, &len_bytes, token_length, .little);
 
             try file.writeAll(&id_bytes);
             try file.writeAll(&len_bytes);
-
-            // Write token content
             try file.writeAll(token_str);
+
+            sequential_id += 1;
+        }
+
+        // Then save all other tokens with sequential IDs
+        for (256..self.candidate_stats.len) |i| {
+            const original_id: u32 = @intCast(i);
+            if (!self.candidate_stats[original_id].is_in_vocab) continue;
+
+            const token_str = self.getTokenStr(original_id);
+            const token_length: u32 = @intCast(token_str.len);
+
+            // Write sequential token ID
+            var id_bytes: [4]u8 = undefined;
+            var len_bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &id_bytes, sequential_id, .little);
+            std.mem.writeInt(u32, &len_bytes, token_length, .little);
+
+            try file.writeAll(&id_bytes);
+            try file.writeAll(&len_bytes);
+            try file.writeAll(token_str);
+
+            sequential_id += 1;
         }
 
         if (self.debug) {
@@ -1231,7 +1246,7 @@ pub const VocabLearner = struct {
         return learner;
     }
 
-    fn evaluateCandidatesOnDocumentDP(
+    pub fn evaluateCandidatesOnDocumentDP(
         self: *const VocabLearner,
         candidates: []SampleStats,
         candidates_automaton: *const BakaCorasick,
@@ -1486,15 +1501,6 @@ pub const VocabLearner = struct {
         var candidate_automaton = try BakaCorasick.init(self.allocator);
         defer deinitBakaCorasick(&candidate_automaton, self.allocator);
 
-        var lookbacks = std.ArrayList(u64).init(self.allocator);
-        defer lookbacks.deinit();
-        var dp_solution = std.ArrayList(u32).init(self.allocator);
-        defer dp_solution.deinit();
-        var matches = std.ArrayList(MatchInfo).init(self.allocator);
-        defer matches.deinit();
-        const token_idx_to_least_end_pos = try self.allocator.alloc(u32, large_number);
-        defer self.allocator.free(token_idx_to_least_end_pos);
-
         // Extract top candidates for evaluation
         for (0..large_number) |i| {
             if (heap.count() == 0) break;
@@ -1515,18 +1521,10 @@ pub const VocabLearner = struct {
         self.sample_size = @max(self.sample_size / 4, 5); // Reduce sample size for speed
 
         // Evaluate selected candidates on samples to get accurate estimates
-        for (0..self.sample_size) |_| {
-            const doc = try self.loader.?.nextDocumentStringLoop();
-            try self.evaluateCandidatesOnDocumentDP(
-                top_k_candidates[0..large_number],
-                &candidate_automaton,
-                doc,
-                &lookbacks,
-                &dp_solution,
-                &matches,
-                token_idx_to_least_end_pos,
-            );
-        }
+        const parallel_dp = try parallel.ParallelDP.init(self.allocator, self, self.debug);
+        defer parallel_dp.deinit();
+
+        try parallel_dp.processDocuments(self.loader.?, self.sample_size, top_k_candidates, large_number);
 
         // Restore original sample size
         self.sample_size = original_sample_size;
