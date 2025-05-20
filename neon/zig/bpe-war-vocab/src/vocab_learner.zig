@@ -300,7 +300,10 @@ pub const VocabLearner = struct {
 
         self.candidate_stats = try self.allocator.alloc(TokenStats, self.n_token_ids);
         for (self.candidate_stats) |*stats| {
-            stats.* = .{ .str_start_idx = 0, .str_len = 0, };
+            stats.* = .{
+                .str_start_idx = 0,
+                .str_len = 0,
+            };
         }
 
         if (self.debug) {
@@ -349,23 +352,18 @@ pub const VocabLearner = struct {
             std.debug.print("Processing corpus using raw text conversion...\n", .{});
         }
 
-        // Find all binary files
-        var corpus_files = try self.collectBinFiles();
-        defer {
-            for (corpus_files.items) |path| {
-                self.allocator.free(path);
+        if (self.loader == null) {
+            var corpus_files = try self.collectBinFiles();
+            defer {
+                for (corpus_files.items) |path| {
+                    self.allocator.free(path);
+                }
+                corpus_files.deinit();
             }
-            corpus_files.deinit();
+            var loader = try fineweb.init(self.allocator, corpus_files.items);
+            try loader.loadVocabulary("vocab.json");
+            self.loader = loader;
         }
-
-        if (self.debug) {
-            std.debug.print("Found {d} .bin files to process\n", .{corpus_files.items.len});
-        }
-
-        // Initialize data loader with the files
-        var loader = try fineweb.init(self.allocator, corpus_files.items);
-        try loader.loadVocabulary("vocab.json");
-        self.loader = loader;
 
         // Setup for token counting
         var combined_automaton = try BakaCorasick.init(self.allocator);
@@ -401,7 +399,7 @@ pub const VocabLearner = struct {
         var position: u64 = 0;
         var tokens_recorded: u64 = 0;
 
-        while (try loader.nextDocumentString()) |text| {
+        while (try self.loader.?.nextDocumentString()) |text| {
             // Scan text with the automaton
             var current_state: u32 = 0;
             for (text) |byte| {
@@ -1961,8 +1959,19 @@ pub const VocabLearner = struct {
             if (self.debug) {
                 std.debug.print("Using cached corpus statistics. Skipping corpus processing.\n", .{});
             }
+
+            // Initialize loader here, since processCorpus() won't be called
+            var corpus_files = try self.collectBinFiles();
+            defer {
+                for (corpus_files.items) |path| {
+                    self.allocator.free(path);
+                }
+                corpus_files.deinit();
+            }
+            var loader = try fineweb.init(self.allocator, corpus_files.items);
+            try loader.loadVocabulary("vocab.json");
+            self.loader = loader;
         } else {
-            // No valid cache, so process the corpus
             try self.processCorpus();
 
             // Save results for future runs
