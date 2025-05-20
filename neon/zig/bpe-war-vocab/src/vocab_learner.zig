@@ -174,11 +174,6 @@ pub const VocabLearner = struct {
         return learner;
     }
 
-    fn deinitBakaCorasick(self: *BakaCorasick, allocator: Allocator) void {
-        allocator.free(self.transitions[0..self.capacity]);
-        allocator.free(self.info[0..self.capacity]);
-    }
-
     pub fn deinit(self: *VocabLearner) void {
         // Free candidate stats (each contains its own token)
         self.allocator.free(self.candidate_stats);
@@ -190,8 +185,8 @@ pub const VocabLearner = struct {
         self.processed_files.deinit();
 
         // Clean up BakaCorasick instances
-        deinitBakaCorasick(&self.vocab_automaton, self.allocator);
-        deinitBakaCorasick(&self.eval_automaton, self.allocator);
+        self.vocab_automaton.deinit();
+        self.eval_automaton.deinit();
 
         // Free document sampler
         self.document_sampler.deinit();
@@ -304,6 +299,9 @@ pub const VocabLearner = struct {
         }
 
         self.candidate_stats = try self.allocator.alloc(TokenStats, self.n_token_ids);
+        for (self.candidate_stats) |*stats| {
+            stats.* = .{ .str_start_idx = 0, .str_len = 0, };
+        }
 
         if (self.debug) {
             std.debug.print("Found {d} total candidate tokens.\n", .{self.n_token_ids});
@@ -371,7 +369,7 @@ pub const VocabLearner = struct {
 
         // Setup for token counting
         var combined_automaton = try BakaCorasick.init(self.allocator);
-        defer deinitBakaCorasick(&combined_automaton, self.allocator);
+        defer combined_automaton.deinit();
 
         if (self.debug) {
             std.debug.print("Building search automaton with {d} candidate tokens ({d})...\n", .{ self.candidate_stats.len, self.n_token_ids });
@@ -621,7 +619,10 @@ pub const VocabLearner = struct {
         const top_k_candidates = try self.allocator.alloc(SampleStats, self.top_k_candidates);
 
         var candidate_automaton = try BakaCorasick.init(self.allocator);
-        defer deinitBakaCorasick(&candidate_automaton, self.allocator);
+        defer candidate_automaton.deinit();
+
+        var parallel_dp = try parallel.ParallelDP.init(self.allocator, self, self.debug);
+        defer parallel_dp.deinit();
 
         while (self.vocab_size < self.max_vocab_size) {
             const max_acceptable = @min(accepted_current_step_tokens.len, self.max_vocab_size - self.vocab_size);
@@ -632,31 +633,15 @@ pub const VocabLearner = struct {
                 std.debug.print("\n--- Iteration {d}: Vocabulary size {d}/{d} ---\n", .{ self.current_step, self.vocab_size, self.max_vocab_size });
             }
 
-            var already_evaluated = std.AutoHashMap(u32, void).init(self.allocator);
-            defer already_evaluated.deinit();
-
             var apparent_best_token_id = heap.peek().?;
             // At the start of buildVocabulary loop
             std.debug.print("Top token ID: {d}, sampled_step: {d}, current: {d}\n", .{ apparent_best_token_id, self.candidate_stats[apparent_best_token_id].sampled_step, self.current_step });
             while (self.candidate_stats[apparent_best_token_id].sampled_step < self.current_step) {
                 // Extract candidates that haven't been evaluated yet
-                var candidates_to_evaluate: usize = 0;
                 for (0..self.top_k_candidates) |i| {
-                    if (heap.count() == 0) break;
-
                     const token_id = heap.remove();
-                    if (already_evaluated.contains(token_id)) {
-                        try heap.add(token_id);
-                        continue;
-                    }
-
                     top_k_candidates[i] = .{ .token_id = token_id };
-                    try already_evaluated.put(token_id, {});
-                    candidates_to_evaluate += 1;
                 }
-
-                // If we've evaluated all candidates, break the loop
-                if (candidates_to_evaluate == 0) break;
 
                 // -- Keep the existing automaton building code --
                 const automaton_start_time = std.time.milliTimestamp();
@@ -666,7 +651,7 @@ pub const VocabLearner = struct {
 
                 // Add candidate tokens with flag
                 candidate_automaton.clear();
-                for (top_k_candidates[0..candidates_to_evaluate], 0..) |stats, my_idx_usize| {
+                for (top_k_candidates, 0..) |stats, my_idx_usize| {
                     const my_idx: u32 = @intCast(my_idx_usize);
                     const token_id = stats.token_id;
                     const token_str = self.getTokenStr(token_id);
@@ -678,27 +663,20 @@ pub const VocabLearner = struct {
                 if (self.debug) {
                     const automaton_elapsed_seconds = @as(f64, @floatFromInt(std.time.milliTimestamp() - automaton_start_time)) / 1000.0;
                     std.debug.print("Candidate automaton created with {d} states in {d:.2}s\n", .{ candidate_automaton.len, automaton_elapsed_seconds });
-                    std.debug.print("Added {d} candidate tokens to automaton\n", .{candidates_to_evaluate});
+                    std.debug.print("Added {d} candidate tokens to automaton\n", .{top_k_candidates.len});
                 }
-
-                const parallel_dp = try parallel.ParallelDP.init(self.allocator, self, self.debug);
-                defer parallel_dp.deinit();
 
                 // -- Keep the document sampling and evaluation code --
                 try parallel_dp.processDocuments(
                     self.loader.?,
                     self.sample_size,
                     top_k_candidates,
-                    candidates_to_evaluate,
                 );
 
                 // Always update sampled_step for all evaluated tokens
-                for (top_k_candidates[0..candidates_to_evaluate]) |sample_stats| {
+                for (top_k_candidates) |sample_stats| {
                     const token_id = sample_stats.token_id;
                     const sampled_occurrences = sample_stats.sampled_occurrences;
-
-                    // Always mark as evaluated for this step
-                    self.candidate_stats[token_id].sampled_step = self.current_step;
 
                     // Only update estimates if we have enough data
                     if (sampled_occurrences >= 5) {
@@ -709,6 +687,7 @@ pub const VocabLearner = struct {
                         self.candidate_stats[token_id].sampled_occurrences = sampled_occurrences;
                         self.candidate_stats[token_id].sampled_savings = sampled_savings;
                         self.candidate_stats[token_id].est_total_savings = est_savings;
+                        self.candidate_stats[token_id].sampled_step = self.current_step;
                     }
                     try heap.add(token_id);
                 }
@@ -759,25 +738,25 @@ pub const VocabLearner = struct {
             try self.vocab_automaton.computeSuffixLinks();
 
             // 6. Delete Tokens
-            if (self.vocab_size >= self.max_vocab_size) {
-                // Only do batch replacement if we have enough tokens to work with
-                const non_essential_token_count = self.vocab_size - 256;
-                const batch_size = 1000;
+            // if (self.vocab_size >= self.max_vocab_size) {
+            //     // Only do batch replacement if we have enough tokens to work with
+            //     const non_essential_token_count = self.vocab_size - 256;
+            //     const batch_size = 1000;
 
-                if (non_essential_token_count >= batch_size) {
-                    const batch_count = @min(50, non_essential_token_count / batch_size);
+            //     if (non_essential_token_count >= batch_size) {
+            //         const batch_count = @min(50, non_essential_token_count / batch_size);
 
-                    if (batch_count > 0) {
-                        if (self.debug) {
-                            std.debug.print("\nStarting batch token replacement phase...\n", .{});
-                        }
+            //         if (batch_count > 0) {
+            //             if (self.debug) {
+            //                 std.debug.print("\nStarting batch token replacement phase...\n", .{});
+            //             }
 
-                        try self.batchTokenReplacement(batch_count, batch_size);
-                    }
-                } else if (self.debug) {
-                    std.debug.print("\nNot enough non-essential tokens for batch replacement.\n", .{});
-                }
-            }
+            //             try self.batchTokenReplacement(batch_count, batch_size);
+            //         }
+            //     } else if (self.debug) {
+            //         std.debug.print("\nNot enough non-essential tokens for batch replacement.\n", .{});
+            //     }
+            // }
 
             const iteration_elapsed = std.time.milliTimestamp() - iteration_start;
             if (self.debug) {
@@ -1499,7 +1478,7 @@ pub const VocabLearner = struct {
 
         // Prepare data structures for candidate evaluation
         var candidate_automaton = try BakaCorasick.init(self.allocator);
-        defer deinitBakaCorasick(&candidate_automaton, self.allocator);
+        defer candidate_automaton.deinit();
 
         // Extract top candidates for evaluation
         for (0..large_number) |i| {
@@ -1521,10 +1500,10 @@ pub const VocabLearner = struct {
         self.sample_size = @max(self.sample_size / 4, 5); // Reduce sample size for speed
 
         // Evaluate selected candidates on samples to get accurate estimates
-        const parallel_dp = try parallel.ParallelDP.init(self.allocator, self, self.debug);
+        var parallel_dp = try parallel.ParallelDP.init(self.allocator, self, self.debug);
         defer parallel_dp.deinit();
 
-        try parallel_dp.processDocuments(self.loader.?, self.sample_size, top_k_candidates, large_number);
+        try parallel_dp.processDocuments(self.loader.?, self.sample_size, top_k_candidates);
 
         // Restore original sample size
         self.sample_size = original_sample_size;
@@ -1532,9 +1511,6 @@ pub const VocabLearner = struct {
         // Update estimates and return to heap
         for (top_k_candidates) |sample_stats| {
             const token_id = sample_stats.token_id;
-
-            // ALWAYS update the step
-            self.candidate_stats[token_id].sampled_step = self.current_step;
 
             // Only update value estimates if we have enough occurrences
             const sampled_occurrences = sample_stats.sampled_occurrences;
@@ -2066,7 +2042,7 @@ pub fn main() !void {
 
     const debug = true;
 
-    var learner = try VocabLearner.init(allocator, tokenset_path, corpus_paths, 5000, debug);
+    var learner = try VocabLearner.init(allocator, tokenset_path, corpus_paths, 300, debug);
     defer learner.deinit();
 
     // Check if everything initialized properly

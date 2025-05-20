@@ -9,63 +9,7 @@ const VocabLearnerModule = @import("vocab_learner.zig");
 const SampleStats = VocabLearnerModule.SampleStats;
 const TokenStats = VocabLearnerModule.TokenStats;
 const MatchInfo = VocabLearnerModule.MatchInfo;
-
-// SPSC Queue implementation - reusing from provided files
-const cache_line_length = switch (@import("builtin").target.cpu.arch) {
-    .aarch64, .powerpc64 => 128,
-    .arm, .mips, .mips64, .riscv64 => 32,
-    .s390x => 256,
-    else => 64,
-};
-
-pub fn BoundedQueue(comptime T: type, comptime capacity: comptime_int) type {
-    std.debug.assert(std.math.isPowerOfTwo(capacity));
-    const mask = capacity - 1;
-
-    return struct {
-        const Self = @This();
-
-        // align to 2*cache_line_length to fight the next-line prefetcher
-        buffer: *[capacity]T align(2 * cache_line_length),
-        head: usize align(2 * cache_line_length),
-        tail: usize align(2 * cache_line_length),
-
-        pub fn init(gpa: Allocator) !Self {
-            const buffer = try gpa.create([capacity]T);
-            return Self{ .buffer = buffer, .head = 0, .tail = 0 };
-        }
-
-        pub fn deinit(self: *Self, gpa: Allocator) void {
-            gpa.destroy(self.buffer);
-        }
-
-        pub fn push(self: *Self, value: T) bool {
-            const head = @atomicLoad(usize, &self.head, .acquire);
-            const tail = self.tail;
-            if (head +% 1 -% tail > capacity) return false;
-            self.buffer[head & mask] = value;
-            @atomicStore(usize, &self.head, head +% 1, .release);
-            return true;
-        }
-
-        pub fn pop(self: *Self) ?T {
-            const tail = @atomicLoad(usize, &self.tail, .acquire);
-            const head = self.head;
-            if (tail -% head == 0) return null;
-            const value = self.buffer[tail & mask];
-            @atomicStore(usize, &self.tail, tail +% 1, .release);
-            return value;
-        }
-    };
-}
-
-// Message types
-const MessageType = enum {
-    ProcessDocument,
-    DocumentProcessed,
-    Shutdown,
-    Error,
-};
+const BoundedQueue = @import("spsc.zig").BoundedQueue;
 
 const ProcessDocumentMessage = struct {
     id: usize,
@@ -74,8 +18,6 @@ const ProcessDocumentMessage = struct {
 
 const DocumentProcessedMessage = struct {
     id: usize,
-    worker_id: usize,
-    document_stats: []SampleStats,
 };
 
 const ErrorMessage = struct {
@@ -83,30 +25,30 @@ const ErrorMessage = struct {
     message: []const u8,
 };
 
-const Message = union(MessageType) {
+const SubmissionQueueEntry = union(enum) {
+    Reset: []SampleStats,
     ProcessDocument: ProcessDocumentMessage,
-    DocumentProcessed: DocumentProcessedMessage,
     Shutdown: usize, // worker id
-    Error: ErrorMessage,
 };
 
-fn deinitBakaCorasick(automaton: *BakaCorasick, allocator: Allocator) void {
-    allocator.free(automaton.transitions[0..automaton.capacity]);
-    allocator.free(automaton.info[0..automaton.capacity]);
-}
+const CompletionQueueEntry = union(enum) {
+    DocumentProcessed: DocumentProcessedMessage,
+    Error: ErrorMessage,
+};
 
 // Worker implementation
 pub const Worker = struct {
     allocator: Allocator,
     id: usize,
     vocab_learner: *VocabLearnerModule.VocabLearner,
+    candidate_stats: []SampleStats,
     candidate_automaton: *BakaCorasick, // Now just a reference to shared automaton
     token_idx_to_least_end_pos: []u32,
     lookbacks: std.ArrayList(u64),
     dp_solution: std.ArrayList(u32),
     matches: std.ArrayList(MatchInfo),
-    input_queue: *BoundedQueue(Message, 256),
-    output_queue: *BoundedQueue(Message, 256),
+    submission_queue: *BoundedQueue(SubmissionQueueEntry, 256),
+    completion_queue: *BoundedQueue(CompletionQueueEntry, 256),
     thread: ?Thread = null,
     running: bool = false,
     candidates_length: usize,
@@ -118,41 +60,39 @@ pub const Worker = struct {
         vocab_learner: *VocabLearnerModule.VocabLearner,
         candidate_automaton: *BakaCorasick, // Now taking shared automaton
         candidates_length: usize,
-        input_queue: *BoundedQueue(Message, 256),
-        output_queue: *BoundedQueue(Message, 256),
+        submission_queue: *BoundedQueue(SubmissionQueueEntry, 256),
+        completion_queue: *BoundedQueue(CompletionQueueEntry, 256),
         debug: bool,
-    ) !*Worker {
-        const worker = try allocator.create(Worker);
-        errdefer allocator.destroy(worker);
-
+    ) !Worker {
         // Initialize data structures (each worker has its own)
         const lookbacks = std.ArrayList(u64).init(allocator);
         const dp_solution = std.ArrayList(u32).init(allocator);
         const matches = std.ArrayList(MatchInfo).init(allocator);
 
         const token_idx_to_least_end_pos = try allocator.alloc(u32, candidates_length);
+        const candidate_stats = try allocator.alloc(SampleStats, candidates_length);
 
-        worker.* = .{
+        return Worker{
             .allocator = allocator,
             .id = id,
             .vocab_learner = vocab_learner,
+            .candidate_stats = candidate_stats,
             .candidate_automaton = candidate_automaton, // Using shared automaton
             .token_idx_to_least_end_pos = token_idx_to_least_end_pos,
             .lookbacks = lookbacks,
             .dp_solution = dp_solution,
             .matches = matches,
-            .input_queue = input_queue,
-            .output_queue = output_queue,
+            .submission_queue = submission_queue,
+            .completion_queue = completion_queue,
             .candidates_length = candidates_length,
             .debug = debug,
         };
-
-        return worker;
     }
 
     pub fn deinit(self: *Worker) void {
         if (self.thread) |thread| {
             thread.join();
+            self.thread = null;
         }
 
         // Don't deinit shared automaton, just our private data structures
@@ -160,7 +100,6 @@ pub const Worker = struct {
         self.dp_solution.deinit();
         self.matches.deinit();
         self.allocator.free(self.token_idx_to_least_end_pos);
-        self.allocator.destroy(self);
     }
 
     pub fn start(self: *Worker) !void {
@@ -179,22 +118,9 @@ pub const Worker = struct {
     }
 
     fn processDocument(self: *Worker, document: []const u8, doc_id: usize) !void {
-        // Create local copies of candidate stats for this document
-        var local_stats = try self.allocator.alloc(SampleStats, self.candidates_length);
-        defer self.allocator.free(local_stats);
-
-        // Initialize local stats with zero counts
-        for (0..self.candidates_length) |i| {
-            local_stats[i] = .{
-                .token_id = @intCast(i), // Store index for coordinator to map back
-                .sampled_occurrences = 0,
-                .sampled_savings = 0,
-            };
-        }
-
         // Process the document using the evaluateCandidatesOnDocumentDP logic
         try self.vocab_learner.evaluateCandidatesOnDocumentDP(
-            local_stats,
+            self.candidate_stats,
             self.candidate_automaton,
             document,
             &self.lookbacks,
@@ -203,24 +129,17 @@ pub const Worker = struct {
             self.token_idx_to_least_end_pos,
         );
 
-        // Create copy of results to send back to coordinator
-        const result_stats = try self.allocator.dupe(SampleStats, local_stats);
-
         // Send results
-        const result_msg = Message{
+        const result_msg = CompletionQueueEntry{
             .DocumentProcessed = DocumentProcessedMessage{
                 .id = doc_id,
-                .worker_id = self.id,
-                .document_stats = result_stats,
             },
         };
 
-        var pushed = false;
+        var pushed = self.completion_queue.push(result_msg);
         while (!pushed) {
-            pushed = self.output_queue.push(result_msg);
-            if (!pushed) {
-                std.time.sleep(1 * std.time.ns_per_ms);
-            }
+            std.time.sleep(1 * std.time.ns_per_ms);
+            pushed = self.completion_queue.push(result_msg);
         }
     }
 
@@ -230,18 +149,25 @@ pub const Worker = struct {
         }
 
         while (self.running) {
-            if (self.input_queue.pop()) |msg| {
+            if (self.submission_queue.pop()) |msg| {
                 switch (msg) {
+                    .Reset => |coordinator_stats| {
+                        for (self.candidate_stats, 0..) |*stats, idx| {
+                            stats.sampled_occurrences = 0;
+                            stats.sampled_savings = 0;
+                            stats.token_id = coordinator_stats[idx].token_id;
+                        }
+                    },
                     .ProcessDocument => |process_data| {
                         self.processDocument(process_data.document, process_data.id) catch |err| {
                             const error_msg = try std.fmt.allocPrint(self.allocator, "Error processing document: {s}", .{@errorName(err)});
-                            const error_message = Message{
+                            const error_message = CompletionQueueEntry{
                                 .Error = ErrorMessage{
                                     .worker_id = self.id,
                                     .message = error_msg,
                                 },
                             };
-                            _ = self.output_queue.push(error_message);
+                            _ = self.completion_queue.push(error_message);
                         };
                     },
                     .Shutdown => {
@@ -250,11 +176,11 @@ pub const Worker = struct {
                         }
                         self.running = false;
                     },
-                    else => {
-                        if (self.debug) {
-                            std.debug.print("[Worker {d}] Unexpected message type\n", .{self.id});
-                        }
-                    },
+                    // else => {
+                    //     if (self.debug) {
+                    //         std.debug.print("[Worker {d}] Unexpected message type\n", .{self.id});
+                    //     }
+                    // },
                 }
             } else {
                 // No messages, sleep a bit
@@ -272,62 +198,85 @@ pub const Worker = struct {
 pub const ParallelDP = struct {
     allocator: Allocator,
     vocab_learner: *VocabLearnerModule.VocabLearner,
-    input_queues: []BoundedQueue(Message, 256),
-    output_queues: []BoundedQueue(Message, 256),
-    workers: []*Worker,
+    submission_queues: []BoundedQueue(SubmissionQueueEntry, 256),
+    completion_queues: []BoundedQueue(CompletionQueueEntry, 256),
+    workers: []Worker,
     shared_automaton: BakaCorasick, // Now we keep a shared automaton
     num_workers: usize,
     debug: bool,
     next_document_id: usize = 0,
-    pending_documents: std.AutoHashMap(usize, []const u8),
+    n_outstanding_jobs: []usize,
+    pending_documents: [][]const u8,
+    pending_documents_free_list: []usize,
+    n_free_pending_documents: usize,
+    queue_depth: usize,
     processed_count: usize = 0,
+    started_workers: bool = false,
 
     pub fn init(
         allocator: Allocator,
         vocab_learner: *VocabLearnerModule.VocabLearner,
         debug: bool,
-    ) !*ParallelDP {
-        const coordinator = try allocator.create(ParallelDP);
-        errdefer allocator.destroy(coordinator);
-
+    ) !ParallelDP {
         // Determine number of workers based on CPU cores
         const num_workers = try Thread.getCpuCount();
 
         // Create queues
-        var input_queues = try allocator.alloc(BoundedQueue(Message, 256), num_workers);
-        errdefer allocator.free(input_queues);
+        var submission_queues = try allocator.alloc(BoundedQueue(SubmissionQueueEntry, 256), num_workers);
+        errdefer allocator.free(submission_queues);
 
-        var output_queues = try allocator.alloc(BoundedQueue(Message, 256), num_workers);
-        errdefer allocator.free(output_queues);
+        var completion_queues = try allocator.alloc(BoundedQueue(CompletionQueueEntry, 256), num_workers);
+        errdefer allocator.free(completion_queues);
 
         // Initialize queues
         for (0..num_workers) |i| {
-            input_queues[i] = try BoundedQueue(Message, 256).init(allocator);
-            output_queues[i] = try BoundedQueue(Message, 256).init(allocator);
+            submission_queues[i] = try BoundedQueue(SubmissionQueueEntry, 256).init(allocator);
+            completion_queues[i] = try BoundedQueue(CompletionQueueEntry, 256).init(allocator);
         }
 
         // Allocate worker array
-        const workers = try allocator.alloc(*Worker, num_workers);
+        const workers = try allocator.alloc(Worker, num_workers);
         errdefer allocator.free(workers);
 
-        // Initialize coordinator state
-        coordinator.* = .{
-            .allocator = allocator,
-            .vocab_learner = vocab_learner,
-            .input_queues = input_queues,
-            .output_queues = output_queues,
-            .workers = workers,
-            .shared_automaton = undefined, // Will be initialized in initWorkers
-            .num_workers = num_workers,
-            .debug = debug,
-            .pending_documents = std.AutoHashMap(usize, []const u8).init(allocator),
-        };
+        const queue_depth = 2;
+        const pending_documents = try allocator.alloc([]const u8, num_workers * queue_depth);
+        errdefer allocator.free(pending_documents);
+        for (pending_documents) |*ptr| {
+            ptr.* = &[_]u8{};
+        }
+        const pending_documents_free_list = try allocator.alloc(usize, num_workers * queue_depth);
+        errdefer allocator.free(pending_documents_free_list);
+        for (pending_documents_free_list, 0..) |*ptr, i| {
+            ptr.* = i;
+        }
+
+        const n_outstanding_jobs = try allocator.alloc(usize, num_workers);
+        errdefer allocator.free(n_outstanding_jobs);
+        @memset(n_outstanding_jobs, 0);
+
+        const automaton = try BakaCorasick.init(allocator);
+        errdefer automaton.deinit();
 
         if (debug) {
             std.debug.print("[ParallelDP] Initialized with {d} workers\n", .{num_workers});
         }
 
-        return coordinator;
+
+        return ParallelDP{
+            .allocator = allocator,
+            .vocab_learner = vocab_learner,
+            .submission_queues = submission_queues,
+            .completion_queues = completion_queues,
+            .workers = workers,
+            .shared_automaton = automaton,
+            .num_workers = num_workers,
+            .debug = debug,
+            .pending_documents = pending_documents,
+            .pending_documents_free_list = pending_documents_free_list,
+            .n_free_pending_documents = num_workers * queue_depth,
+            .queue_depth = queue_depth,
+            .n_outstanding_jobs = n_outstanding_jobs,
+        };
     }
 
     pub fn deinit(self: *ParallelDP) void {
@@ -337,47 +286,40 @@ pub const ParallelDP = struct {
             self.workers[i].deinit();
 
             // Deinit queues
-            self.input_queues[i].deinit(self.allocator);
-            self.output_queues[i].deinit(self.allocator);
+            self.submission_queues[i].deinit(self.allocator);
+            self.completion_queues[i].deinit(self.allocator);
         }
 
         // Free the shared automaton
-        deinitBakaCorasick(&self.shared_automaton, self.allocator);
+        self.shared_automaton.deinit();
 
-        // Free remaining pending documents
-        var it = self.pending_documents.iterator();
-        while (it.next()) |entry| {
-            self.allocator.free(entry.value_ptr.*);
-        }
-        self.pending_documents.deinit();
 
         // Free arrays
-        self.allocator.free(self.input_queues);
-        self.allocator.free(self.output_queues);
+        self.allocator.free(self.pending_documents);
+        self.allocator.free(self.pending_documents_free_list);
+        self.allocator.free(self.submission_queues);
+        self.allocator.free(self.completion_queues);
         self.allocator.free(self.workers);
-
-        // Free self
-        self.allocator.destroy(self);
+        self.allocator.free(self.n_outstanding_jobs);
     }
 
     /// Initialize workers with the given candidates to evaluate
     pub fn initWorkers(
         self: *ParallelDP,
         candidates: []SampleStats,
-        candidates_length: usize,
     ) !void {
         if (self.debug) {
-            std.debug.print("[ParallelDP] Initializing {d} workers with {d} candidates\n", .{ self.num_workers, candidates_length });
+            std.debug.print("[ParallelDP] Initializing {d} workers with {d} candidates\n", .{ self.num_workers, candidates.len });
         }
 
         // Build a SINGLE automaton on the main thread
         const automaton_start = time.nanoTimestamp();
 
         // Initialize shared automaton
-        self.shared_automaton = try BakaCorasick.init(self.allocator);
+        self.shared_automaton.clear();
 
         // Add candidate tokens to the shared automaton
-        for (candidates[0..candidates_length], 0..) |stats, idx| {
+        for (candidates, 0..) |stats, idx| {
             const my_idx: u32 = @intCast(idx);
             const token_id = stats.token_id;
             const token_str = self.vocab_learner.getTokenStr(token_id);
@@ -393,12 +335,47 @@ pub const ParallelDP = struct {
         }
 
         // Create and start workers, sharing the automaton
-        for (0..self.num_workers) |i| {
-            self.workers[i] = try Worker.init(self.allocator, i, self.vocab_learner, &self.shared_automaton, // Share the automaton
-                candidates_length, &self.input_queues[i], &self.output_queues[i], self.debug);
+        if (!self.started_workers) {
+            for (0..self.num_workers) |i| {
+                self.workers[i] = try Worker.init(self.allocator, i, self.vocab_learner, &self.shared_automaton, // Share the automaton
+                    candidates.len, &self.submission_queues[i], &self.completion_queues[i], self.debug);
 
-            try self.workers[i].start();
+                try self.workers[i].start();
+            }
+            self.started_workers = true;
         }
+        for (0..self.num_workers) |i| {
+            const msg = SubmissionQueueEntry{
+                .Reset = candidates,
+            };
+            _ = self.sendMessageToWorker(i, msg, false);
+        }
+    }
+
+    fn addToPendingDocuments(self: *ParallelDP, document: []const u8) usize {
+        //std.debug.print("Adding document to pending documents list {d}\n", .{self.n_free_pending_documents});
+        self.n_free_pending_documents -= 1;
+        const index = self.pending_documents_free_list[self.n_free_pending_documents];
+        self.pending_documents[index] = document;
+        return index;
+    }
+
+    fn removeFromPendingDocuments(self: *ParallelDP, index: usize) void {
+        //std.debug.print("Removing document from pending documents list {d}\n", .{self.n_free_pending_documents});
+        const document = self.pending_documents[index];
+        self.allocator.free(document);
+        self.pending_documents_free_list[self.n_free_pending_documents] = index;
+        self.pending_documents[index] = &[_]u8{};
+        self.n_free_pending_documents += 1;
+    }
+
+    /// Send a message to a worker and track it if a response is expected
+    fn sendMessageToWorker(self: *ParallelDP, worker_id: usize, msg: SubmissionQueueEntry, expect_response: bool) bool {
+        const result = self.submission_queues[worker_id].push(msg);
+        if (result and expect_response) {
+            self.n_outstanding_jobs[worker_id] += 1;
+        }
+        return result;
     }
 
     /// Process a batch of documents in parallel
@@ -407,231 +384,114 @@ pub const ParallelDP = struct {
         loader: *fineweb,
         sample_size: usize,
         candidates: []SampleStats,
-        candidates_length: usize,
     ) !void {
         const start_time = time.nanoTimestamp();
-        // At the start of processDocuments in ParallelDP:
-        if (self.debug) {
-            const status = loader.getFileStatus();
-            std.debug.print("[ParallelDP] Document loader status: {d} files\n", .{status.total_files});
+        // // At the start of processDocuments in ParallelDP:
+        // if (self.debug) {
+        //     const status = loader.getFileStatus();
+        //     std.debug.print("[ParallelDP] Document loader status: {d} files\n", .{status.total_files});
 
-            // Try to read a test document
-            const doc = try loader.nextDocumentStringLoop();
-            if (doc.len > 0) {
-                std.debug.print("[ParallelDP] Successfully read test document of length {d}\n", .{doc.len});
-                // Read another document to test the loop
-                const doc2 = try loader.nextDocumentStringLoop();
-                std.debug.print("[ParallelDP] Successfully read second test document of length {d}\n", .{doc2.len});
-            } else {
-                std.debug.print("[ParallelDP] Read empty document - loader may have issues\n", .{});
-            }
+        //     // Try to read a test document
+        //     const doc = try loader.nextDocumentStringLoop();
+        //     if (doc.len > 0) {
+        //         std.debug.print("[ParallelDP] Successfully read test document of length {d}\n", .{doc.len});
+        //         // Read another document to test the loop
+        //         const doc2 = try loader.nextDocumentStringLoop();
+        //         std.debug.print("[ParallelDP] Successfully read second test document of length {d}\n", .{doc2.len});
+        //     } else {
+        //         std.debug.print("[ParallelDP] Read empty document - loader may have issues\n", .{});
+        //     }
 
-            // Important: Rewind the loader to reset position after this test
-            try loader.rewind();
-        }
+        //     // Important: Rewind the loader to reset position after this test
+        //     try loader.rewind();
+        // }
         // Clear candidate stats before starting
-        for (candidates[0..candidates_length]) |*stats| {
+        for (candidates) |*stats| {
             stats.sampled_occurrences = 0;
             stats.sampled_savings = 0;
         }
 
         // Initialize workers with shared automaton
-        try self.initWorkers(candidates, candidates_length);
+        try self.initWorkers(candidates);
 
         // Process documents
         var documents_processed: usize = 0;
         var documents_submitted: usize = 0;
-        var worker_idx: usize = 0;
+        var running = true;
+        
+        while (running) {
+            var did_anything = false;
 
-        // Initial document feeding
-        const feed_per_worker = 4; // Number of documents to initially feed each worker
-        for (0..self.num_workers * feed_per_worker) |_| {
-            if (documents_submitted >= sample_size) break;
-
-            if (try loader.nextDocumentString()) |doc| {
-                const doc_copy = try self.allocator.dupe(u8, doc);
-                const doc_id = self.next_document_id;
-                self.next_document_id += 1;
-
-                try self.pending_documents.put(doc_id, doc_copy);
-
-                const msg = Message{
-                    .ProcessDocument = ProcessDocumentMessage{
-                        .id = doc_id,
-                        .document = doc_copy,
-                    },
-                };
-
-                // Try to push to a worker's queue
-                var pushed = false;
-                var attempts: usize = 0;
-                while (!pushed and attempts < self.num_workers) {
-                    pushed = self.input_queues[worker_idx].push(msg);
-                    if (!pushed) {
-                        worker_idx = (worker_idx + 1) % self.num_workers;
-                        attempts += 1;
+            // Loop through each worker's output queue
+            for (0..self.num_workers) |i| {
+                // Process all available messages from this worker
+                if (self.completion_queues[i].pop()) |msg| {
+                    self.n_outstanding_jobs[i] -= 1;
+                    did_anything = true;
+                    switch (msg) {
+                        .DocumentProcessed => |doc_processed_msg| {
+                            self.removeFromPendingDocuments(doc_processed_msg.id);
+                            documents_processed += 1;
+                        },
+                        .Error => |error_data| {
+                            std.debug.print("[Coordinator] Worker {d} error: {s}\n", .{ i, error_data.message });
+                            @panic("oh no!");
+                        },
                     }
                 }
+                if (documents_submitted < sample_size and self.n_outstanding_jobs[i] < self.queue_depth) {
+                    const doc = try loader.nextDocumentStringLoop();
+                    did_anything = true;
+                    // Add to pending documents
+                    const doc_idx = self.addToPendingDocuments(doc);
 
-                if (pushed) {
+                    // Create a message for the worker
+                    const msg = SubmissionQueueEntry{
+                        .ProcessDocument = ProcessDocumentMessage{
+                            .id = doc_idx,
+                            .document = doc,
+                        },
+                    };
+
+                    _ = self.sendMessageToWorker(i, msg, true); // Expect response
                     documents_submitted += 1;
-                } else {
-                    // Couldn't push to any worker, free the document
-                    self.allocator.free(doc_copy);
-                    _ = self.pending_documents.remove(doc_id);
-                    if (self.debug) {
-                        std.debug.print("[ParallelDP] Warning: Couldn't submit document to any worker\n", .{});
+                    //std.debug.print("Submitted document {d} to worker {d}, now self.n_outstanding_jobs[i] = {d} and documents_submitted = {d}\n", .{ doc_idx, i, self.n_outstanding_jobs[i], documents_submitted });
+                }
+            }
+
+            if (documents_processed == sample_size) {
+                // copy the stats from all workers
+                for (self.workers) |worker| {
+                    for (worker.candidate_stats, 0..) |stats, idx| {
+                        candidates[idx].sampled_occurrences += stats.sampled_occurrences;
+                        candidates[idx].sampled_savings += stats.sampled_savings;
                     }
                 }
-            } else {
-                // No more documents
-                break;
+                // if we haven't seen each token at least 5 times, keep going
+                var keep_going = false;
+                for (candidates) |stats| {
+                    if (stats.sampled_occurrences < 5) {
+                        keep_going = true;
+                        break;
+                    }
+                }
+                if (keep_going) {
+                    documents_submitted = 0;
+                    documents_processed = 0;
+                } else {
+                    running = false;
+                }
+            }
+
+            // If we didn't process any messages, sleep a bit to avoid spinning
+            if (!did_anything) {
+                std.time.sleep(1);
             }
         }
 
         if (self.debug) {
             std.debug.print("[ParallelDP] Initially submitted {d} documents to workers\n", .{documents_submitted});
         }
-
-        // Process results and feed more documents
-        while (documents_processed < sample_size and documents_processed < documents_submitted) {
-            // Check for results from all workers
-            var got_results = false;
-
-            for (0..self.num_workers) |i| {
-                if (self.output_queues[i].pop()) |msg| {
-                    got_results = true;
-
-                    switch (msg) {
-                        .DocumentProcessed => |processed| {
-                            // Update candidate statistics - using actual token IDs
-                            for (processed.document_stats, 0..) |stats, idx| {
-                                if (idx < candidates_length) {
-                                    candidates[idx].sampled_occurrences += stats.sampled_occurrences;
-                                    candidates[idx].sampled_savings += stats.sampled_savings;
-                                }
-                            }
-
-                            // Free the result stats
-                            self.allocator.free(processed.document_stats);
-
-                            // Remove document from pending
-                            if (self.pending_documents.fetchRemove(processed.id)) |entry| {
-                                self.allocator.free(entry.value);
-                            }
-
-                            documents_processed += 1;
-
-                            // Submit another document if we haven't reached the limit
-                            if (documents_submitted < sample_size) {
-                                if (try loader.nextDocumentString()) |doc| {
-                                    const doc_copy = try self.allocator.dupe(u8, doc);
-                                    const doc_id = self.next_document_id;
-                                    self.next_document_id += 1;
-
-                                    try self.pending_documents.put(doc_id, doc_copy);
-
-                                    const new_msg = Message{
-                                        .ProcessDocument = ProcessDocumentMessage{
-                                            .id = doc_id,
-                                            .document = doc_copy,
-                                        },
-                                    };
-
-                                    if (self.input_queues[i].push(new_msg)) {
-                                        documents_submitted += 1;
-                                    } else {
-                                        // Could not push, free the document
-                                        self.allocator.free(doc_copy);
-                                        _ = self.pending_documents.remove(doc_id);
-                                    }
-                                }
-                            }
-
-                            // Log progress
-                            if (self.debug and documents_processed % 1000 == 0) {
-                                std.debug.print("[ParallelDP] Processed {d}/{d} documents\n", .{ documents_processed, sample_size });
-                            }
-                        },
-                        .Error => |error_data| {
-                            std.debug.print("[ParallelDP] Worker {d} error: {s}\n", .{ error_data.worker_id, error_data.message });
-                            self.allocator.free(error_data.message);
-                        },
-                        else => {
-                            std.debug.print("[ParallelDP] Unexpected message from worker\n", .{});
-                        },
-                    }
-                }
-            }
-
-            if (!got_results) {
-                // No results, sleep a bit
-                std.time.sleep(1 * std.time.ns_per_ms);
-            }
-
-            // Check if we've processed all submitted documents and there are no more to submit
-            if (documents_processed == documents_submitted and documents_submitted < sample_size) {
-                if (try loader.nextDocumentString()) |doc| {
-                    const doc_copy = try self.allocator.dupe(u8, doc);
-                    const doc_id = self.next_document_id;
-                    self.next_document_id += 1;
-
-                    try self.pending_documents.put(doc_id, doc_copy);
-
-                    const new_msg = Message{
-                        .ProcessDocument = ProcessDocumentMessage{
-                            .id = doc_id,
-                            .document = doc_copy,
-                        },
-                    };
-
-                    // Try to push to any worker
-                    var pushed = false;
-                    for (0..self.num_workers) |i| {
-                        if (self.input_queues[i].push(new_msg)) {
-                            pushed = true;
-                            documents_submitted += 1;
-                            break;
-                        }
-                    }
-
-                    if (!pushed) {
-                        // Couldn't push to any worker, free the document
-                        self.allocator.free(doc_copy);
-                        _ = self.pending_documents.remove(doc_id);
-                    }
-                } else if (documents_processed == documents_submitted) {
-                    // No more documents and all processed
-                    break;
-                }
-            }
-        }
-
-        // Shutdown all workers
-        for (0..self.num_workers) |i| {
-            const msg = Message{
-                .Shutdown = i,
-            };
-
-            // Try to push shutdown message
-            var pushed = false;
-            while (!pushed) {
-                pushed = self.input_queues[i].push(msg);
-                if (!pushed) {
-                    std.time.sleep(1 * std.time.ns_per_ms);
-                }
-            }
-        }
-
-        // Wait for all workers to join
-        for (0..self.num_workers) |i| {
-            if (self.workers[i].thread) |thread| {
-                thread.join();
-                self.workers[i].thread = null;
-            }
-        }
-
-        self.processed_count += documents_processed;
 
         const elapsed = time.nanoTimestamp() - start_time;
         if (self.debug) {

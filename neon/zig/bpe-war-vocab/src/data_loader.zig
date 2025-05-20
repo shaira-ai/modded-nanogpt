@@ -30,10 +30,6 @@ pub const FinewebDataLoader = struct {
     // Buffered reader with large buffer
     buffered_reader: ?std.io.BufferedReader(2 * 1024 * 1024, std.fs.File.Reader), // Now optional
 
-    // Token handling
-    token_map: std.AutoHashMap(usize, []const u8),
-    byte_to_token: std.StringHashMap(usize),
-
     // Direct token lookup array
     token_bytes: []?[]const u8,
 
@@ -79,8 +75,6 @@ pub const FinewebDataLoader = struct {
             .current_file_index = 0,
             .current_file_path = paths_copy[0], // Start with first file
             .buffered_reader = null,
-            .token_map = std.AutoHashMap(usize, []const u8).init(allocator),
-            .byte_to_token = std.StringHashMap(usize).init(allocator),
             .token_bytes = token_bytes,
             .current_document = null,
             .added_fake_separator = false,
@@ -169,18 +163,11 @@ pub const FinewebDataLoader = struct {
         }
         self.allocator.free(self.file_paths);
 
-        var token_it = self.token_map.iterator();
-        while (token_it.next()) |entry| {
-            self.allocator.free(entry.value_ptr.*);
+        for (self.token_bytes) |maybe_str| {
+            if (maybe_str) |str| {
+                self.allocator.free(str);
+            }
         }
-        self.token_map.deinit();
-
-        var byte_token_it = self.byte_to_token.iterator();
-        while (byte_token_it.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
-        }
-
-        self.byte_to_token.deinit();
         self.allocator.free(self.token_bytes);
         if (self.current_document) |doc| {
             self.allocator.free(doc);
@@ -227,9 +214,6 @@ pub const FinewebDataLoader = struct {
             return error.InvalidJsonFormat;
         }
 
-        self.token_map.clearRetainingCapacity();
-        self.byte_to_token.clearRetainingCapacity();
-
         // Reset all entries to null
         for (self.token_bytes) |*token_entry| {
             token_entry.* = null;
@@ -243,10 +227,6 @@ pub const FinewebDataLoader = struct {
             const decoded_size = gpt_encode.get_decoded_len(token_str);
             const bytes_buffer = try self.allocator.alloc(u8, decoded_size);
             const decoded_bytes = try gpt_encode.decode(bytes_buffer, token_str);
-
-            try self.token_map.put(token_id, decoded_bytes);
-            const str_copy = try self.allocator.dupe(u8, token_str);
-            try self.byte_to_token.put(str_copy, token_id);
 
             // Store in direct lookup array
             if (token_id < self.token_bytes.len) {
@@ -385,6 +365,16 @@ pub const FinewebDataLoader = struct {
 
         var byte_buffer = try self.allocator.alloc(u8, CHUNK_SIZE * 2);
         defer self.allocator.free(byte_buffer);
+
+        // ============================================================================
+        // !!!! IMPORTANT !!!!
+        //
+        // This code looks brokenm but actually it's been fixed by setting
+        // CHUNK_SIZE = 1.
+        //
+        // There's no need to fix this code. It does actually read the entirety
+        // of each document.
+        // ============================================================================
 
         // Read chunks directly into our document_tokens
         while (!found_document) {

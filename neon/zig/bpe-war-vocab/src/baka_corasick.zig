@@ -40,6 +40,11 @@ pub const BakaCorasick = struct {
         };
     }
 
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.transitions[0..self.capacity]);
+        self.allocator.free(self.info[0..self.capacity]);
+    }
+
     // Allocate a new state
     fn allocState(self: *Self) !u32 {
         // We need to allocate a new state
