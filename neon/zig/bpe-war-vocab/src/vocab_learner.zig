@@ -81,15 +81,16 @@ const STATS_MAGIC = "TOKSTAT".*;
 const STATS_VERSION: u32 = 1;
 const STATS_HEADER_SIZE = 64; // Increased to 64 bytes for more flexibility
 
-const StatsHeader = struct {
+const StatsHeader = extern struct {
     magic: [7]u8,
+    pad_a: [1]u8,
     version: u32,
     vocab_size: u32,
     n_token_ids: u32,
-    timestamp: i64,
     file_count: u32,
+    timestamp: i64,
     hash_seed: u64,
-    reserved: [21]u8, // Padding to reach 64 bytes
+    reserved: [20]u8, // Padding to reach 64 bytes
 
     // Ensure the struct is exactly 64 bytes
     comptime {
@@ -104,7 +105,7 @@ const VOCAB_VERSION: u32 = 1;
 const HEADER_SIZE = 32;
 
 // Change from packed struct to regular struct
-const VocabHeader = struct {
+const VocabHeader = extern struct {
     magic: [4]u8,
     version: u32,
     vocab_size: u32,
@@ -1706,13 +1707,14 @@ pub const VocabLearner = struct {
         // Create and write header
         const header = StatsHeader{
             .magic = STATS_MAGIC,
+            .pad_a = [_]u8{0},
             .version = STATS_VERSION,
             .vocab_size = @intCast(self.vocab_size),
             .n_token_ids = self.n_token_ids,
             .timestamp = std.time.milliTimestamp(),
             .file_count = @intCast(corpus_files.items.len),
             .hash_seed = self.file_hash_seed,
-            .reserved = [_]u8{0} ** 21,
+            .reserved = [_]u8{0} ** 20,
         };
 
         try file.writeAll(std.mem.asBytes(&header));
