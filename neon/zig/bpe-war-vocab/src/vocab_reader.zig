@@ -98,7 +98,6 @@ pub fn main() !void {
     for (header.magic) |byte| std.debug.print("{c}", .{byte});
     std.debug.print("\n", .{});
     std.debug.print("  Version: {d}\n", .{header.version});
-    std.debug.print("  Vocabulary Size: {d}\n", .{header.vocab_size});
 
     // Validate magic number
     if (!std.mem.eql(u8, &header.magic, &VOCAB_MAGIC)) {
@@ -181,7 +180,7 @@ pub fn main() !void {
 
         token_id += 1;
     }
-
+    std.debug.print("\n\nVocabulary Size: {d}\n", .{header.vocab_size});
     // Print statistics
     countTokensByLength(tokens.items);
 

@@ -201,7 +201,6 @@ pub const ParallelDP = struct {
     submission_queues: []BoundedQueue(SubmissionQueueEntry, 256),
     completion_queues: []BoundedQueue(CompletionQueueEntry, 256),
     workers: []Worker,
-    shared_automaton: BakaCorasick, // Now we keep a shared automaton
     num_workers: usize,
     debug: bool,
     next_document_id: usize = 0,
@@ -261,14 +260,12 @@ pub const ParallelDP = struct {
             std.debug.print("[ParallelDP] Initialized with {d} workers\n", .{num_workers});
         }
 
-
         return ParallelDP{
             .allocator = allocator,
             .vocab_learner = vocab_learner,
             .submission_queues = submission_queues,
             .completion_queues = completion_queues,
             .workers = workers,
-            .shared_automaton = automaton,
             .num_workers = num_workers,
             .debug = debug,
             .pending_documents = pending_documents,
@@ -290,10 +287,6 @@ pub const ParallelDP = struct {
             self.completion_queues[i].deinit(self.allocator);
         }
 
-        // Free the shared automaton
-        self.shared_automaton.deinit();
-
-
         // Free arrays
         self.allocator.free(self.pending_documents);
         self.allocator.free(self.pending_documents_free_list);
@@ -307,43 +300,32 @@ pub const ParallelDP = struct {
     pub fn initWorkers(
         self: *ParallelDP,
         candidates: []SampleStats,
+        automaton: *BakaCorasick,
     ) !void {
         if (self.debug) {
             std.debug.print("[ParallelDP] Initializing {d} workers with {d} candidates\n", .{ self.num_workers, candidates.len });
         }
-
-        // Build a SINGLE automaton on the main thread
         const automaton_start = time.nanoTimestamp();
 
-        // Initialize shared automaton
-        self.shared_automaton.clear();
-
-        // Add candidate tokens to the shared automaton
-        for (candidates, 0..) |stats, idx| {
-            const my_idx: u32 = @intCast(idx);
-            const token_id = stats.token_id;
-            const token_str = self.vocab_learner.getTokenStr(token_id);
-            try self.shared_automaton.insert(token_str, my_idx);
+        if (self.debug) {
+            std.debug.print("[ParallelDP] Using pre-built automaton with {d} states\n", .{automaton.len});
         }
-
-        // Compute suffix links for the shared automaton
-        try self.shared_automaton.computeSuffixLinks();
 
         const automaton_elapsed = time.nanoTimestamp() - automaton_start;
         if (self.debug) {
-            std.debug.print("[ParallelDP] Built shared automaton in {d:.2}ms\n", .{@as(f64, @floatFromInt(automaton_elapsed)) / time.ns_per_ms});
+            std.debug.print("[ParallelDP] Using automaton, elapsed: {d:.2}ms\n", .{@as(f64, @floatFromInt(automaton_elapsed)) / time.ns_per_ms});
         }
 
         // Create and start workers, sharing the automaton
         if (!self.started_workers) {
             for (0..self.num_workers) |i| {
-                self.workers[i] = try Worker.init(self.allocator, i, self.vocab_learner, &self.shared_automaton, // Share the automaton
-                    candidates.len, &self.submission_queues[i], &self.completion_queues[i], self.debug);
+                self.workers[i] = try Worker.init(self.allocator, i, self.vocab_learner, automaton, candidates.len, &self.submission_queues[i], &self.completion_queues[i], self.debug);
 
                 try self.workers[i].start();
             }
             self.started_workers = true;
         }
+
         for (0..self.num_workers) |i| {
             const msg = SubmissionQueueEntry{
                 .Reset = candidates,
@@ -384,27 +366,9 @@ pub const ParallelDP = struct {
         loader: *fineweb,
         sample_size: usize,
         candidates: []SampleStats,
+        candidate_automaton: *BakaCorasick,
     ) !void {
         const start_time = time.nanoTimestamp();
-        // // At the start of processDocuments in ParallelDP:
-        // if (self.debug) {
-        //     const status = loader.getFileStatus();
-        //     std.debug.print("[ParallelDP] Document loader status: {d} files\n", .{status.total_files});
-
-        //     // Try to read a test document
-        //     const doc = try loader.nextDocumentStringLoop();
-        //     if (doc.len > 0) {
-        //         std.debug.print("[ParallelDP] Successfully read test document of length {d}\n", .{doc.len});
-        //         // Read another document to test the loop
-        //         const doc2 = try loader.nextDocumentStringLoop();
-        //         std.debug.print("[ParallelDP] Successfully read second test document of length {d}\n", .{doc2.len});
-        //     } else {
-        //         std.debug.print("[ParallelDP] Read empty document - loader may have issues\n", .{});
-        //     }
-
-        //     // Important: Rewind the loader to reset position after this test
-        //     try loader.rewind();
-        // }
         // Clear candidate stats before starting
         for (candidates) |*stats| {
             stats.sampled_occurrences = 0;
@@ -412,13 +376,13 @@ pub const ParallelDP = struct {
         }
 
         // Initialize workers with shared automaton
-        try self.initWorkers(candidates);
+        try self.initWorkers(candidates, candidate_automaton);
 
         // Process documents
         var documents_processed: usize = 0;
         var documents_submitted: usize = 0;
         var running = true;
-        
+
         while (running) {
             var did_anything = false;
 

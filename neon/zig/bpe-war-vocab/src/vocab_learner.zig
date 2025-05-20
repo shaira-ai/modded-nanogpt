@@ -78,13 +78,11 @@ pub const DocumentSampler = struct {
 };
 
 const STATS_MAGIC = "TOKSTAT".*;
-const STATS_VERSION: u32 = 1;
 const STATS_HEADER_SIZE = 64; // Increased to 64 bytes for more flexibility
 
 const StatsHeader = extern struct {
     magic: [7]u8,
     pad_a: [1]u8,
-    version: u32,
     vocab_size: u32,
     n_token_ids: u32,
     file_count: u32,
@@ -101,13 +99,11 @@ const StatsHeader = extern struct {
 };
 
 const VOCAB_MAGIC = "VOCA".*;
-const VOCAB_VERSION: u32 = 1;
-const HEADER_SIZE = 32;
+const HEADER_SIZE = 28;
 
 // Change from packed struct to regular struct
 const VocabHeader = extern struct {
     magic: [4]u8,
-    version: u32,
     vocab_size: u32,
     reserved: [20]u8,
 
@@ -606,6 +602,7 @@ pub const VocabLearner = struct {
         var heap = std.PriorityQueue(u32, *VocabLearner, Context.lessThan).init(self.allocator, self);
         defer heap.deinit();
         try heap.ensureTotalCapacity(self.n_token_ids);
+        // add all the candidate tokens that are not part of vocabulary
         for (0..self.n_token_ids) |id_usize| {
             const id: u32 = @intCast(id_usize);
             if (!self.candidate_stats[id].is_in_vocab) {
@@ -666,11 +663,7 @@ pub const VocabLearner = struct {
                 }
 
                 // -- Keep the document sampling and evaluation code --
-                try parallel_dp.processDocuments(
-                    self.loader.?,
-                    self.sample_size,
-                    top_k_candidates,
-                );
+                try parallel_dp.processDocuments(self.loader.?, self.sample_size, top_k_candidates, &candidate_automaton);
 
                 // Always update sampled_step for all evaluated tokens
                 for (top_k_candidates) |sample_stats| {
@@ -947,7 +940,6 @@ pub const VocabLearner = struct {
         // Create and write header
         const header = VocabHeader{
             .magic = VOCAB_MAGIC,
-            .version = VOCAB_VERSION,
             .vocab_size = @intCast(self.vocab_size),
             .reserved = [_]u8{0} ** 20,
         };
@@ -1021,11 +1013,6 @@ pub const VocabLearner = struct {
         // Validate magic number
         if (!std.mem.eql(u8, &header.magic, &VOCAB_MAGIC)) {
             return error.InvalidMagicNumber;
-        }
-
-        // Check version compatibility
-        if (header.version != VOCAB_VERSION) {
-            return error.UnsupportedVersion;
         }
 
         // Create new VocabLearner with empty initialization
@@ -1114,7 +1101,6 @@ pub const VocabLearner = struct {
         // Create and write header
         const header = VocabHeader{
             .magic = VOCAB_MAGIC,
-            .version = VOCAB_VERSION,
             .vocab_size = @intCast(self.vocab_size),
             .reserved = [_]u8{0} ** 20,
         };
@@ -1151,11 +1137,6 @@ pub const VocabLearner = struct {
         // Validate magic number
         if (!std.mem.eql(u8, &header.magic, &VOCAB_MAGIC)) {
             return error.InvalidMagicNumber;
-        }
-
-        // Check version compatibility
-        if (header.version != VOCAB_VERSION) {
-            return error.UnsupportedVersion;
         }
 
         // Create new VocabLearner with empty initialization
@@ -1708,7 +1689,6 @@ pub const VocabLearner = struct {
         const header = StatsHeader{
             .magic = STATS_MAGIC,
             .pad_a = [_]u8{0},
-            .version = STATS_VERSION,
             .vocab_size = @intCast(self.vocab_size),
             .n_token_ids = self.n_token_ids,
             .timestamp = std.time.milliTimestamp(),
@@ -1812,14 +1792,6 @@ pub const VocabLearner = struct {
         if (!std.mem.eql(u8, &header.magic, &STATS_MAGIC)) {
             if (self.debug) {
                 std.debug.print("Invalid magic number in statistics file.\n", .{});
-            }
-            return false;
-        }
-
-        // Check version
-        if (header.version != STATS_VERSION) {
-            if (self.debug) {
-                std.debug.print("Unsupported version in statistics file: {d}\n", .{header.version});
             }
             return false;
         }
@@ -1962,7 +1934,6 @@ pub const VocabLearner = struct {
                 std.debug.print("Using cached corpus statistics. Skipping corpus processing.\n", .{});
             }
 
-            // Initialize loader here, since processCorpus() won't be called
             var corpus_files = try self.collectBinFiles();
             defer {
                 for (corpus_files.items) |path| {
