@@ -738,25 +738,25 @@ pub const VocabLearner = struct {
             try self.vocab_automaton.computeSuffixLinks();
 
             // 6. Delete Tokens
-            // if (self.vocab_size >= self.max_vocab_size) {
-            //     // Only do batch replacement if we have enough tokens to work with
-            //     const non_essential_token_count = self.vocab_size - 256;
-            //     const batch_size = 1000;
+            if (self.vocab_size >= self.max_vocab_size) {
+                // Only do batch replacement if we have enough tokens to work with
+                const non_essential_token_count = self.vocab_size - 256;
+                const batch_size = 1000;
 
-            //     if (non_essential_token_count >= batch_size) {
-            //         const batch_count = @min(50, non_essential_token_count / batch_size);
+                if (non_essential_token_count >= batch_size) {
+                    const batch_count = @min(50, non_essential_token_count / batch_size);
 
-            //         if (batch_count > 0) {
-            //             if (self.debug) {
-            //                 std.debug.print("\nStarting batch token replacement phase...\n", .{});
-            //             }
+                    if (batch_count > 0) {
+                        if (self.debug) {
+                            std.debug.print("\nStarting batch token replacement phase...\n", .{});
+                        }
 
-            //             try self.batchTokenReplacement(batch_count, batch_size);
-            //         }
-            //     } else if (self.debug) {
-            //         std.debug.print("\nNot enough non-essential tokens for batch replacement.\n", .{});
-            //     }
-            // }
+                        try self.batchTokenReplacement(batch_count, batch_size, &parallel_dp);
+                    }
+                } else if (self.debug) {
+                    std.debug.print("\nNot enough non-essential tokens for batch replacement.\n", .{});
+                }
+            }
 
             const iteration_elapsed = std.time.milliTimestamp() - iteration_start;
             if (self.debug) {
@@ -1406,7 +1406,7 @@ pub const VocabLearner = struct {
     }
 
     // Process a single batch of tokens to delete and replace
-    fn processTokenBatch(self: *VocabLearner, tokens_to_delete: []const u32) !void {
+    fn processTokenBatch(self: *VocabLearner, tokens_to_delete: []const u32, parallel_dp: *parallel.ParallelDP) !void {
         const start_time = std.time.milliTimestamp();
         const batch_size = tokens_to_delete.len;
 
@@ -1487,11 +1487,7 @@ pub const VocabLearner = struct {
         const original_sample_size = self.sample_size;
         self.sample_size = @max(self.sample_size / 4, 5); // Reduce sample size for speed
 
-        // Evaluate selected candidates on samples to get accurate estimates
-        var parallel_dp = try parallel.ParallelDP.init(self.allocator, self, self.debug);
-        defer parallel_dp.deinit();
-
-        try parallel_dp.processDocuments(self.loader.?, self.sample_size, top_k_candidates);
+        try parallel_dp.processDocuments(self.loader.?, self.sample_size, top_k_candidates, &candidate_automaton);
 
         // Restore original sample size
         self.sample_size = original_sample_size;
@@ -1597,7 +1593,7 @@ pub const VocabLearner = struct {
     }
 
     // Main function to coordinate batch replacement
-    pub fn batchTokenReplacement(self: *VocabLearner, batch_count: usize, batch_size: usize) !void {
+    pub fn batchTokenReplacement(self: *VocabLearner, batch_count: usize, batch_size: usize, parallel_dp: *parallel.ParallelDP) !void {
         const start_time = std.time.milliTimestamp();
 
         if (self.debug) {
@@ -1658,7 +1654,7 @@ pub const VocabLearner = struct {
             }
 
             // Process this batch with our optimized approach
-            try self.processTokenBatch(batch);
+            try self.processTokenBatch(batch, parallel_dp);
         }
 
         const elapsed_sec = @as(f64, @floatFromInt(std.time.milliTimestamp() - start_time)) / 1000.0;
