@@ -4,31 +4,49 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const exe = b.addExecutable(.{
-        .name = "bpe-war-vocab",
-        .root_source_file = b.path("src/main.zig"),
+    const tokenset_combiner = b.addExecutable(.{
+        .name = "tokenset_combiner",
+        .root_source_file = b.path("src/tokenset_combiner.zig"),
         .target = target,
         .optimize = optimize,
     });
-    exe.linkLibC();
-    b.installArtifact(exe);
+    b.installArtifact(tokenset_combiner);
 
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
+    const run_tokenset_combiner = b.addRunArtifact(tokenset_combiner);
     if (b.args) |args| {
-        run_cmd.addArgs(args);
+        run_tokenset_combiner.addArgs(args);
     }
+    const run_tokenset_combiner_step = b.step("run-tokenset-combiner", "Run the tokenset combiner");
+    run_tokenset_combiner_step.dependOn(&run_tokenset_combiner.step);
 
-    const run_step = b.step("run", "Run the app");
-    run_step.dependOn(&run_cmd.step);
-
-    const unit_tests = b.addTest(.{
-        .root_source_file = b.path("src/main.zig"),
+    const tokenset_filter = b.addExecutable(.{
+        .name = "tokenset_filter",
+        .root_source_file = b.path("src/tokenset_filter.zig"),
         .target = target,
         .optimize = optimize,
     });
+    b.installArtifact(tokenset_filter);
 
-    const run_unit_tests = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
+    const run_tokenset_filter = b.addRunArtifact(tokenset_filter);
+    if (b.args) |args| {
+        run_tokenset_filter.addArgs(args);
+    }
+    const run_tokenset_filter_step = b.step("run-tokenset-filter", "Run the tokenset filter");
+    run_tokenset_filter_step.dependOn(&run_tokenset_filter.step);
+
+    const vocab_reader = b.addExecutable(.{
+        .name = "vocab_reader",
+        .root_source_file = b.path("src/vocab_reader.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(vocab_reader);
+
+    const vocab_learner = b.addExecutable(.{
+        .name = "vocab_learner",
+        .root_source_file = b.path("src/vocab_learner.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(vocab_learner);
 }
