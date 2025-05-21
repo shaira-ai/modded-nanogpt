@@ -156,7 +156,7 @@ pub const VocabLearner = struct {
             .max_vocab_size = max_vocab_size,
             .top_k_candidates = 500,
             .batch_size = 10,
-            .sample_size = 10000,
+            .sample_size = 1000,
             .processed_files = std.StringHashMap(void).init(allocator),
             .last_full_corpus_scan = 0,
             .debug = debug,
@@ -342,6 +342,23 @@ pub const VocabLearner = struct {
         }
     }
 
+    fn cleanupBinFiles(self: *VocabLearner, corpus_files: *ArrayList([]const u8)) void {
+        for (corpus_files.items) |path| {
+            self.allocator.free(path);
+        }
+        corpus_files.deinit();
+    }
+
+    fn initializeLoader(self: *VocabLearner) !void {
+        if (self.loader == null) {
+            var corpus_files = try self.collectBinFiles();
+            defer self.cleanupBinFiles(&corpus_files);
+            var loader = try fineweb.init(self.allocator, corpus_files.items);
+            try loader.loadVocabulary("vocab.json");
+            self.loader = loader;
+        }
+    }
+
     pub fn processCorpus(self: *VocabLearner) !void {
         const start_time = std.time.milliTimestamp();
 
@@ -349,18 +366,7 @@ pub const VocabLearner = struct {
             std.debug.print("Processing corpus using raw text conversion...\n", .{});
         }
 
-        if (self.loader == null) {
-            var corpus_files = try self.collectBinFiles();
-            defer {
-                for (corpus_files.items) |path| {
-                    self.allocator.free(path);
-                }
-                corpus_files.deinit();
-            }
-            var loader = try fineweb.init(self.allocator, corpus_files.items);
-            try loader.loadVocabulary("vocab.json");
-            self.loader = loader;
-        }
+        try self.initializeLoader();
 
         // Setup for token counting
         var combined_automaton = try BakaCorasick.init(self.allocator);
@@ -484,10 +490,6 @@ pub const VocabLearner = struct {
                         // Construct full path
                         const full_path = try std.fs.path.join(self.allocator, &[_][]const u8{ corpus_path, entry.name });
                         try result.append(full_path);
-
-                        if (self.debug) {
-                            std.debug.print("  Added file: {s}\n", .{full_path});
-                        }
                     }
                 }
             }
@@ -500,6 +502,12 @@ pub const VocabLearner = struct {
         }.lessThan;
 
         std.sort.pdq([]const u8, result.items, {}, lt);
+
+        for(result.items) |item| {
+            if (self.debug) {
+                std.debug.print("  Added file: {s}\n", .{item});
+            }
+        }
 
         return result;
     }
@@ -1674,12 +1682,7 @@ pub const VocabLearner = struct {
 
         // Find all corpus files
         var corpus_files = try self.collectBinFiles();
-        defer {
-            for (corpus_files.items) |file_path| {
-                self.allocator.free(file_path);
-            }
-            corpus_files.deinit();
-        }
+        defer self.cleanupBinFiles(&corpus_files);
 
         const file = try std.fs.cwd().createFile(path, .{});
         defer file.close();
@@ -1810,12 +1813,7 @@ pub const VocabLearner = struct {
 
         // Get current corpus files
         var corpus_files = try self.collectBinFiles();
-        defer {
-            for (corpus_files.items) |file_path| {
-                self.allocator.free(file_path);
-            }
-            corpus_files.deinit();
-        }
+        defer self.cleanupBinFiles(&corpus_files);
 
         // Validate file count matches
         if (header.file_count != corpus_files.items.len) {
@@ -1938,16 +1936,10 @@ pub const VocabLearner = struct {
                 std.debug.print("Using cached corpus statistics. Skipping corpus processing.\n", .{});
             }
 
-            var corpus_files = try self.collectBinFiles();
-            defer {
-                for (corpus_files.items) |path| {
-                    self.allocator.free(path);
-                }
-                corpus_files.deinit();
+            try self.initializeLoader();
+            while (try self.loader.?.nextDocumentString()) |text| {
+                _ = text;
             }
-            var loader = try fineweb.init(self.allocator, corpus_files.items);
-            try loader.loadVocabulary("vocab.json");
-            self.loader = loader;
         } else {
             try self.processCorpus();
 
@@ -2008,7 +2000,6 @@ pub fn main() !void {
 
             // Create corpus_paths array excluding the stats flag and value
             var non_flag_paths = std.ArrayList([]const u8).init(allocator);
-            defer non_flag_paths.deinit();
 
             for (2..args.len) |j| {
                 if (j != i and j != i + 1) {
@@ -2028,7 +2019,7 @@ pub fn main() !void {
 
     const debug = true;
 
-    var learner = try VocabLearner.init(allocator, tokenset_path, corpus_paths, 300, debug);
+    var learner = try VocabLearner.init(allocator, tokenset_path, corpus_paths, 2000, debug);
     defer learner.deinit();
 
     // Check if everything initialized properly
