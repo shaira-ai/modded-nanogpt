@@ -1937,9 +1937,6 @@ pub const VocabLearner = struct {
             }
 
             try self.initializeLoader();
-            while (try self.loader.?.nextDocumentString()) |text| {
-                _ = text;
-            }
         } else {
             try self.processCorpus();
 

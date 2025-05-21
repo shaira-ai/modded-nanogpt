@@ -35,7 +35,7 @@ pub const FinewebDataLoader = struct {
 
     // Document state tracking
     current_document: ?[]usize,
-    added_fake_separator: bool,
+    //added_fake_separator: bool,
     reached_end: bool, // Now indicates all files are processed
     header_skipped: bool, // Now per-file state
 
@@ -77,7 +77,7 @@ pub const FinewebDataLoader = struct {
             .buffered_reader = null,
             .token_bytes = token_bytes,
             .current_document = null,
-            .added_fake_separator = false,
+            //.added_fake_separator = false,
             .reached_end = false,
             .header_skipped = false,
             .vocab_path = null,
@@ -454,7 +454,9 @@ pub const FinewebDataLoader = struct {
     /// Get the next document as a string, handling multiple files, looping forever
     pub fn nextDocumentStringLoop(self: *FinewebDataLoader) ![]u8 {
         var document_maybe = try self.nextDocumentString();
-        if (document_maybe == null) {
+        if (document_maybe) |document| {
+            return document;
+        } else {
             try self.rewind();
         }
         document_maybe = try self.nextDocumentString();
