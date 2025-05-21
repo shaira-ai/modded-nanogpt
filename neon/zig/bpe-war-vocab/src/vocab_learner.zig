@@ -368,28 +368,8 @@ pub const VocabLearner = struct {
 
         try self.initializeLoader();
 
-        // Setup for token counting
-        var combined_automaton = try BakaCorasick.init(self.allocator);
-        defer combined_automaton.deinit();
-
-        if (self.debug) {
-            std.debug.print("Building search automaton with {d} candidate tokens ({d})...\n", .{ self.candidate_stats.len, self.n_token_ids });
-        }
-
-        for (0..self.n_token_ids) |id_usize| {
-            const id: u32 = @intCast(id_usize);
-            const token = self.getTokenStr(id);
-            if (token.len > 1) {
-                try combined_automaton.insert(token, id);
-            }
-        }
-
-        try combined_automaton.computeSuffixLinks();
-
-        if (self.debug) {
-            const elapsed_sec = @as(f64, @floatFromInt(std.time.milliTimestamp() - start_time)) / 1000.0;
-            std.debug.print("Automaton built with {d} states in {d:.2}s\n", .{ combined_automaton.len, elapsed_sec });
-        }
+        const automaton_size = 10_000_000;
+        std.debug.print("Using target automaton size of {d} states\n", .{automaton_size});
 
         const NonoverlappingStats = struct {
             n_nonoverlapping_occurrences: u64,
@@ -398,61 +378,169 @@ pub const VocabLearner = struct {
 
         const token_id_to_stats = try self.allocator.alloc(NonoverlappingStats, self.n_token_ids);
         defer self.allocator.free(token_id_to_stats);
-        @memset(token_id_to_stats, .{ .n_nonoverlapping_occurrences = 0, .next_valid_position = 0 });
-        var position: u64 = 0;
-        var tokens_recorded: u64 = 0;
 
-        while (try self.loader.?.nextDocumentString()) |text| {
-            // Scan text with the automaton
-            var current_state: u32 = 0;
-            for (text) |byte| {
-                current_state = combined_automaton.transitions[current_state][byte];
+        const token_ids_buffer = try self.allocator.alloc(u32, self.n_token_ids);
+        defer self.allocator.free(token_ids_buffer);
 
-                // Check if this state represents a match
-                {
-                    const token_id = combined_automaton.info[current_state].token_id;
-                    if (token_id != BakaCorasick.NO_TOKEN) {
-                        const token_len = combined_automaton.info[current_state].depth;
-                        if (position >= token_id_to_stats[token_id].next_valid_position) {
-                            const next_valid_position = position + token_len;
-                            token_id_to_stats[token_id].next_valid_position = next_valid_position;
-                            token_id_to_stats[token_id].n_nonoverlapping_occurrences += 1;
-                            tokens_recorded += 1;
-                        }
-                    }
-                }
+        var batch_automaton = try BakaCorasick.init(self.allocator);
+        defer batch_automaton.deinit();
 
-                // Check suffix links for additional matches
-                var suffix = combined_automaton.info[current_state].green;
-                while (suffix != 0) {
-                    const token_id = combined_automaton.info[suffix].token_id;
-                    if (token_id != BakaCorasick.NO_TOKEN) {
-                        const token_len = combined_automaton.info[suffix].depth;
-                        if (position >= token_id_to_stats[token_id].next_valid_position) {
-                            const next_valid_position = position + token_len;
-                            token_id_to_stats[token_id].next_valid_position = next_valid_position;
-                            token_id_to_stats[token_id].n_nonoverlapping_occurrences += 1;
-                            tokens_recorded += 1;
-                        }
-                    }
-                    suffix = combined_automaton.info[suffix].green;
-                }
-                position += 1;
+        var token_count: usize = 0;
+        for (0..self.n_token_ids) |id_usize| {
+            const id: u32 = @intCast(id_usize);
+            if (self.getTokenStr(id).len > 1) {
+                token_ids_buffer[token_count] = id;
+                token_count += 1;
             }
         }
 
+        const tokens_to_process = token_ids_buffer[0..token_count];
         if (self.debug) {
-            std.debug.print("Phase 1: Processed {d} tokens from {d} bytes\n", .{ tokens_recorded, position });
+            std.debug.print("Found {d} multi-byte tokens to process\n", .{token_count});
         }
 
-        for (self.candidate_stats, token_id_to_stats) |*stats, my_stats| {
-            stats.n_nonoverlapping_occurrences = my_stats.n_nonoverlapping_occurrences;
-            stats.est_total_savings = @floatFromInt(my_stats.n_nonoverlapping_occurrences * (stats.str_len - 1));
+        for (self.candidate_stats) |*stats| {
+            stats.n_nonoverlapping_occurrences = 0;
+            stats.est_total_savings = 0;
+        }
+
+        var batch_num: usize = 1;
+        var start_idx: usize = 0;
+        var total_tokens_processed: u64 = 0;
+
+        while (start_idx < tokens_to_process.len) {
+            const batch_start_time = std.time.milliTimestamp();
+
+            batch_automaton.clear();
+
+            // reset stats for this batch
+            @memset(token_id_to_stats, .{ .n_nonoverlapping_occurrences = 0, .next_valid_position = 0 });
+
+            // add tokens until we reach target automaton size
+            var current_idx = start_idx;
+            var estimated_automaton_size: usize = 0;
+
+            while (current_idx < tokens_to_process.len) {
+                const token_id = tokens_to_process[current_idx];
+                const token_str = self.getTokenStr(token_id);
+
+                // estimate automaton size increase
+                const estimated_increase = token_str.len;
+
+                // stop if adding this token would exceed target size!
+                if (estimated_automaton_size > 0 and
+                    estimated_automaton_size + estimated_increase > automaton_size)
+                {
+                    break;
+                }
+
+                // add token to the automaton
+                try batch_automaton.insert(token_str, token_id);
+                estimated_automaton_size += estimated_increase;
+                current_idx += 1;
+            }
+
+            try batch_automaton.computeSuffixLinks();
+
+            const actual_end_idx = current_idx;
+            const tokens_in_batch = actual_end_idx - start_idx;
+
+            if (self.debug) {
+                std.debug.print("Batch {d}: Processing tokens {d}-{d} ({d} tokens), automaton size: {d} states\n", .{ batch_num, start_idx, actual_end_idx - 1, tokens_in_batch, batch_automaton.len });
+            }
+
+            // process corpus with this batch's automaton
+            try self.loader.?.rewind();
+            var position: u64 = 0;
+            var tokens_recorded: u64 = 0;
+
+            while (try self.loader.?.nextDocumentString()) |text| {
+                defer self.allocator.free(text);
+
+                var current_state: u32 = 0;
+                for (text) |byte| {
+                    current_state = batch_automaton.transitions[current_state][byte];
+
+                    {
+                        const token_id = batch_automaton.info[current_state].token_id;
+                        if (token_id != BakaCorasick.NO_TOKEN) {
+                            const token_len = batch_automaton.info[current_state].depth;
+                            if (position >= token_id_to_stats[token_id].next_valid_position) {
+                                const next_valid_position = position + token_len;
+                                token_id_to_stats[token_id].next_valid_position = next_valid_position;
+                                token_id_to_stats[token_id].n_nonoverlapping_occurrences += 1;
+                                tokens_recorded += 1;
+                            }
+                        }
+                    }
+
+                    var suffix = batch_automaton.info[current_state].green;
+                    while (suffix != 0) {
+                        const token_id = batch_automaton.info[suffix].token_id;
+                        if (token_id != BakaCorasick.NO_TOKEN) {
+                            const token_len = batch_automaton.info[suffix].depth;
+                            if (position >= token_id_to_stats[token_id].next_valid_position) {
+                                const next_valid_position = position + token_len;
+                                token_id_to_stats[token_id].next_valid_position = next_valid_position;
+                                token_id_to_stats[token_id].n_nonoverlapping_occurrences += 1;
+                                tokens_recorded += 1;
+                            }
+                        }
+                        suffix = batch_automaton.info[suffix].green;
+                    }
+                    position += 1;
+                }
+            }
+
+            // update main stats with results from this batch
+            for (start_idx..actual_end_idx) |idx| {
+                const token_id = tokens_to_process[idx];
+                self.candidate_stats[token_id].n_nonoverlapping_occurrences =
+                    token_id_to_stats[token_id].n_nonoverlapping_occurrences;
+                self.candidate_stats[token_id].est_total_savings = @floatFromInt(token_id_to_stats[token_id].n_nonoverlapping_occurrences *
+                    (self.candidate_stats[token_id].str_len - 1));
+            }
+
+            total_tokens_processed += tokens_recorded;
+
+            const batch_elapsed_sec = @as(f64, @floatFromInt(std.time.milliTimestamp() - batch_start_time)) / 1000.0;
+            if (self.debug) {
+                std.debug.print("Batch {d} completed in {d:.2}s. Recorded {d} tokens.\n", .{ batch_num, batch_elapsed_sec, tokens_recorded });
+            }
+
+            start_idx = actual_end_idx;
+            batch_num += 1;
+
+            if (start_idx >= tokens_to_process.len) break;
+        }
+
+        // Process single-byte tokens
+        if (self.debug) {
+            std.debug.print("Processing single-byte tokens...\n", .{});
+        }
+
+        try self.loader.?.rewind();
+        var single_byte_counts = try self.allocator.alloc(u64, 256);
+        defer self.allocator.free(single_byte_counts);
+        @memset(single_byte_counts, 0);
+
+        while (try self.loader.?.nextDocumentString()) |text| {
+            defer self.allocator.free(text);
+            for (text) |byte| {
+                single_byte_counts[byte] += 1;
+            }
+        }
+
+        for (0..256) |id| {
+            const token_id: u32 = @intCast(id);
+            self.candidate_stats[token_id].n_nonoverlapping_occurrences = single_byte_counts[id];
+            self.candidate_stats[token_id].est_total_savings = 0;
         }
 
         const elapsed_sec = @as(f64, @floatFromInt(std.time.milliTimestamp() - start_time)) / 1000.0;
         if (self.debug) {
-            std.debug.print("\nCompleted corpus processing in {d:.2}s\n", .{elapsed_sec});
+            std.debug.print("\nProcessed total of {d} tokens in {d} batches\n", .{ total_tokens_processed, batch_num - 1 });
+            std.debug.print("Completed corpus processing in {d:.2}s\n", .{elapsed_sec});
         }
     }
 
@@ -503,7 +591,7 @@ pub const VocabLearner = struct {
 
         std.sort.pdq([]const u8, result.items, {}, lt);
 
-        for(result.items) |item| {
+        for (result.items) |item| {
             if (self.debug) {
                 std.debug.print("  Added file: {s}\n", .{item});
             }

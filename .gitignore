@@ -5,5 +5,8 @@ logs/
 .DS_Store
 *.dylib
 *.dylib.o
-.zig-cache
 *.bin
+
+# Zig build artifacts
+zig-out
+.zig-cache
