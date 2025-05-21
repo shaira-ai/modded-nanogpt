@@ -135,7 +135,7 @@ pub const VocabLearner = struct {
     vocab_size: u32,
     tokenset_contents: []const u8,
     // Parameters
-    max_token_length: u32 = 30,
+    max_token_length: u32 = 15,
     max_vocab_size: u32,
     top_k_candidates: u32,
     batch_size: u32,
@@ -164,7 +164,7 @@ pub const VocabLearner = struct {
             .max_vocab_size = max_vocab_size,
             .top_k_candidates = 500,
             .batch_size = 10,
-            .sample_size = 1000,
+            .sample_size = 10000,
             .processed_files = std.StringHashMap(void).init(allocator),
             .last_full_corpus_scan = 0,
             .debug = debug,
@@ -686,8 +686,8 @@ pub const VocabLearner = struct {
         }
 
         var best_corpus_token_count: u64 = ~@as(u64, 0);
-        var late_lookbacks_arraylist = std.ArrayList(u64).init(self.allocator);
-        var late_dp_solution_arraylist = std.ArrayList(u32).init(self.allocator);
+        //var late_lookbacks_arraylist = std.ArrayList(u64).init(self.allocator);
+        //var late_dp_solution_arraylist = std.ArrayList(u32).init(self.allocator);
 
         var heap = std.PriorityQueue(u32, *VocabLearner, buildVocabLessThan).init(self.allocator, self);
         defer heap.deinit();
@@ -820,7 +820,7 @@ pub const VocabLearner = struct {
             try self.vocab_automaton.computeSuffixLinks();
 
             if (self.vocab_size == self.max_vocab_size) {
-                const token_count = try self.getCorpusTokenCount(&late_lookbacks_arraylist, &late_dp_solution_arraylist);
+                const token_count = try parallel_dp.getCorpusTokenCount();
                 if (token_count < best_corpus_token_count) {
                     best_corpus_token_count = token_count;
                     std.debug.print("New best corpus token count: {d}\n", .{token_count});
@@ -2273,7 +2273,7 @@ pub fn main() !void {
 
     const debug = true;
 
-    var learner = try VocabLearner.init(allocator, tokenset_path, corpus_paths, 2000, debug);
+    var learner = try VocabLearner.init(allocator, tokenset_path, corpus_paths, 50000, debug);
     defer learner.deinit();
 
     // Check if everything initialized properly
