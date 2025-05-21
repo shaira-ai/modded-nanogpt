@@ -400,7 +400,6 @@ pub const VocabLearner = struct {
                 token_ids_buffer[token_count] = id;
                 token_count += 1;
             }
-            self.allocator.free(text);
         }
 
         const tokens_to_process = token_ids_buffer[0..token_count];
@@ -1107,7 +1106,7 @@ pub const VocabLearner = struct {
 
         const elapsed_ms = std.time.milliTimestamp() - start_time;
         if (self.debug) {
-            std.debug.print("Completed deleting some tokens in {d}ms.\n", .{ elapsed_ms });
+            std.debug.print("Completed deleting some tokens in {d}ms.\n", .{elapsed_ms});
         }
     }
 
