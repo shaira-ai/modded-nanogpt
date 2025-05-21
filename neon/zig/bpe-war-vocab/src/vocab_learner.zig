@@ -115,6 +115,14 @@ const VocabHeader = extern struct {
     }
 };
 
+const buildVocabLessThan = struct {
+    fn lessThan(ctx: *VocabLearner, a: u32, b: u32) std.math.Order {
+        const value_a = ctx.candidate_stats[a].getCurrentValueBound();
+        const value_b = ctx.candidate_stats[b].getCurrentValueBound();
+        return std.math.order(value_b, value_a);
+    }
+}.lessThan;
+
 pub const VocabLearner = struct {
     allocator: Allocator,
     candidate_stats: []TokenStats,
@@ -127,7 +135,7 @@ pub const VocabLearner = struct {
     vocab_size: u32,
     tokenset_contents: []const u8,
     // Parameters
-    max_token_length: u32 = 15,
+    max_token_length: u32 = 30,
     max_vocab_size: u32,
     top_k_candidates: u32,
     batch_size: u32,
@@ -392,6 +400,7 @@ pub const VocabLearner = struct {
                 token_ids_buffer[token_count] = id;
                 token_count += 1;
             }
+            self.allocator.free(text);
         }
 
         const tokens_to_process = token_ids_buffer[0..token_count];
@@ -630,26 +639,8 @@ pub const VocabLearner = struct {
             const suffix_len = str1.len - i;
             // Check if this suffix matches a prefix of str2 (up to the length of the shorter of the two)
             const check_len = @min(suffix_len, str2.len);
-            if (check_len > 0 and std.mem.eql(u8, str1[i..][0..check_len], str2[0..check_len])) {
+            if (check_len <= str2.len and std.mem.eql(u8, str1[i..][0..check_len], str2[0..check_len])) {
                 return true;
-            }
-        }
-
-        return false;
-    }
-
-    // Check if any prefix of str1 is a suffix of str2
-    fn hasPrefixSuffixOverlap(str1: []const u8, str2: []const u8) bool {
-        if (str1.len <= 1 or str2.len <= 1) return false; // No meaningful overlaps with empty/single char strings
-
-        // For each length of prefix in str1
-        for (1..str1.len) |prefix_len| {
-            // Check if this prefix matches a suffix of str2
-            if (str2.len >= prefix_len) {
-                const suffix_start = str2.len - prefix_len;
-                if (std.mem.eql(u8, str1[0..prefix_len], str2[suffix_start..])) {
-                    return true;
-                }
             }
         }
 
@@ -680,7 +671,7 @@ pub const VocabLearner = struct {
                 return false;
             }
 
-            if (hasPrefixSuffixOverlap(token_str, other_token_str)) {
+            if (hasSuffixPrefixOverlap(other_token_str, token_str)) {
                 return false;
             }
         }
@@ -695,15 +686,11 @@ pub const VocabLearner = struct {
             std.debug.print("Starting vocabulary building process...\n", .{});
         }
 
-        const Context = struct {
-            fn lessThan(ctx: *VocabLearner, a: u32, b: u32) std.math.Order {
-                const value_a = ctx.candidate_stats[a].getCurrentValueBound();
-                const value_b = ctx.candidate_stats[b].getCurrentValueBound();
-                return std.math.order(value_b, value_a);
-            }
-        };
+        var best_corpus_token_count: u64 = ~@as(u64, 0);
+        var late_lookbacks_arraylist = std.ArrayList(u64).init(self.allocator);
+        var late_dp_solution_arraylist = std.ArrayList(u32).init(self.allocator);
 
-        var heap = std.PriorityQueue(u32, *VocabLearner, Context.lessThan).init(self.allocator, self);
+        var heap = std.PriorityQueue(u32, *VocabLearner, buildVocabLessThan).init(self.allocator, self);
         defer heap.deinit();
         try heap.ensureTotalCapacity(self.n_token_ids);
         // add all the candidate tokens that are not part of vocabulary
@@ -833,26 +820,36 @@ pub const VocabLearner = struct {
 
             try self.vocab_automaton.computeSuffixLinks();
 
-            // 6. Delete Tokens
-            if (self.vocab_size >= self.max_vocab_size) {
-                // Only do batch replacement if we have enough tokens to work with
-                const non_essential_token_count = self.vocab_size - 256;
-                const batch_size = 1000;
-
-                if (non_essential_token_count >= batch_size) {
-                    const batch_count = @min(50, non_essential_token_count / batch_size);
-
-                    if (batch_count > 0) {
-                        if (self.debug) {
-                            std.debug.print("\nStarting batch token replacement phase...\n", .{});
-                        }
-
-                        try self.batchTokenReplacement(batch_count, batch_size, &parallel_dp);
-                    }
-                } else if (self.debug) {
-                    std.debug.print("\nNot enough non-essential tokens for batch replacement.\n", .{});
+            if (self.vocab_size == self.max_vocab_size) {
+                const token_count = try self.getCorpusTokenCount(&late_lookbacks_arraylist, &late_dp_solution_arraylist);
+                if (token_count < best_corpus_token_count) {
+                    best_corpus_token_count = token_count;
+                    std.debug.print("New best corpus token count: {d}\n", .{token_count});
+                    try self.saveVocabularyNow();
                 }
+                try self.deleteSomeTokens(&heap);
             }
+
+            // // 6. Delete Tokens
+            // if (self.vocab_size >= self.max_vocab_size) {
+            //     // Only do batch replacement if we have enough tokens to work with
+            //     const non_essential_token_count = self.vocab_size - 256;
+            //     const batch_size = 1000;
+
+            //     if (non_essential_token_count >= batch_size) {
+            //         const batch_count = @min(50, non_essential_token_count / batch_size);
+
+            //         if (batch_count > 0) {
+            //             if (self.debug) {
+            //                 std.debug.print("\nStarting batch token replacement phase...\n", .{});
+            //             }
+
+            //             try self.batchTokenReplacement(batch_count, batch_size, &parallel_dp);
+            //         }
+            //     } else if (self.debug) {
+            //         std.debug.print("\nNot enough non-essential tokens for batch replacement.\n", .{});
+            //     }
+            // }
 
             const iteration_elapsed = std.time.milliTimestamp() - iteration_start;
             if (self.debug) {
@@ -1033,6 +1030,100 @@ pub const VocabLearner = struct {
 
             std.debug.print("         Multi-byte tokens: {d:.1}% of vocabulary.\n", .{mb_percentage});
             std.debug.print("         Candidate tokens remaining: {d}\n", .{self.candidate_stats.len});
+        }
+    }
+
+    pub fn deleteSomeTokens(
+        self: *VocabLearner,
+        heap: *std.PriorityQueue(u32, *VocabLearner, buildVocabLessThan),
+    ) !void {
+        const start_time = std.time.milliTimestamp();
+
+        if (self.debug) {
+            std.debug.print("\n=== Starting token deletion ===\n", .{});
+        }
+
+        // 1. Collect all non-essential tokens (tokens with ID >= 256)
+        var vocab_tokens = std.ArrayList(u32).init(self.allocator);
+        defer vocab_tokens.deinit();
+
+        for (0..self.n_token_ids) |id_usize| {
+            const id: u32 = @intCast(id_usize);
+            if (id >= 256 and self.candidate_stats[id].is_in_vocab) {
+                try vocab_tokens.append(id);
+            }
+        }
+
+        const batch_size = 1000;
+
+        const available_tokens = vocab_tokens.items.len;
+        if (available_tokens < batch_size) {
+            if (self.debug) {
+                std.debug.print("Not enough non-essential tokens for replacement: {d} available, {d} needed per batch\n", .{ available_tokens, batch_size });
+            }
+            return;
+        }
+
+        // 2. Shuffle the tokens
+        var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+        const random = prng.random();
+
+        {
+            var i = vocab_tokens.items.len;
+            while (i > 1) : (i -= 1) {
+                const j = random.uintLessThan(usize, i + 1); // Random index from 0 to i inclusive
+                const temp = vocab_tokens.items[i];
+                vocab_tokens.items[i] = vocab_tokens.items[j];
+                vocab_tokens.items[j] = temp;
+            }
+        }
+
+        // 3. delete the first batch_size tokens
+        for (0..batch_size) |i| {
+            const token_id = vocab_tokens.items[i];
+            self.removeFromVocab(token_id);
+        }
+
+        // Rebuild the automaton without deleted tokens
+        self.vocab_automaton.clear();
+        for (0..self.n_token_ids) |id_usize| {
+            const id: u32 = @intCast(id_usize);
+            const stats = self.candidate_stats[id];
+            if (stats.is_in_vocab and stats.str_len > 1) {
+                const token_str = self.getTokenStr(id);
+                try self.vocab_automaton.insert(token_str, id);
+            }
+        }
+        try self.vocab_automaton.computeSuffixLinks();
+
+        self.resetTokenEstimates();
+        heap.clearRetainingCapacity();
+        for (0..self.n_token_ids) |id_usize| {
+            const id: u32 = @intCast(id_usize);
+            if (!self.candidate_stats[id].is_in_vocab) {
+                try heap.add(id);
+            }
+        }
+
+        const elapsed_ms = std.time.milliTimestamp() - start_time;
+        if (self.debug) {
+            std.debug.print("Completed deleting some tokens in {d}ms.\n", .{ elapsed_ms });
+        }
+    }
+
+    pub fn saveVocabularyNow(self: *VocabLearner) !void {
+        // Get current Unix time in seconds
+        const current_time_seconds = std.time.timestamp();
+
+        // Construct filename
+        var filename_buffer: [64]u8 = undefined; // Large enough for "vocabulary_" + timestamp + ".bin"
+        const filename = try std.fmt.bufPrint(&filename_buffer, "vocabulary_{d}.bin", .{current_time_seconds});
+
+        // Call saveVocabulary with this filename
+        try self.saveVocabulary(filename);
+
+        if (self.debug) {
+            std.debug.print("Vocabulary saved to {s}\n", .{filename});
         }
     }
 
@@ -1307,6 +1398,82 @@ pub const VocabLearner = struct {
         }
 
         return learner;
+    }
+
+    pub fn getCorpusTokenCount(
+        self: *const VocabLearner,
+        lookbacks_arraylist: *std.ArrayList(u64),
+        dp_solution_arraylist: *std.ArrayList(u32),
+    ) !u64 {
+        try self.loader.?.rewind();
+        var token_count: u64 = 0;
+
+        while (try self.loader.?.nextDocumentString()) |text| {
+            token_count += try self.getDocumentTokenCount(text, lookbacks_arraylist, dp_solution_arraylist);
+            self.allocator.free(text);
+        }
+        return token_count;
+    }
+
+    pub fn getDocumentTokenCount(
+        self: *const VocabLearner,
+        document: []const u8,
+        lookbacks_arraylist: *std.ArrayList(u64),
+        dp_solution_arraylist: *std.ArrayList(u32),
+    ) !u64 {
+        lookbacks_arraylist.clearRetainingCapacity();
+        try lookbacks_arraylist.appendNTimes(0, document.len + 1);
+        const lookbacks = lookbacks_arraylist.items;
+        dp_solution_arraylist.clearRetainingCapacity();
+        try dp_solution_arraylist.appendNTimes(0, document.len + 1);
+        const dp_solution = dp_solution_arraylist.items;
+
+        {
+            // Scan text with the automata
+            const vocab_automaton = &self.vocab_automaton;
+            var vocab_state: u32 = 0;
+            for (document, 1..) |byte, i| {
+                vocab_state = vocab_automaton.transitions[vocab_state][byte];
+                var this_lookback: u64 = 0;
+
+                // Check if this state represents a match
+                {
+                    const token_id = vocab_automaton.info[vocab_state].token_id;
+                    if (token_id != BakaCorasick.NO_TOKEN) {
+                        const token_len = vocab_automaton.info[vocab_state].depth;
+                        this_lookback |= @as(u64, 1) << @intCast(token_len);
+                    }
+                }
+
+                // Check suffix links for additional matches
+                var suffix = vocab_automaton.info[vocab_state].green;
+                while (suffix != 0) {
+                    const token_id = vocab_automaton.info[suffix].token_id;
+                    if (token_id != BakaCorasick.NO_TOKEN) {
+                        const token_len = vocab_automaton.info[suffix].depth;
+                        this_lookback |= @as(u64, 1) << @intCast(token_len);
+                    }
+                    suffix = vocab_automaton.info[suffix].green;
+                }
+                this_lookback &= ~@as(u64, 3);
+                lookbacks[i] = this_lookback;
+            }
+        }
+
+        dp_solution[0] = 0;
+        for (1..dp_solution.len) |i| {
+            var entry_minus_one = dp_solution[i - 1];
+            var mask = lookbacks[i];
+            const n_iters = @popCount(mask);
+            for (0..n_iters) |_| {
+                const lookback = @ctz(mask);
+                mask &= mask - 1;
+                entry_minus_one = @min(entry_minus_one, dp_solution[i - lookback]);
+            }
+            dp_solution[i] = entry_minus_one + 1;
+        }
+        const baseline_cost = dp_solution[dp_solution.len - 1];
+        return baseline_cost;
     }
 
     pub fn evaluateCandidatesOnDocumentDP(
@@ -1727,11 +1894,14 @@ pub const VocabLearner = struct {
         var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
         const random = prng.random();
 
-        for (0..vocab_tokens.items.len) |i| {
-            const j = random.uintLessThan(usize, vocab_tokens.items.len);
-            const temp = vocab_tokens.items[i];
-            vocab_tokens.items[i] = vocab_tokens.items[j];
-            vocab_tokens.items[j] = temp;
+        {
+            var i = vocab_tokens.items.len;
+            while (i > 1) : (i -= 1) {
+                const j = random.uintLessThan(usize, i + 1); // Random index from 0 to i inclusive
+                const temp = vocab_tokens.items[i];
+                vocab_tokens.items[i] = vocab_tokens.items[j];
+                vocab_tokens.items[j] = temp;
+            }
         }
 
         // 3. Create and process batches
@@ -2025,9 +2195,6 @@ pub const VocabLearner = struct {
             }
 
             try self.initializeLoader();
-            while (try self.loader.?.nextDocumentString()) |text| {
-                _ = text;
-            }
         } else {
             try self.processCorpus();
 
