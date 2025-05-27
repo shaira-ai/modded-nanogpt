@@ -8,6 +8,7 @@ const parallel = @import("parallel.zig");
 pub const TokenStats = extern struct {
     str_start_idx: u64,
     str_len: u16,
+    len_in_tokens: u16,
     is_in_vocab: bool = false,
     n_nonoverlapping_occurrences: u64 = 0,
     sampled_occurrences: u64 = 0,
@@ -123,6 +124,14 @@ const buildVocabLessThan = struct {
     }
 }.lessThan;
 
+const buildVocabGreaterThan = struct {
+    fn lessThan(ctx: *VocabLearner, a: u32, b: u32) std.math.Order {
+        const value_a = ctx.candidate_stats[a].getCurrentValueBound();
+        const value_b = ctx.candidate_stats[b].getCurrentValueBound();
+        return std.math.order(value_a, value_b);
+    }
+}.lessThan;
+
 pub const VocabLearner = struct {
     allocator: Allocator,
     candidate_stats: []TokenStats,
@@ -140,6 +149,7 @@ pub const VocabLearner = struct {
     top_k_candidates: u32,
     batch_size: u32,
     sample_size: u32,
+    n_candidates_to_tokenize: u32,
     processed_files: std.StringHashMap(void),
     file_hash_seed: u64 = 0,
 
@@ -162,9 +172,10 @@ pub const VocabLearner = struct {
             .vocab_size = 0,
             .tokenset_contents = &[_]u8{},
             .max_vocab_size = max_vocab_size,
-            .top_k_candidates = 500,
+            .top_k_candidates = 100,
             .batch_size = 10,
             .sample_size = 10000,
+            .n_candidates_to_tokenize = 500,
             .processed_files = std.StringHashMap(void).init(allocator),
             .last_full_corpus_scan = 0,
             .debug = debug,
@@ -308,6 +319,7 @@ pub const VocabLearner = struct {
             stats.* = .{
                 .str_start_idx = 0,
                 .str_len = 0,
+                .len_in_tokens = 0,
             };
         }
 
@@ -328,6 +340,7 @@ pub const VocabLearner = struct {
             for (0..count) |_| {
                 self.candidate_stats[token_id].str_start_idx = @intCast(content_offset);
                 self.candidate_stats[token_id].str_len = @intCast(length);
+                self.candidate_stats[token_id].len_in_tokens = @intCast(length);
                 token_id += 1;
                 content_offset += length;
             }
@@ -692,6 +705,13 @@ pub const VocabLearner = struct {
         var heap = std.PriorityQueue(u32, *VocabLearner, buildVocabLessThan).init(self.allocator, self);
         defer heap.deinit();
         try heap.ensureTotalCapacity(self.n_token_ids);
+        var this_step_heap = std.PriorityQueue(u32, *VocabLearner, buildVocabLessThan).init(self.allocator, self);
+        defer this_step_heap.deinit();
+        try this_step_heap.ensureTotalCapacity(self.n_token_ids);
+        var tokenize_candidates_heap = std.PriorityQueue(u32, *VocabLearner, buildVocabGreaterThan).init(self.allocator, self);
+        defer tokenize_candidates_heap.deinit();
+        var tokenize_candidates_scratch = std.ArrayList(u32).init(self.allocator);
+        defer tokenize_candidates_scratch.deinit();
         // add all the candidate tokens that are not part of vocabulary
         for (0..self.n_token_ids) |id_usize| {
             const id: u32 = @intCast(id_usize);
@@ -710,8 +730,11 @@ pub const VocabLearner = struct {
         var parallel_dp = try parallel.ParallelDP.init(self.allocator, self, self.debug);
         defer parallel_dp.deinit();
 
+        const candidates_to_tokenize = try self.allocator.alloc(u32, self.n_candidates_to_tokenize);
+
         while (self.vocab_size < self.max_vocab_size) {
-            const max_acceptable = @min(accepted_current_step_tokens.len, self.max_vocab_size - self.vocab_size);
+            //const max_acceptable = @min(accepted_current_step_tokens.len, self.max_vocab_size - self.vocab_size);
+            const max_acceptable: usize = 1;
             const iteration_start = std.time.milliTimestamp();
             self.current_step += 1;
 
@@ -719,25 +742,28 @@ pub const VocabLearner = struct {
                 std.debug.print("\n--- Iteration {d}: Vocabulary size {d}/{d} ---\n", .{ self.current_step, self.vocab_size, self.max_vocab_size });
             }
 
-            var apparent_best_token_id = heap.peek().?;
+            var n_candidates: usize = 0;
+            //var cleanup_mode = false;
+
             // At the start of buildVocabulary loop
-            std.debug.print("Top token ID: {d}, sampled_step: {d}, current: {d}\n", .{ apparent_best_token_id, self.candidate_stats[apparent_best_token_id].sampled_step, self.current_step });
-            while (self.candidate_stats[apparent_best_token_id].sampled_step < self.current_step) {
+            while (true) {
                 // Extract candidates that haven't been evaluated yet
-                for (0..self.top_k_candidates) |i| {
+                //if (!cleanup_mode) {
+                for (n_candidates..self.top_k_candidates) |i| {
                     const token_id = heap.remove();
                     top_k_candidates[i] = .{ .token_id = token_id };
                 }
+                n_candidates = self.top_k_candidates;
+                //}
 
-                // -- Keep the existing automaton building code --
                 const automaton_start_time = std.time.milliTimestamp();
                 if (self.debug) {
+                    std.debug.print("heap.items.len={}, this_step_heap.items.len={}\n", .{heap.items.len, this_step_heap.items.len});
                     std.debug.print("Creating candidate automaton with just candidate tokens...\n", .{});
                 }
 
-                // Add candidate tokens with flag
                 candidate_automaton.clear();
-                for (top_k_candidates, 0..) |stats, my_idx_usize| {
+                for (top_k_candidates[0..n_candidates], 0..) |stats, my_idx_usize| {
                     const my_idx: u32 = @intCast(my_idx_usize);
                     const token_id = stats.token_id;
                     const token_str = self.getTokenStr(token_id);
@@ -749,14 +775,15 @@ pub const VocabLearner = struct {
                 if (self.debug) {
                     const automaton_elapsed_seconds = @as(f64, @floatFromInt(std.time.milliTimestamp() - automaton_start_time)) / 1000.0;
                     std.debug.print("Candidate automaton created with {d} states in {d:.2}s\n", .{ candidate_automaton.len, automaton_elapsed_seconds });
-                    std.debug.print("Added {d} candidate tokens to automaton\n", .{top_k_candidates.len});
+                    std.debug.print("Added {d} candidate tokens to automaton\n", .{n_candidates});
                 }
 
-                // -- Keep the document sampling and evaluation code --
-                try parallel_dp.processDocuments(self.loader.?, self.sample_size, top_k_candidates, &candidate_automaton);
+                try parallel_dp.processDocuments(self.loader.?, self.sample_size, top_k_candidates[0..n_candidates], &candidate_automaton);
 
-                // Always update sampled_step for all evaluated tokens
-                for (top_k_candidates) |sample_stats| {
+                var write_cursor: usize = 0;
+                var best_leftover_savings: f64 = -420;
+                for (0..n_candidates) |idx| {
+                    const sample_stats = top_k_candidates[idx];
                     const token_id = sample_stats.token_id;
                     const sampled_occurrences = sample_stats.sampled_occurrences;
 
@@ -765,37 +792,86 @@ pub const VocabLearner = struct {
                         const sampled_savings = sample_stats.sampled_savings;
                         const total_occurrences = self.candidate_stats[token_id].n_nonoverlapping_occurrences;
                         const est_savings = @as(f64, @floatFromInt(sampled_savings)) * @as(f64, @floatFromInt(total_occurrences)) / @as(f64, @floatFromInt(sampled_occurrences));
-
-                        self.candidate_stats[token_id].sampled_occurrences = sampled_occurrences;
-                        self.candidate_stats[token_id].sampled_savings = sampled_savings;
-                        self.candidate_stats[token_id].est_total_savings = est_savings;
+                        const token_count = self.candidate_stats[token_id].len_in_tokens;
+                        const max_est_savings: f64 = @floatFromInt(total_occurrences * (token_count - 1));
+                        if (est_savings < max_est_savings) {
+                            self.candidate_stats[token_id].sampled_occurrences = sampled_occurrences;
+                            self.candidate_stats[token_id].sampled_savings = sampled_savings;
+                            self.candidate_stats[token_id].est_total_savings = est_savings;
+                        }
                         self.candidate_stats[token_id].sampled_step = self.current_step;
+                        try this_step_heap.add(token_id);
+                    } else {
+                        const est_savings = self.candidate_stats[token_id].est_total_savings;
+                        best_leftover_savings = @max(best_leftover_savings, est_savings);
+                        top_k_candidates[write_cursor] = sample_stats;
+                        write_cursor += 1;
                     }
-                    try heap.add(token_id);
                 }
+                n_candidates = write_cursor;
 
-                apparent_best_token_id = heap.peek().?;
+                // if this_step_heap has some stuff,
+                // and the best one is better than everything else,
+                // then we can stop.
+                const apparent_best_unsampled_token_id = heap.peek().?;
+                const best_other_savings = @max(best_leftover_savings, self.candidate_stats[apparent_best_unsampled_token_id].est_total_savings);
+                if (this_step_heap.peek()) |elem| {
+                    if (self.candidate_stats[elem].est_total_savings >= best_other_savings) {
+                        break;
+                    }
+                }
+                {
+                    var best_heap_est_savings = self.candidate_stats[heap.peek().?].est_total_savings;
+                    while (tokenize_candidates_heap.count() < self.top_k_candidates or
+                            self.candidate_stats[tokenize_candidates_heap.peek().?].est_total_savings <= best_heap_est_savings) {
+                        for (0..self.n_candidates_to_tokenize) |i| {
+                            candidates_to_tokenize[i] = heap.remove();
+                        }
+                        try parallel_dp.updateMaxSavingsByTokenizingCandidates(candidates_to_tokenize);
+                        for (0..self.n_candidates_to_tokenize) |i| {
+                            try tokenize_candidates_heap.add(candidates_to_tokenize[i]);
+                        }
+                        while (tokenize_candidates_heap.count() > self.top_k_candidates) {
+                            const token_id = tokenize_candidates_heap.remove();
+                            try tokenize_candidates_scratch.append(token_id);
+                        }
+                        best_heap_est_savings = self.candidate_stats[heap.peek().?].est_total_savings;
+                    }
+                    for (tokenize_candidates_scratch.items) |token_id| {
+                        try heap.add(token_id);
+                    }
+                    tokenize_candidates_scratch.clearRetainingCapacity();
+                    while (tokenize_candidates_heap.removeOrNull()) |token_id| {
+                        try heap.add(token_id);
+                    }
+                }
             }
 
             var n_accepted: usize = 0;
             var n_rejected: usize = 0;
             while (n_accepted < max_acceptable and n_rejected < rejected_current_step_tokens.len) {
-                apparent_best_token_id = heap.peek().?;
-                if (self.candidate_stats[apparent_best_token_id].sampled_step < self.current_step) {
-                    break;
-                }
-                _ = heap.remove();
-                if (self.tokenIsAlmostIndependentOfTokens(apparent_best_token_id, accepted_current_step_tokens[0..n_accepted])) {
-                    accepted_current_step_tokens[n_accepted] = apparent_best_token_id;
-                    n_accepted += 1;
+                if (this_step_heap.peek()) |apparent_best_token_id| {
+                    _ = this_step_heap.remove();
+                    if (self.tokenIsAlmostIndependentOfTokens(apparent_best_token_id, accepted_current_step_tokens[0..n_accepted])) {
+                        accepted_current_step_tokens[n_accepted] = apparent_best_token_id;
+                        n_accepted += 1;
+                    } else {
+                        rejected_current_step_tokens[n_rejected] = apparent_best_token_id;
+                        n_rejected += 1;
+                    }
                 } else {
-                    rejected_current_step_tokens[n_rejected] = apparent_best_token_id;
-                    n_rejected += 1;
+                    break;
                 }
             }
 
             for (rejected_current_step_tokens[0..n_rejected]) |token_id| {
                 try heap.add(token_id);
+            }
+            while(this_step_heap.removeOrNull()) |token_id| {
+                try heap.add(token_id);
+            }
+            for (top_k_candidates[0..n_candidates]) |stats| {
+                try heap.add(stats.token_id);
             }
 
             // 5. Add selected tokens to vocabulary
@@ -827,6 +903,30 @@ pub const VocabLearner = struct {
                     try self.saveVocabularyNow();
                 }
                 try self.deleteSomeTokens(&heap);
+            } else {
+                var best_heap_est_savings = self.candidate_stats[heap.peek().?].est_total_savings;
+                while (tokenize_candidates_heap.count() < self.top_k_candidates or
+                        self.candidate_stats[tokenize_candidates_heap.peek().?].est_total_savings <= best_heap_est_savings) {
+                    for (0..self.n_candidates_to_tokenize) |i| {
+                        candidates_to_tokenize[i] = heap.remove();
+                    }
+                    try parallel_dp.updateMaxSavingsByTokenizingCandidates(candidates_to_tokenize);
+                    for (0..self.n_candidates_to_tokenize) |i| {
+                        try tokenize_candidates_heap.add(candidates_to_tokenize[i]);
+                    }
+                    while (tokenize_candidates_heap.count() > self.top_k_candidates) {
+                        const token_id = tokenize_candidates_heap.remove();
+                        try tokenize_candidates_scratch.append(token_id);
+                    }
+                    best_heap_est_savings = self.candidate_stats[heap.peek().?].est_total_savings;
+                }
+                for (tokenize_candidates_scratch.items) |token_id| {
+                    try heap.add(token_id);
+                }
+                tokenize_candidates_scratch.clearRetainingCapacity();
+                while (tokenize_candidates_heap.removeOrNull()) |token_id| {
+                    try heap.add(token_id);
+                }
             }
 
             // // 6. Delete Tokens

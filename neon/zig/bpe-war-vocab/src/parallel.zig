@@ -25,6 +25,11 @@ const DocumentProcessedMessage = struct {
     id: usize,
 };
 
+const TokenCountMessage = struct {
+    id: usize,
+    token_count: u64,
+};
+
 const ErrorMessage = struct {
     worker_id: usize,
     message: []const u8,
@@ -38,7 +43,6 @@ const ResetMessage = struct {
 
 const SubmissionQueueEntry = union(enum) {
     Reset: ResetMessage,
-    ResetCorpusTokenCount: void,
     ProcessDocument: ProcessDocumentMessage,
     CountTokensInDocument: CountTokensInDocumentMessage,
     Shutdown: usize, // worker id
@@ -46,6 +50,7 @@ const SubmissionQueueEntry = union(enum) {
 
 const CompletionQueueEntry = union(enum) {
     DocumentProcessed: DocumentProcessedMessage,
+    TokenCount: TokenCountMessage,
     Error: ErrorMessage,
 };
 
@@ -67,6 +72,7 @@ pub const Worker = struct {
     candidates_length: usize,
     debug: bool,
     token_count: u64 = 0,
+    current_n_candidates: usize = 0,
 
     pub fn init(
         allocator: Allocator,
@@ -134,13 +140,13 @@ pub const Worker = struct {
     fn processDocument(self: *Worker, document: []const u8, doc_id: usize) !void {
         // Process the document using the evaluateCandidatesOnDocumentDP logic
         try self.vocab_learner.evaluateCandidatesOnDocumentDP(
-            self.candidate_stats,
+            self.candidate_stats[0..self.current_n_candidates],
             self.candidate_automaton,
             document,
             &self.lookbacks,
             &self.dp_solution,
             &self.matches,
-            self.token_idx_to_least_end_pos,
+            self.token_idx_to_least_end_pos[0..self.current_n_candidates],
         );
 
         // Send results
@@ -162,14 +168,15 @@ pub const Worker = struct {
         document: []const u8,
         doc_id: usize,
     ) !void {
-        self.token_count += try self.vocab_learner.getDocumentTokenCount(
+        const token_count = try self.vocab_learner.getDocumentTokenCount(
             document,
             &self.lookbacks,
             &self.dp_solution);
 
         const result_msg = CompletionQueueEntry{
-            .DocumentProcessed = DocumentProcessedMessage{
+            .TokenCount = TokenCountMessage{
                 .id = doc_id,
+                .token_count = token_count,
             },
         };
 
@@ -191,15 +198,16 @@ pub const Worker = struct {
                     .Reset => |resset_message| {
                         const coordinator_stats = resset_message.candidates;
                         const automaton = resset_message.automaton;
-                        for (self.candidate_stats, 0..) |*stats, idx| {
+                        self.current_n_candidates = coordinator_stats.len;
+                        if (self.candidate_stats.len < self.current_n_candidates) {
+                            @panic("oh no!1");
+                        }
+                        for (self.candidate_stats[0..self.current_n_candidates], 0..) |*stats, idx| {
                             stats.sampled_occurrences = 0;
                             stats.sampled_savings = 0;
                             stats.token_id = coordinator_stats[idx].token_id;
                         }
                         self.candidate_automaton = automaton;
-                    },
-                    .ResetCorpusTokenCount => {
-                        self.token_count = 0;
                     },
                     .ProcessDocument => |process_data| {
                         self.processDocument(process_data.document, process_data.id) catch |err| {
@@ -263,7 +271,8 @@ pub const ParallelDP = struct {
     pending_documents: [][]const u8,
     pending_documents_free_list: []usize,
     n_free_pending_documents: usize,
-    queue_depth: usize,
+    queue_depth_for_tokenize: usize,
+    queue_depth_for_dp: usize,
     processed_count: usize = 0,
     started_workers: bool = false,
 
@@ -292,13 +301,15 @@ pub const ParallelDP = struct {
         const workers = try allocator.alloc(Worker, num_workers);
         errdefer allocator.free(workers);
 
-        const queue_depth = 3;
-        const pending_documents = try allocator.alloc([]const u8, num_workers * queue_depth);
+        const queue_depth_for_tokenize = 20;
+        const queue_depth_for_dp = 20;
+        const larger_queue_depth = @max(queue_depth_for_tokenize, queue_depth_for_dp);
+        const pending_documents = try allocator.alloc([]const u8, num_workers * larger_queue_depth);
         errdefer allocator.free(pending_documents);
         for (pending_documents) |*ptr| {
             ptr.* = &[_]u8{};
         }
-        const pending_documents_free_list = try allocator.alloc(usize, num_workers * queue_depth);
+        const pending_documents_free_list = try allocator.alloc(usize, num_workers * larger_queue_depth);
         errdefer allocator.free(pending_documents_free_list);
         for (pending_documents_free_list, 0..) |*ptr, i| {
             ptr.* = i;
@@ -325,8 +336,9 @@ pub const ParallelDP = struct {
             .debug = debug,
             .pending_documents = pending_documents,
             .pending_documents_free_list = pending_documents_free_list,
-            .n_free_pending_documents = num_workers * queue_depth,
-            .queue_depth = queue_depth,
+            .n_free_pending_documents = num_workers * larger_queue_depth,
+            .queue_depth_for_tokenize = queue_depth_for_tokenize,
+            .queue_depth_for_dp = queue_depth_for_dp,
             .n_outstanding_jobs = n_outstanding_jobs,
         };
     }
@@ -402,13 +414,6 @@ pub const ParallelDP = struct {
         if (!self.started_workers) {
             return error.FixMePlz;
         }
-
-        for (0..self.num_workers) |i| {
-            const msg = SubmissionQueueEntry{
-                .ResetCorpusTokenCount = {},
-            };
-            _ = self.sendMessageToWorker(i, msg, false);
-        }
     }
 
     fn addToPendingDocuments(self: *ParallelDP, document: []const u8) usize {
@@ -446,12 +451,6 @@ pub const ParallelDP = struct {
         candidate_automaton: *BakaCorasick,
     ) !void {
         const start_time = time.nanoTimestamp();
-        // Clear candidate stats before starting
-        for (candidates) |*stats| {
-            stats.sampled_occurrences = 0;
-            stats.sampled_savings = 0;
-        }
-
         // Initialize workers with shared automaton
         try self.initWorkers(candidates, candidate_automaton);
 
@@ -476,11 +475,15 @@ pub const ParallelDP = struct {
                         },
                         .Error => |error_data| {
                             std.debug.print("[Coordinator] Worker {d} error: {s}\n", .{ i, error_data.message });
-                            @panic("oh no!");
+                            @panic("oh no!2");
+                        },
+                        else => {
+                            std.debug.print("[Coordinator] Worker {d} error: Unknown message type\n", .{ i });
+                            @panic("oh no!3");
                         },
                     }
                 }
-                if (documents_submitted < sample_size and self.n_outstanding_jobs[i] < self.queue_depth) {
+                if (documents_submitted < sample_size and self.n_outstanding_jobs[i] < self.queue_depth_for_dp) {
                     const doc = try loader.nextDocumentStringLoop();
                     did_anything = true;
                     // Add to pending documents
@@ -509,19 +512,19 @@ pub const ParallelDP = struct {
                     }
                 }
                 // if we haven't seen each token at least 5 times, keep going
-                var keep_going = false;
-                for (candidates) |stats| {
-                    if (stats.sampled_occurrences < 5) {
-                        keep_going = true;
-                        break;
-                    }
-                }
-                if (keep_going) {
-                    documents_submitted = 0;
-                    documents_processed = 0;
-                } else {
-                    running = false;
-                }
+                // var keep_going = false;
+                // for (candidates) |stats| {
+                //     if (stats.sampled_occurrences < 5) {
+                //         keep_going = true;
+                //         break;
+                //     }
+                // }
+                // if (keep_going) {
+                //     documents_submitted = 0;
+                //     documents_processed = 0;
+                // } else {
+                running = false;
+                // }
             }
 
             // If we didn't process any messages, sleep a bit to avoid spinning
@@ -540,6 +543,87 @@ pub const ParallelDP = struct {
         }
     }
 
+    pub fn updateMaxSavingsByTokenizingCandidates(
+        self: *ParallelDP,
+        candidates: []u32,
+    ) !void {
+        const start_time = time.nanoTimestamp();
+        // Initialize workers with shared automaton
+        try self.initWorkersForCorpusTokenCount();
+
+        // Process documents
+        var documents_processed: usize = 0;
+        var documents_submitted: usize = 0;
+
+        while (true) {
+            var did_anything = false;
+
+            // Loop through each worker's output queue
+            for (0..self.num_workers) |i| {
+                // Process all available messages from this worker
+                if (self.completion_queues[i].pop()) |msg| {
+                    self.n_outstanding_jobs[i] -= 1;
+                    did_anything = true;
+                    switch (msg) {
+                        .TokenCount => |token_count_msg| {
+                            const token_id: u32 = @intCast(token_count_msg.id);
+                            const token_count: u16 = @intCast(token_count_msg.token_count);
+                            const stats: *TokenStats = &self.vocab_learner.candidate_stats[token_id];
+                            const old_token_count = stats.len_in_tokens;
+                            if (token_count < old_token_count) {
+                                stats.len_in_tokens = token_count;
+                                const old_est_savings = stats.est_total_savings;
+                                const occurrence_count = stats.n_nonoverlapping_occurrences;
+                                const new_savings: f64 = @floatFromInt(occurrence_count * (token_count - 1));
+                                stats.est_total_savings = @min(old_est_savings, new_savings);
+                            }
+                            documents_processed += 1;
+                        },
+                        .Error => |error_data| {
+                            std.debug.print("[Coordinator] Worker {d} error: {s}\n", .{ i, error_data.message });
+                            @panic("oh no!4");
+                        },
+                        else => {
+                            std.debug.print("[Coordinator] Worker {d} error: Unknown message type\n", .{ i });
+                            @panic("oh no!5");
+                        },
+                    }
+                }
+                if (self.n_outstanding_jobs[i] < self.queue_depth_for_tokenize) {
+                    if (documents_submitted < candidates.len) {
+                        const doc = self.vocab_learner.getTokenStr(candidates[documents_submitted]);
+                        did_anything = true;
+
+                        // Create a message for the worker
+                        const msg = SubmissionQueueEntry{
+                            .CountTokensInDocument = CountTokensInDocumentMessage{
+                                .id = documents_submitted,
+                                .document = doc,
+                            },
+                        };
+
+                        _ = self.sendMessageToWorker(i, msg, true); // Expect response
+                        documents_submitted += 1;
+                    }
+                }
+            }
+
+            if (documents_processed == candidates.len) {
+                const elapsed = time.nanoTimestamp() - start_time;
+                if (self.debug) {
+                    std.debug.print("[ParallelDP] Tokenized {d} candidates in {d:.2}ms\n", .{ documents_processed, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
+                }
+                return;
+            }
+
+            // If we didn't process any messages, sleep a bit to avoid spinning
+            if (!did_anything) {
+                std.time.sleep(1);
+            }
+
+        }
+    }
+
     /// Process a batch of documents in parallel
     pub fn getCorpusTokenCount(
         self: *ParallelDP,
@@ -555,6 +639,7 @@ pub const ParallelDP = struct {
         const loader = self.vocab_learner.loader.?;
         try loader.rewind();
         var maybe_doc = try loader.nextDocumentString();
+        var ret: u64 = 0;
 
         while (true) {
             var did_anything = false;
@@ -566,17 +651,22 @@ pub const ParallelDP = struct {
                     self.n_outstanding_jobs[i] -= 1;
                     did_anything = true;
                     switch (msg) {
-                        .DocumentProcessed => |doc_processed_msg| {
-                            self.removeFromPendingDocuments(doc_processed_msg.id);
+                        .TokenCount => |token_count_msg| {
+                            self.removeFromPendingDocuments(token_count_msg.id);
+                            ret += token_count_msg.token_count;
                             documents_processed += 1;
                         },
                         .Error => |error_data| {
                             std.debug.print("[Coordinator] Worker {d} error: {s}\n", .{ i, error_data.message });
-                            @panic("oh no!");
+                            @panic("oh no!6");
+                        },
+                        else => {
+                            std.debug.print("[Coordinator] Worker {d} error: Unknown message type\n", .{ i });
+                            @panic("oh no!7");
                         },
                     }
                 }
-                if (self.n_outstanding_jobs[i] < self.queue_depth) {
+                if (self.n_outstanding_jobs[i] < self.queue_depth_for_tokenize) {
                     if (maybe_doc) |doc| {
                         did_anything = true;
                         // Add to pending documents
@@ -598,25 +688,12 @@ pub const ParallelDP = struct {
                 }
             }
 
-            if (maybe_doc == null) {
-                var any_outstanding = false;
-                for (0..self.num_workers) |i| {
-                    if (self.n_outstanding_jobs[i] > 0) {
-                        any_outstanding = true;
-                        break;
-                    }
+            if (maybe_doc == null and documents_processed == documents_submitted) {
+                const elapsed = time.nanoTimestamp() - start_time;
+                if (self.debug) {
+                    std.debug.print("[ParallelDP] Processed {d} documents in {d:.2}ms\n", .{ documents_processed, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
                 }
-                if (!any_outstanding) {
-                    var ret: u64 = 0;
-                    for (0..self.num_workers) |i| {
-                        ret += self.workers[i].token_count;
-                    }
-                    const elapsed = time.nanoTimestamp() - start_time;
-                    if (self.debug) {
-                        std.debug.print("[ParallelDP] Processed {d} documents in {d:.2}ms\n", .{ documents_processed, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
-                    }
-                    return ret;
-                }
+                return ret;
             }
 
             // If we didn't process any messages, sleep a bit to avoid spinning
