@@ -18,6 +18,8 @@ pub fn reportFunctionTime(function_name: []const u8, elapsed_ns: i128) void {
 }
 
 pub const FinewebDataLoader = struct {
+    pub const NEEDS_DEALLOCATION = true;
+
     // File handling
     allocator: std.mem.Allocator,
     file: ?std.fs.File, // Now optional since we may be between files

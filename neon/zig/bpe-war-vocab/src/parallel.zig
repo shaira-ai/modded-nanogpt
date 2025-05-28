@@ -40,7 +40,6 @@ const ResetMessage = struct {
     automaton: *BakaCorasick,
 };
 
-
 const SubmissionQueueEntry = union(enum) {
     Reset: ResetMessage,
     ProcessDocument: ProcessDocumentMessage,
@@ -168,10 +167,7 @@ pub const Worker = struct {
         document: []const u8,
         doc_id: usize,
     ) !void {
-        const token_count = try self.vocab_learner.getDocumentTokenCount(
-            document,
-            &self.lookbacks,
-            &self.dp_solution);
+        const token_count = try self.vocab_learner.getDocumentTokenCount(document, &self.lookbacks, &self.dp_solution);
 
         const result_msg = CompletionQueueEntry{
             .TokenCount = TokenCountMessage{
@@ -424,10 +420,13 @@ pub const ParallelDP = struct {
         return index;
     }
 
-    fn removeFromPendingDocuments(self: *ParallelDP, index: usize) void {
+    fn removeFromPendingDocuments(self: *ParallelDP, index: usize, comptime DataLoaderType: type) void {
         //std.debug.print("Removing document from pending documents list {d}\n", .{self.n_free_pending_documents});
         const document = self.pending_documents[index];
-        self.allocator.free(document);
+
+        if (DataLoaderType.NEEDS_DEALLOCATION) {
+            self.allocator.free(document);
+        }
         self.pending_documents_free_list[self.n_free_pending_documents] = index;
         self.pending_documents[index] = &[_]u8{};
         self.n_free_pending_documents += 1;
@@ -445,12 +444,14 @@ pub const ParallelDP = struct {
     /// Process a batch of documents in parallel
     pub fn processDocuments(
         self: *ParallelDP,
-        loader: *fineweb,
+        loader: anytype,
         sample_size: usize,
         candidates: []SampleStats,
         candidate_automaton: *BakaCorasick,
     ) !void {
+        const DataLoaderType = @TypeOf(loader.*);
         const start_time = time.nanoTimestamp();
+
         // Initialize workers with shared automaton
         try self.initWorkers(candidates, candidate_automaton);
 
@@ -470,7 +471,7 @@ pub const ParallelDP = struct {
                     did_anything = true;
                     switch (msg) {
                         .DocumentProcessed => |doc_processed_msg| {
-                            self.removeFromPendingDocuments(doc_processed_msg.id);
+                            self.removeFromPendingDocuments(doc_processed_msg.id, DataLoaderType);
                             documents_processed += 1;
                         },
                         .Error => |error_data| {
@@ -478,14 +479,16 @@ pub const ParallelDP = struct {
                             @panic("oh no!2");
                         },
                         else => {
-                            std.debug.print("[Coordinator] Worker {d} error: Unknown message type\n", .{ i });
+                            std.debug.print("[Coordinator] Worker {d} error: Unknown message type\n", .{i});
                             @panic("oh no!3");
                         },
                     }
                 }
+
                 if (documents_submitted < sample_size and self.n_outstanding_jobs[i] < self.queue_depth_for_dp) {
                     const doc = try loader.nextDocumentStringLoop();
                     did_anything = true;
+
                     // Add to pending documents
                     const doc_idx = self.addToPendingDocuments(doc);
 
@@ -497,14 +500,13 @@ pub const ParallelDP = struct {
                         },
                     };
 
-                    _ = self.sendMessageToWorker(i, msg, true); // Expect response
+                    _ = self.sendMessageToWorker(i, msg, true);
                     documents_submitted += 1;
-                    //std.debug.print("Submitted document {d} to worker {d}, now self.n_outstanding_jobs[i] = {d} and documents_submitted = {d}\n", .{ doc_idx, i, self.n_outstanding_jobs[i], documents_submitted });
                 }
             }
 
             if (documents_processed == sample_size) {
-                // copy the stats from all workers
+                // Copy the stats from all workers
                 for (self.workers) |worker| {
                     for (worker.candidate_stats, 0..) |stats, idx| {
                         candidates[idx].sampled_occurrences += stats.sampled_occurrences;
@@ -584,7 +586,7 @@ pub const ParallelDP = struct {
                             @panic("oh no!4");
                         },
                         else => {
-                            std.debug.print("[Coordinator] Worker {d} error: Unknown message type\n", .{ i });
+                            std.debug.print("[Coordinator] Worker {d} error: Unknown message type\n", .{i});
                             @panic("oh no!5");
                         },
                     }
@@ -620,14 +622,12 @@ pub const ParallelDP = struct {
             if (!did_anything) {
                 std.time.sleep(1);
             }
-
         }
     }
 
     /// Process a batch of documents in parallel
-    pub fn getCorpusTokenCount(
-        self: *ParallelDP,
-    ) !u64 {
+    pub fn getCorpusTokenCount(self: *ParallelDP, loader: anytype) !u64 {
+        const DataLoaderType = @TypeOf(loader.*);
         const start_time = time.nanoTimestamp();
         // Initialize workers with shared automaton
         try self.initWorkersForCorpusTokenCount();
@@ -636,7 +636,6 @@ pub const ParallelDP = struct {
         var documents_processed: usize = 0;
         var documents_submitted: usize = 0;
 
-        const loader = self.vocab_learner.loader.?;
         try loader.rewind();
         var maybe_doc = try loader.nextDocumentString();
         var ret: u64 = 0;
@@ -652,7 +651,7 @@ pub const ParallelDP = struct {
                     did_anything = true;
                     switch (msg) {
                         .TokenCount => |token_count_msg| {
-                            self.removeFromPendingDocuments(token_count_msg.id);
+                            self.removeFromPendingDocuments(token_count_msg.id, DataLoaderType);
                             ret += token_count_msg.token_count;
                             documents_processed += 1;
                         },
@@ -661,14 +660,16 @@ pub const ParallelDP = struct {
                             @panic("oh no!6");
                         },
                         else => {
-                            std.debug.print("[Coordinator] Worker {d} error: Unknown message type\n", .{ i });
+                            std.debug.print("[Coordinator] Worker {d} error: Unknown message type\n", .{i});
                             @panic("oh no!7");
                         },
                     }
                 }
+
                 if (self.n_outstanding_jobs[i] < self.queue_depth_for_tokenize) {
                     if (maybe_doc) |doc| {
                         did_anything = true;
+
                         // Add to pending documents
                         const doc_idx = self.addToPendingDocuments(doc);
 

@@ -6,6 +6,7 @@ logs/
 *.dylib
 *.dylib.o
 *.bin
+*.o
 
 # Zig build artifacts
 zig-out

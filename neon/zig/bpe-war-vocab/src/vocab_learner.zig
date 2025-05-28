@@ -1,6 +1,7 @@
 const std = @import("std");
 const BakaCorasick = @import("baka_corasick.zig").BakaCorasick;
 const fineweb = @import("data_loader.zig").FinewebDataLoader;
+const InMemoryDataLoader = @import("in_mem_dataloader.zig").InMemoryDataLoader;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const parallel = @import("parallel.zig");
@@ -138,7 +139,8 @@ pub const VocabLearner = struct {
     vocab_automaton: BakaCorasick,
     eval_automaton: BakaCorasick,
     current_step: u32,
-    loader: ?*fineweb = null,
+    loader: ?*anyopaque = null,
+    use_in_memory: bool = false,
     document_sampler: *DocumentSampler,
     n_token_ids: u32,
     vocab_size: u32,
@@ -157,7 +159,11 @@ pub const VocabLearner = struct {
     last_full_corpus_scan: u32,
     debug: bool,
 
-    pub fn init(allocator: Allocator, input_tokenset_path: []const u8, corpus_paths: []const []const u8, max_vocab_size: u32, debug: bool) !*VocabLearner {
+    fn getLoader(self: *VocabLearner, comptime LoaderType: type) *LoaderType {
+        return @ptrCast(@alignCast(self.loader.?));
+    }
+
+    pub fn init(allocator: Allocator, input_tokenset_path: []const u8, corpus_paths: []const []const u8, max_vocab_size: u32, use_in_memory: bool, debug: bool) !*VocabLearner {
         var learner = try allocator.create(VocabLearner);
 
         // Initialize fields
@@ -178,6 +184,7 @@ pub const VocabLearner = struct {
             .n_candidates_to_tokenize = 500,
             .processed_files = std.StringHashMap(void).init(allocator),
             .last_full_corpus_scan = 0,
+            .use_in_memory = use_in_memory,
             .debug = debug,
         };
 
@@ -203,6 +210,16 @@ pub const VocabLearner = struct {
         // Clean up BakaCorasick instances
         self.vocab_automaton.deinit();
         self.eval_automaton.deinit();
+
+        if (self.loader) |_| {
+            if (self.use_in_memory) {
+                const loader = self.getLoader(InMemoryDataLoader);
+                loader.deinit();
+            } else {
+                const loader = self.getLoader(fineweb);
+                loader.deinit();
+            }
+        }
 
         // Free document sampler
         self.document_sampler.deinit();
@@ -374,9 +391,75 @@ pub const VocabLearner = struct {
         if (self.loader == null) {
             var corpus_files = try self.collectBinFiles();
             defer self.cleanupBinFiles(&corpus_files);
-            var loader = try fineweb.init(self.allocator, corpus_files.items);
-            try loader.loadVocabulary("vocab.json");
-            self.loader = loader;
+
+            if (self.use_in_memory) {
+                if (self.debug) {
+                    std.debug.print("Initializing in-memory data loader...\n", .{});
+                }
+                const in_memory_loader = try InMemoryDataLoader.init(self.allocator, corpus_files.items);
+                self.loader = @ptrCast(in_memory_loader);
+            } else {
+                if (self.debug) {
+                    std.debug.print("Initializing streaming data loader...\n", .{});
+                }
+                var fineweb_loader = try fineweb.init(self.allocator, corpus_files.items);
+                try fineweb_loader.loadVocabulary("vocab.json");
+                self.loader = @ptrCast(fineweb_loader);
+            }
+        }
+    }
+
+    inline fn processCorpusBatch(self: *VocabLearner, comptime LoaderType: type, batch_automaton: *BakaCorasick, token_id_to_stats: anytype, position: *u64, tokens_recorded: *u64) !void {
+        const loader = self.getLoader(LoaderType);
+        try loader.rewind();
+        while (try loader.nextDocumentString()) |text| {
+            defer self.allocator.free(text);
+
+            var current_state: u32 = 0;
+            for (text) |byte| {
+                current_state = batch_automaton.transitions[current_state][byte];
+
+                {
+                    const token_id = batch_automaton.info[current_state].token_id;
+                    if (token_id != BakaCorasick.NO_TOKEN) {
+                        const token_len = batch_automaton.info[current_state].depth;
+                        if (position.* >= token_id_to_stats[token_id].next_valid_position) {
+                            const next_valid_position = position.* + token_len;
+                            token_id_to_stats[token_id].next_valid_position = next_valid_position;
+                            token_id_to_stats[token_id].n_nonoverlapping_occurrences += 1;
+                            tokens_recorded.* += 1;
+                        }
+                    }
+                }
+
+                var suffix = batch_automaton.info[current_state].green;
+                while (suffix != 0) {
+                    const token_id = batch_automaton.info[suffix].token_id;
+                    if (token_id != BakaCorasick.NO_TOKEN) {
+                        const token_len = batch_automaton.info[suffix].depth;
+                        if (position.* >= token_id_to_stats[token_id].next_valid_position) {
+                            const next_valid_position = position.* + token_len;
+                            token_id_to_stats[token_id].next_valid_position = next_valid_position;
+                            token_id_to_stats[token_id].n_nonoverlapping_occurrences += 1;
+                            tokens_recorded.* += 1;
+                        }
+                    }
+                    suffix = batch_automaton.info[suffix].green;
+                }
+                position.* += 1;
+            }
+        }
+    }
+
+    inline fn countSingleByteTokens(self: *VocabLearner, comptime LoaderType: type, single_byte_counts: []u64) !void {
+        const loader = self.getLoader(LoaderType);
+        try loader.rewind();
+
+        while (try loader.nextDocumentString()) |text| {
+            defer if (LoaderType.NEEDS_DEALLOCATION) self.allocator.free(text);
+            for (text) |byte| {
+                single_byte_counts[byte] += 1;
+            }
         }
     }
 
@@ -470,47 +553,13 @@ pub const VocabLearner = struct {
                 std.debug.print("Batch {d}: Processing tokens {d}-{d} ({d} tokens), automaton size: {d} states\n", .{ batch_num, start_idx, actual_end_idx - 1, tokens_in_batch, batch_automaton.len });
             }
 
-            // process corpus with this batch's automaton
-            try self.loader.?.rewind();
             var position: u64 = 0;
             var tokens_recorded: u64 = 0;
 
-            while (try self.loader.?.nextDocumentString()) |text| {
-                defer self.allocator.free(text);
-
-                var current_state: u32 = 0;
-                for (text) |byte| {
-                    current_state = batch_automaton.transitions[current_state][byte];
-
-                    {
-                        const token_id = batch_automaton.info[current_state].token_id;
-                        if (token_id != BakaCorasick.NO_TOKEN) {
-                            const token_len = batch_automaton.info[current_state].depth;
-                            if (position >= token_id_to_stats[token_id].next_valid_position) {
-                                const next_valid_position = position + token_len;
-                                token_id_to_stats[token_id].next_valid_position = next_valid_position;
-                                token_id_to_stats[token_id].n_nonoverlapping_occurrences += 1;
-                                tokens_recorded += 1;
-                            }
-                        }
-                    }
-
-                    var suffix = batch_automaton.info[current_state].green;
-                    while (suffix != 0) {
-                        const token_id = batch_automaton.info[suffix].token_id;
-                        if (token_id != BakaCorasick.NO_TOKEN) {
-                            const token_len = batch_automaton.info[suffix].depth;
-                            if (position >= token_id_to_stats[token_id].next_valid_position) {
-                                const next_valid_position = position + token_len;
-                                token_id_to_stats[token_id].next_valid_position = next_valid_position;
-                                token_id_to_stats[token_id].n_nonoverlapping_occurrences += 1;
-                                tokens_recorded += 1;
-                            }
-                        }
-                        suffix = batch_automaton.info[suffix].green;
-                    }
-                    position += 1;
-                }
+            if (self.use_in_memory) {
+                try self.processCorpusBatch(InMemoryDataLoader, &batch_automaton, token_id_to_stats, &position, &tokens_recorded);
+            } else {
+                try self.processCorpusBatch(fineweb, &batch_automaton, token_id_to_stats, &position, &tokens_recorded);
             }
 
             // update main stats with results from this batch
@@ -540,16 +589,14 @@ pub const VocabLearner = struct {
             std.debug.print("Processing single-byte tokens...\n", .{});
         }
 
-        try self.loader.?.rewind();
-        var single_byte_counts = try self.allocator.alloc(u64, 256);
+        const single_byte_counts = try self.allocator.alloc(u64, 256);
         defer self.allocator.free(single_byte_counts);
         @memset(single_byte_counts, 0);
 
-        while (try self.loader.?.nextDocumentString()) |text| {
-            defer self.allocator.free(text);
-            for (text) |byte| {
-                single_byte_counts[byte] += 1;
-            }
+        if (self.use_in_memory) {
+            try self.countSingleByteTokens(InMemoryDataLoader, single_byte_counts);
+        } else {
+            try self.countSingleByteTokens(fineweb, single_byte_counts);
         }
 
         for (0..256) |id| {
@@ -758,7 +805,7 @@ pub const VocabLearner = struct {
 
                 const automaton_start_time = std.time.milliTimestamp();
                 if (self.debug) {
-                    std.debug.print("heap.items.len={}, this_step_heap.items.len={}\n", .{heap.items.len, this_step_heap.items.len});
+                    std.debug.print("heap.items.len={}, this_step_heap.items.len={}\n", .{ heap.items.len, this_step_heap.items.len });
                     std.debug.print("Creating candidate automaton with just candidate tokens...\n", .{});
                 }
 
@@ -778,7 +825,13 @@ pub const VocabLearner = struct {
                     std.debug.print("Added {d} candidate tokens to automaton\n", .{n_candidates});
                 }
 
-                try parallel_dp.processDocuments(self.loader.?, self.sample_size, top_k_candidates[0..n_candidates], &candidate_automaton);
+                if (self.use_in_memory) {
+                    const loader = self.getLoader(InMemoryDataLoader);
+                    try parallel_dp.processDocuments(loader, self.sample_size, top_k_candidates[0..n_candidates], &candidate_automaton);
+                } else {
+                    const loader = self.getLoader(fineweb);
+                    try parallel_dp.processDocuments(loader, self.sample_size, top_k_candidates[0..n_candidates], &candidate_automaton);
+                }
 
                 var write_cursor: usize = 0;
                 var best_leftover_savings: f64 = -420;
@@ -823,7 +876,8 @@ pub const VocabLearner = struct {
                 {
                     var best_heap_est_savings = self.candidate_stats[heap.peek().?].est_total_savings;
                     while (tokenize_candidates_heap.count() < self.top_k_candidates or
-                            self.candidate_stats[tokenize_candidates_heap.peek().?].est_total_savings <= best_heap_est_savings) {
+                        self.candidate_stats[tokenize_candidates_heap.peek().?].est_total_savings <= best_heap_est_savings)
+                    {
                         for (0..self.n_candidates_to_tokenize) |i| {
                             candidates_to_tokenize[i] = heap.remove();
                         }
@@ -867,7 +921,7 @@ pub const VocabLearner = struct {
             for (rejected_current_step_tokens[0..n_rejected]) |token_id| {
                 try heap.add(token_id);
             }
-            while(this_step_heap.removeOrNull()) |token_id| {
+            while (this_step_heap.removeOrNull()) |token_id| {
                 try heap.add(token_id);
             }
             for (top_k_candidates[0..n_candidates]) |stats| {
@@ -896,7 +950,13 @@ pub const VocabLearner = struct {
             try self.vocab_automaton.computeSuffixLinks();
 
             if (self.vocab_size == self.max_vocab_size) {
-                const token_count = try parallel_dp.getCorpusTokenCount();
+                const token_count = if (self.use_in_memory) blk: {
+                    const loader = self.getLoader(InMemoryDataLoader);
+                    break :blk try parallel_dp.getCorpusTokenCount(loader);
+                } else blk: {
+                    const loader = self.getLoader(fineweb);
+                    break :blk try parallel_dp.getCorpusTokenCount(loader);
+                };
                 if (token_count < best_corpus_token_count) {
                     best_corpus_token_count = token_count;
                     std.debug.print("New best corpus token count: {d}\n", .{token_count});
@@ -906,7 +966,8 @@ pub const VocabLearner = struct {
             } else {
                 var best_heap_est_savings = self.candidate_stats[heap.peek().?].est_total_savings;
                 while (tokenize_candidates_heap.count() < self.top_k_candidates or
-                        self.candidate_stats[tokenize_candidates_heap.peek().?].est_total_savings <= best_heap_est_savings) {
+                    self.candidate_stats[tokenize_candidates_heap.peek().?].est_total_savings <= best_heap_est_savings)
+                {
                     for (0..self.n_candidates_to_tokenize) |i| {
                         candidates_to_tokenize[i] = heap.remove();
                     }
@@ -1499,21 +1560,6 @@ pub const VocabLearner = struct {
         return learner;
     }
 
-    pub fn getCorpusTokenCount(
-        self: *const VocabLearner,
-        lookbacks_arraylist: *std.ArrayList(u64),
-        dp_solution_arraylist: *std.ArrayList(u32),
-    ) !u64 {
-        try self.loader.?.rewind();
-        var token_count: u64 = 0;
-
-        while (try self.loader.?.nextDocumentString()) |text| {
-            token_count += try self.getDocumentTokenCount(text, lookbacks_arraylist, dp_solution_arraylist);
-            self.allocator.free(text);
-        }
-        return token_count;
-    }
-
     pub fn getDocumentTokenCount(
         self: *const VocabLearner,
         document: []const u8,
@@ -1849,7 +1895,13 @@ pub const VocabLearner = struct {
         const original_sample_size = self.sample_size;
         self.sample_size = @max(self.sample_size / 4, 5); // Reduce sample size for speed
 
-        try parallel_dp.processDocuments(self.loader.?, self.sample_size, top_k_candidates, &candidate_automaton);
+        if (self.use_in_memory) {
+            const loader = self.getLoader(InMemoryDataLoader);
+            try parallel_dp.processDocuments(loader, self.sample_size, top_k_candidates, &candidate_automaton);
+        } else {
+            const loader = self.getLoader(fineweb);
+            try parallel_dp.processDocuments(loader, self.sample_size, top_k_candidates, &candidate_automaton);
+        }
 
         // Restore original sample size
         self.sample_size = original_sample_size;
@@ -2334,46 +2386,44 @@ pub fn main() !void {
     const allocator = std.heap.c_allocator;
 
     // Parse command line arguments
-    var args = try std.process.argsAlloc(allocator);
+    const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 3) {
-        std.debug.print("Usage: {s} <tokenset_file> <corpus_path> [corpus_path...] [--stats-path path]\n", .{args[0]});
+        std.debug.print("Usage: {s} <tokenset_file> <corpus_path> [corpus_path...] [--stats-path path] [--in-memory]\n", .{args[0]});
         return;
     }
 
     const tokenset_path = args[1];
     var stats_path: ?[]const u8 = null;
+    var use_in_memory = false;
     var corpus_paths: []const []const u8 = undefined;
 
-    // Extract stats path option if present
-    const stats_flag = "--stats-path";
-    for (2..args.len - 1) |i| {
-        if (std.mem.eql(u8, args[i], stats_flag)) {
-            stats_path = args[i + 1];
+    var non_flag_paths = std.ArrayList([]const u8).init(allocator);
+    defer non_flag_paths.deinit();
 
-            // Create corpus_paths array excluding the stats flag and value
-            var non_flag_paths = std.ArrayList([]const u8).init(allocator);
-
-            for (2..args.len) |j| {
-                if (j != i and j != i + 1) {
-                    try non_flag_paths.append(args[j]);
-                }
+    var i: usize = 2;
+    while (i < args.len) {
+        if (std.mem.eql(u8, args[i], "--stats-path")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("Error: --stats-path requires a value\n", .{});
+                return;
             }
-
-            corpus_paths = try non_flag_paths.toOwnedSlice();
-            break;
+            stats_path = args[i + 1];
+            i += 2;
+        } else if (std.mem.eql(u8, args[i], "--in-memory")) {
+            use_in_memory = true;
+            i += 1;
+        } else {
+            try non_flag_paths.append(args[i]);
+            i += 1;
         }
     }
 
-    // If no stats path found, use all remaining args as corpus paths
-    if (stats_path == null) {
-        corpus_paths = args[2..];
-    }
-
+    corpus_paths = non_flag_paths.items;
     const debug = true;
 
-    var learner = try VocabLearner.init(allocator, tokenset_path, corpus_paths, 50000, debug);
+    var learner = try VocabLearner.init(allocator, tokenset_path, corpus_paths, 50000, use_in_memory, debug);
     defer learner.deinit();
 
     // Check if everything initialized properly
