@@ -2082,6 +2082,27 @@ pub const VocabLearner = struct {
         }
     }
 
+    fn hashFile(file_path: []const u8, file_size: u64, seed: u64) u64 {
+        var hasher = std.crypto.hash.Sha1.init(.{});
+
+        var seed_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &seed_bytes, seed, .little);
+        hasher.update(&seed_bytes);
+
+        hasher.update(file_path);
+
+        var size_bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &size_bytes, file_size, .little);
+        hasher.update(&size_bytes);
+
+        // Get SHA1 result (20 bytes) and truncate to u64
+        var hash_result: [20]u8 = undefined;
+        hasher.final(&hash_result);
+
+        // Take first 8 bytes as u64
+        return std.mem.readInt(u64, hash_result[0..8], .little);
+    }
+
     pub fn saveCorpusStatistics(self: *VocabLearner, path: []const u8) !void {
         const start_time = std.time.milliTimestamp();
 
@@ -2117,16 +2138,10 @@ pub const VocabLearner = struct {
 
         // Write file identifiers (hashes of file paths and sizes)
         for (corpus_files.items) |corpus_file| {
-            var hasher = std.hash.Wyhash.init(self.file_hash_seed);
-            hasher.update(corpus_file);
-
             // Get file size for better uniqueness
             const file_info = try std.fs.cwd().statFile(corpus_file);
-            var size_bytes: [8]u8 = undefined;
-            std.mem.writeInt(u64, &size_bytes, file_info.size, .little);
-            hasher.update(&size_bytes);
 
-            const hash = hasher.final();
+            const hash = hashFile(corpus_file, file_info.size, self.file_hash_seed);
             var hash_bytes: [8]u8 = undefined;
             std.mem.writeInt(u64, &hash_bytes, hash, .little);
             try file.writeAll(&hash_bytes);
@@ -2245,14 +2260,11 @@ pub const VocabLearner = struct {
             saved_hashes[i] = std.mem.readInt(u64, &hash_bytes, .little);
         }
 
-        // Calculate hashes for current files using same seed
+        // Calculate hashes for current files using SHA1
         var current_hashes = try self.allocator.alloc(u64, corpus_files.items.len);
         defer self.allocator.free(current_hashes);
 
         for (corpus_files.items, 0..) |corpus_file, i| {
-            var hasher = std.hash.Wyhash.init(header.hash_seed);
-            hasher.update(corpus_file);
-
             const file_info = std.fs.cwd().statFile(corpus_file) catch |err| {
                 if (self.debug) {
                     std.debug.print("Error getting file info for {s}: {s}\n", .{ corpus_file, @errorName(err) });
@@ -2260,11 +2272,7 @@ pub const VocabLearner = struct {
                 return false;
             };
 
-            var size_bytes: [8]u8 = undefined;
-            std.mem.writeInt(u64, &size_bytes, file_info.size, .little);
-            hasher.update(&size_bytes);
-
-            current_hashes[i] = hasher.final();
+            current_hashes[i] = hashFile(corpus_file, file_info.size, header.hash_seed);
         }
 
         // Sort both hash arrays for comparison
