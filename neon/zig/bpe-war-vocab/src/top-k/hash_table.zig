@@ -1,6 +1,18 @@
 const std = @import("std");
 const EMPTY_SLICE: []const u8 = "";
 
+pub const HashValue = struct {
+    count: u64,
+    next_valid_position: u64,
+
+    pub fn init() HashValue {
+        return HashValue{
+            .count = 0,
+            .next_valid_position = 0,
+        };
+    }
+};
+
 pub fn HashTable(comptime RHT_POW: u6) type {
     const RHT_LEN: usize = @as(usize, 1) << RHT_POW;
     const RHT_LEN_EXTENDED: usize = RHT_LEN * 2;
@@ -9,7 +21,7 @@ pub fn HashTable(comptime RHT_POW: u6) type {
     const Entry = struct {
         key: []const u8,
         hash: u64,
-        value: u64,
+        value: HashValue,
     };
 
     return struct {
@@ -23,7 +35,7 @@ pub fn HashTable(comptime RHT_POW: u6) type {
                 ptr.* = .{
                     .key = EMPTY_SLICE,
                     .hash = 0,
-                    .value = 0,
+                    .value = HashValue.init(),
                 };
             }
             return .{
@@ -40,7 +52,7 @@ pub fn HashTable(comptime RHT_POW: u6) type {
             @prefetch(&self.xs[hash & RHT_MASK], .{});
         }
 
-        pub fn getPtr(self: *Self, key: []const u8, hash: u64) ?*u64 {
+        pub fn getPtr(self: *Self, key: []const u8, hash: u64) ?*HashValue {
             var bucknum: u64 = hash & RHT_MASK;
             const xs = self.xs;
             while (true) {
@@ -58,7 +70,7 @@ pub fn HashTable(comptime RHT_POW: u6) type {
             noalias xs: [*]Entry,
             noalias key_: []const u8,
             hash_: u64,
-            value_: u64,
+            value_: HashValue,
         ) void {
             var key = key_;
             var hash = hash_;
@@ -89,7 +101,11 @@ pub fn HashTable(comptime RHT_POW: u6) type {
             }
         }
 
-        pub fn insertKnownNotPresent(self: *Self, key: []const u8, hash: u64, value: u64) void {
+        pub fn insertKnownNotPresent(self: *Self, key: []const u8, hash: u64, count: u64, next_valid_position: u64) void {
+            const value = HashValue{
+                .count = count,
+                .next_valid_position = next_valid_position,
+            };
             return insertKnownNotPresentInner(self.xs, key, hash, value);
         }
 
@@ -97,9 +113,9 @@ pub fn HashTable(comptime RHT_POW: u6) type {
             noalias xs: [*]Entry,
             noalias key: []const u8,
             hash: u64,
-        ) u64 {
+        ) HashValue {
             var bucknum = hash & RHT_MASK;
-            var ret: u64 = 0;
+            var ret: HashValue = HashValue.init();
             while (true) {
                 if (xs[bucknum].hash == hash and std.mem.eql(u8, xs[bucknum].key, key)) {
                     ret = xs[bucknum].value;
@@ -121,12 +137,12 @@ pub fn HashTable(comptime RHT_POW: u6) type {
             xs[bucknum] = .{
                 .key = EMPTY_SLICE,
                 .hash = 0,
-                .value = 0,
+                .value = HashValue.init(),
             };
             return ret;
         }
 
-        pub fn deleteKnownPresent(self: *Self, key: []const u8, hash: u64) u64 {
+        pub fn deleteKnownPresent(self: *Self, key: []const u8, hash: u64) HashValue {
             return deleteKnownPresentInner(self.xs, key, hash);
         }
     };

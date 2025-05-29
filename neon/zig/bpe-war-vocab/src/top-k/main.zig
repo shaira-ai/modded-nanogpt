@@ -119,7 +119,7 @@ pub fn main() !void {
 }
 
 pub fn anyMain() !void {
-    var mains: [257]*const fn([]const []const u8, usize) anyerror!void = undefined;
+    var mains: [257]*const fn ([]const []const u8, usize) anyerror!void = undefined;
     inline for (2..257) |i| {
         mains[i] = MainHaver(i).main;
     }

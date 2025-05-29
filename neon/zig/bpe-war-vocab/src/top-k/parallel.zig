@@ -292,6 +292,19 @@ pub fn ParallelAnalyzer(
 
             try self.coordinator.runSecondPass();
 
+            // After second pass, merge results from all workers into worker 0
+            if (self.debug) {
+                std.debug.print("[ParallelAnalyzer] Merging results from all workers\n", .{});
+            }
+
+            // Merge all worker results into worker 0's SFM
+            for (1..self.coordinator.workers.len) |i| {
+                try self.coordinator.workers[0].sfm.mergeCounts(self.coordinator.workers[i].sfm);
+                if (self.debug) {
+                    std.debug.print("[ParallelAnalyzer] Merged results from worker {d}\n", .{i});
+                }
+            }
+
             const total_time = time.nanoTimestamp() - overall_start_time;
             if (self.debug) {
                 std.debug.print("[ParallelAnalyzer] Second pass completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(total_time)) / time.ns_per_ms});
@@ -326,89 +339,14 @@ pub fn ParallelAnalyzer(
                 std.debug.print("[ParallelAnalyzer] Saving token set to binary format: {s}\n", .{output_path});
             }
 
-            // Open output file
-            const file = try fs.cwd().createFile(output_path, .{});
-            defer file.close();
-
-            const writer = file.writer();
-
-            var header: [256]u32 = [_]u32{0} ** 256;
-
             const manager = if (self.manager) |m| m else self.coordinator.workers[0].sfm;
 
-            var token_count_by_length = std.AutoHashMap(usize, usize).init(self.allocator);
-            defer token_count_by_length.deinit();
-
-            for (manager.heap.items) |candidate| {
-                const length = candidate.string.len;
-
-                if (length == 0 or length > 256) continue;
-
-                const current = token_count_by_length.get(length) orelse 0;
-                try token_count_by_length.put(length, current + 1);
-            }
-
-            var lengths_it = token_count_by_length.iterator();
-            while (lengths_it.next()) |entry| {
-                const length = entry.key_ptr.*;
-                const count = entry.value_ptr.*;
-
-                if (length > 0 and length <= 256) {
-                    header[length - 1] = @intCast(count);
-
-                    if (self.debug) {
-                        std.debug.print("[ParallelAnalyzer] Length {d}: {d} tokens\n", .{ length, count });
-                    }
-                }
-            }
-
-            // Write header
-            try writer.writeAll(std.mem.asBytes(&header));
-
-            // Now write the tokens, grouped by length
-            var length_arrays = std.AutoHashMap(usize, std.ArrayList([]const u8)).init(self.allocator);
-            defer {
-                var len_it = length_arrays.iterator();
-                while (len_it.next()) |entry| {
-                    entry.value_ptr.*.deinit();
-                }
-                length_arrays.deinit();
-            }
-
-            while(manager.heap.count() > 0) {
-                const candidate = manager.heap.remove();
-                const length = candidate.string.len;
-
-                if (length == 0 or length > 256) continue;
-
-                if (!length_arrays.contains(length)) {
-                    try length_arrays.put(length, std.ArrayList([]const u8).init(self.allocator));
-                }
-
-                try length_arrays.getPtr(length).?.append(candidate.string);
-            }
-
-            for (1..257) |length| {
-                if (length_arrays.get(@intCast(length))) |token_list| {
-                    var idx: usize = 0;
-                    while (idx < token_list.items.len) : (idx += 1) {
-                        const token = token_list.items[token_list.items.len - idx - 1];
-                        try writer.writeAll(token);
-                    }
-                }
-            }
-
-            const total_tokens = blk: {
-                var sum: usize = 0;
-                for (header) |count| {
-                    sum += count;
-                }
-                break :blk sum;
-            };
+            // Call the new method that saves tokens with non-overlapping counts
+            try manager.saveTokensToBinaryFormat(output_path);
 
             const elapsed = time.nanoTimestamp() - start_time;
             if (self.debug) {
-                std.debug.print("[ParallelAnalyzer] Token set written in {d:.2}ms, {d} total tokens\n", .{ @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms, total_tokens });
+                std.debug.print("[ParallelAnalyzer] Tokens with non-overlapping counts saved in {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
             }
         }
     };
