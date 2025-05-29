@@ -37,8 +37,8 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: comptime_int) type {
         }
 
         pub fn push(self: *Self, value: T) bool {
-            const head = @atomicLoad(usize, &self.head, .acquire);
-            const tail = self.tail;
+            const head = self.head;
+            const tail = @atomicLoad(usize, &self.tail, .acquire);
             if (head +% 1 -% tail > capacity) return false;
             self.buffer[head & mask] = value;
             @atomicStore(usize, &self.head, head +% 1, .release);
@@ -46,21 +46,12 @@ pub fn BoundedQueue(comptime T: type, comptime capacity: comptime_int) type {
         }
 
         pub fn pop(self: *Self) ?T {
-            const tail = @atomicLoad(usize, &self.tail, .acquire);
-            const head = self.head;
+            const tail = self.tail;
+            const head = @atomicLoad(usize, &self.head, .acquire);
             if (tail -% head == 0) return null;
             const value = self.buffer[tail & mask];
             @atomicStore(usize, &self.tail, tail +% 1, .release);
             return value;
-        }
-
-        pub fn count(self: *Self) usize {
-            if (true) {
-                @compileError("BoundedQueue.count() is not implemented");
-            }
-            const head = @atomicLoad(usize, &self.head, .acquire);
-            const tail = @atomicLoad(usize, &self.tail, .acquire);
-            return head -% tail;
         }
     };
 }

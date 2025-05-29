@@ -777,7 +777,12 @@ pub const VocabLearner = struct {
         var parallel_dp = try parallel.ParallelDP.init(self.allocator, self, self.debug);
         defer parallel_dp.deinit();
 
-        const candidates_to_tokenize = try self.allocator.alloc(u32, self.n_candidates_to_tokenize);
+        var candidates_to_tokenize_arraylist = std.ArrayList(u32).init(self.allocator);
+        defer candidates_to_tokenize_arraylist.deinit();
+        var n_candidates_to_tokenize: usize = self.n_candidates_to_tokenize;
+        const n_to_tokenize_increase_per_repeat: usize = 500;
+        const n_to_tokenize_decrease_when_no_repeats: usize = 100;
+        try candidates_to_tokenize_arraylist.ensureTotalCapacity(n_candidates_to_tokenize);
 
         while (self.vocab_size < self.max_vocab_size) {
             //const max_acceptable = @min(accepted_current_step_tokens.len, self.max_vocab_size - self.vocab_size);
@@ -875,14 +880,21 @@ pub const VocabLearner = struct {
                 }
                 {
                     var best_heap_est_savings = self.candidate_stats[heap.peek().?].est_total_savings;
+                    var repeated = false;
                     while (tokenize_candidates_heap.count() < self.top_k_candidates or
                         self.candidate_stats[tokenize_candidates_heap.peek().?].est_total_savings <= best_heap_est_savings)
                     {
-                        for (0..self.n_candidates_to_tokenize) |i| {
+                        if (tokenize_candidates_heap.count() > 0) {
+                            n_candidates_to_tokenize += n_to_tokenize_increase_per_repeat;
+                            repeated = true;
+                            try candidates_to_tokenize_arraylist.ensureTotalCapacity(n_candidates_to_tokenize);
+                        }
+                        const candidates_to_tokenize = candidates_to_tokenize_arraylist.items[0..n_candidates_to_tokenize];
+                        for (0..candidates_to_tokenize.len) |i| {
                             candidates_to_tokenize[i] = heap.remove();
                         }
                         try parallel_dp.updateMaxSavingsByTokenizingCandidates(candidates_to_tokenize);
-                        for (0..self.n_candidates_to_tokenize) |i| {
+                        for (0..candidates_to_tokenize.len) |i| {
                             try tokenize_candidates_heap.add(candidates_to_tokenize[i]);
                         }
                         while (tokenize_candidates_heap.count() > self.top_k_candidates) {
@@ -890,6 +902,10 @@ pub const VocabLearner = struct {
                             try tokenize_candidates_scratch.append(token_id);
                         }
                         best_heap_est_savings = self.candidate_stats[heap.peek().?].est_total_savings;
+                    }
+                    if (!repeated) {
+                        n_candidates_to_tokenize -|= n_to_tokenize_decrease_when_no_repeats;
+                        n_candidates_to_tokenize = @max(n_candidates_to_tokenize, self.n_candidates_to_tokenize);
                     }
                     for (tokenize_candidates_scratch.items) |token_id| {
                         try heap.add(token_id);
@@ -965,14 +981,21 @@ pub const VocabLearner = struct {
                 try self.deleteSomeTokens(&heap);
             } else {
                 var best_heap_est_savings = self.candidate_stats[heap.peek().?].est_total_savings;
+                var repeated = false;
                 while (tokenize_candidates_heap.count() < self.top_k_candidates or
                     self.candidate_stats[tokenize_candidates_heap.peek().?].est_total_savings <= best_heap_est_savings)
                 {
-                    for (0..self.n_candidates_to_tokenize) |i| {
+                    if (tokenize_candidates_heap.count() > 0) {
+                        n_candidates_to_tokenize += n_to_tokenize_increase_per_repeat;
+                        repeated = true;
+                        try candidates_to_tokenize_arraylist.ensureTotalCapacity(n_candidates_to_tokenize);
+                    }
+                    const candidates_to_tokenize = candidates_to_tokenize_arraylist.items[0..n_candidates_to_tokenize];
+                    for (0..candidates_to_tokenize.len) |i| {
                         candidates_to_tokenize[i] = heap.remove();
                     }
                     try parallel_dp.updateMaxSavingsByTokenizingCandidates(candidates_to_tokenize);
-                    for (0..self.n_candidates_to_tokenize) |i| {
+                    for (0..candidates_to_tokenize.len) |i| {
                         try tokenize_candidates_heap.add(candidates_to_tokenize[i]);
                     }
                     while (tokenize_candidates_heap.count() > self.top_k_candidates) {
@@ -980,6 +1003,10 @@ pub const VocabLearner = struct {
                         try tokenize_candidates_scratch.append(token_id);
                     }
                     best_heap_est_savings = self.candidate_stats[heap.peek().?].est_total_savings;
+                }
+                if (!repeated) {
+                    n_candidates_to_tokenize -|= n_to_tokenize_decrease_when_no_repeats;
+                    n_candidates_to_tokenize = @max(n_candidates_to_tokenize, self.n_candidates_to_tokenize);
                 }
                 for (tokenize_candidates_scratch.items) |token_id| {
                     try heap.add(token_id);
