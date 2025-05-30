@@ -10,9 +10,10 @@ const huge_pages_plz = @import("huge_pages_plz.zig");
 const FixedBufferAllocator = std.heap.FixedBufferAllocator;
 const builtin = @import("builtin");
 const native_os = builtin.os.tag;
+const CorpusMetadata = @import("data_loader.zig").CorpusMetadata;
 
 // File format version for serialization
-const FILE_FORMAT_VERSION: u32 = 2;
+const FILE_FORMAT_VERSION: u32 = 3;
 const EMPTY_USIZE_SLICE: []usize = &[_]usize{};
 const EMPTY_BYTE_SLICE: []u8 = &[_]u8{};
 const USE_HUGE_PAGES = native_os == .linux and false;
@@ -83,6 +84,8 @@ pub fn StringFrequencyManager(
         cms: *CMS,
         length2_counters: []usize,
         length3_counters: []usize,
+        length2_used_indices: std.ArrayList(u16),
+        length3_used_indices: std.ArrayList(u32),
         cms_is_owned: bool = true,
         // Min heap for tracking top-K strings of my length
         heap: std.PriorityQueue(CandidateString, void, CandidateString.lessThan),
@@ -90,6 +93,7 @@ pub fn StringFrequencyManager(
         actual_counts: HashTable(get_RHT_POW(top_k)),
         // Global position counter across all documents processed by this manager
         global_position: u64 = 0,
+        corpus_metadata: ?*const CorpusMetadata = null,
 
         const Self = @This();
 
@@ -120,14 +124,22 @@ pub fn StringFrequencyManager(
             @memset(len2_counters, 0);
             @memset(len3_counters, 0);
 
+            const len2_used_indices = std.ArrayList(u16).init(allocator);
+            const len3_used_indices = std.ArrayList(u32).init(allocator);
+
             self.* = .{
                 .allocator = allocator,
                 .fba = fba,
                 .cms = cms,
                 .length2_counters = len2_counters,
                 .length3_counters = len3_counters,
+                .length2_used_indices = len2_used_indices,
+                .length3_used_indices = len3_used_indices,
                 .heap = heap,
                 .actual_counts = actual_counts,
+                .global_position = 0,
+                .corpus_metadata = null,
+                .cms_is_owned = true,
             };
             if (USE_HUGE_PAGES) {
                 self.heap.allocator = self.fba.allocator();
@@ -146,6 +158,10 @@ pub fn StringFrequencyManager(
             }
             self.allocator.free(self.length2_counters);
             self.allocator.free(self.length3_counters);
+
+            self.length2_used_indices.deinit();
+            self.length3_used_indices.deinit();
+
             while (self.heap.count() > 0) {
                 const item = self.heap.remove();
                 self.allocator.free(item.string);
@@ -164,6 +180,10 @@ pub fn StringFrequencyManager(
             std.debug.print("[TIMING] StringFrequencyManager.deinit: {d:.2}ms\n", .{@as(f64, @floatFromInt(elapsed)) / time.ns_per_ms});
         }
 
+        pub fn setCorpusMetadata(self: *Self, metadata: *const CorpusMetadata) void {
+            self.corpus_metadata = metadata;
+        }
+
         inline fn length2ToIndex(substring: []const u8) usize {
             return @as(u16, @bitCast(substring[0..2].*));
         }
@@ -173,36 +193,38 @@ pub fn StringFrequencyManager(
 
         pub fn length2_token_from_index(self: *Self, index: u16) [2]u8 {
             _ = self;
-            var token: [2]u8 = undefined;
-            token[0] = @intCast((index >> 8) & 0xFF);
-            token[1] = @intCast(index & 0xFF);
-            return token;
+            return @bitCast(index);
         }
 
         pub fn length3_token_from_index(self: *Self, index: u32) [3]u8 {
             _ = self;
-            var token: [3]u8 = undefined;
-            token[0] = @intCast((index >> 16) & 0xFF);
-            token[1] = @intCast((index >> 8) & 0xFF);
-            token[2] = @intCast(index & 0xFF);
-            return token;
+            const index_24: u24 = @intCast(index);
+            return @bitCast(index_24);
         }
 
         // PASS 1: Build the Count-Min Sketch
         pub fn buildCMS(self: *Self, document: []const u8) !void {
-            //const start_time = time.nanoTimestamp();
-
             // Process all substrings of all lengths in one pass
             for (0..document.len) |i| {
                 if (MY_LEN == 2 and i + 2 <= document.len) {
                     const substring = document[i .. i + 2];
                     const index = length2ToIndex(substring);
+
+                    // Track index only when transitioning from 0 to 1
+                    if (self.length2_counters[index] == 0) {
+                        try self.length2_used_indices.append(@intCast(index));
+                    }
                     self.length2_counters[index] += 1;
                 }
 
                 if (MY_LEN == 3 and i + 3 <= document.len) {
                     const substring = document[i .. i + 3];
                     const index = length3ToIndex(substring);
+
+                    // Track index only when transitioning from 0 to 1
+                    if (self.length3_counters[index] == 0) {
+                        try self.length3_used_indices.append(@intCast(index));
+                    }
                     self.length3_counters[index] += 1;
                 }
 
@@ -444,27 +466,133 @@ pub fn StringFrequencyManager(
             }
         }
 
+        fn computeStringHash(self: *Self, str: []const u8) u64 {
+            _ = self;
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(str);
+            return hasher.final();
+        }
+
         pub fn addSmallStringsToHeap(self: *Self) !void {
-            for (self.length2_counters, 0..) |*count, index| {
-                if (count.* > 0) {
+            // Process length 2 indices
+            for (self.length2_used_indices.items) |index| {
+                const count = self.length2_counters[index];
+                if (count > 0) {
                     const str = try self.allocator.alloc(u8, 2);
-                    const idx_u16: u16 = @intCast(index);
-                    @memcpy(str, @as([*]const u8, @ptrCast(&idx_u16)));
-                    const item = CandidateString.init(str, 420, count.*);
-                    try self.addItemToHeap(item, count.*);
+                    const token_bytes = self.length2_token_from_index(@intCast(index));
+                    @memcpy(str, &token_bytes);
+
+                    const hash = self.computeStringHash(str);
+                    const item = CandidateString.init(str, hash, count);
+
+                    // Top-K selection
+                    if (self.heap.count() < top_k) {
+                        try self.heap.add(item);
+                        self.actual_counts.insertKnownNotPresent(item.string, item.hash, 0, 0);
+                    } else if (CandidateString.lessThan(undefined, self.heap.peek().?, item) == .lt) {
+                        const evicted = self.heap.remove();
+                        _ = self.actual_counts.deleteKnownPresent(evicted.string, evicted.hash);
+                        self.allocator.free(evicted.string);
+                        try self.heap.add(item);
+                        self.actual_counts.insertKnownNotPresent(item.string, item.hash, 0, 0);
+                    } else {
+                        self.allocator.free(item.string);
+                    }
                 }
-                count.* = 0;
+                self.length2_counters[index] = 0;
             }
-            for (self.length3_counters, 0..) |*count, index| {
-                if (count.* > 0) {
+            self.length2_used_indices.clearRetainingCapacity();
+
+            // Process length 3 indices
+            for (self.length3_used_indices.items) |index| {
+                const count = self.length3_counters[index];
+                if (count > 0) {
                     const str = try self.allocator.alloc(u8, 3);
-                    const idx_u24: u24 = @intCast(index);
-                    @memcpy(str, @as([*]const u8, @ptrCast(&idx_u24)));
-                    const item = CandidateString.init(str, 420, count.*);
-                    try self.addItemToHeap(item, count.*);
+                    const token_bytes = self.length3_token_from_index(@intCast(index));
+                    @memcpy(str, &token_bytes);
+
+                    const hash = self.computeStringHash(str);
+                    const item = CandidateString.init(str, hash, count);
+
+                    // Top-K selection
+                    if (self.heap.count() < top_k) {
+                        try self.heap.add(item);
+                        self.actual_counts.insertKnownNotPresent(item.string, item.hash, 0, 0);
+                    } else if (CandidateString.lessThan(undefined, self.heap.peek().?, item) == .lt) {
+                        const evicted = self.heap.remove();
+                        _ = self.actual_counts.deleteKnownPresent(evicted.string, evicted.hash);
+                        self.allocator.free(evicted.string);
+                        try self.heap.add(item);
+                        self.actual_counts.insertKnownNotPresent(item.string, item.hash, 0, 0);
+                    } else {
+                        self.allocator.free(item.string);
+                    }
                 }
-                count.* = 0;
+                self.length3_counters[index] = 0;
             }
+            self.length3_used_indices.clearRetainingCapacity();
+        }
+
+        pub fn processDocumentSecondPassSmallStrings(self: *Self, document: []const u8) !void {
+            if (MY_LEN >= 4) return;
+
+            var lookups_attempted: usize = 0;
+            var lookups_found: usize = 0;
+            var overlaps_skipped: usize = 0;
+            var counts_incremented: usize = 0;
+
+            for (0..document.len) |i| {
+                // Process length 2
+                if (MY_LEN == 2 and i + 2 <= document.len) {
+                    const substring = document[i .. i + 2];
+                    const hash = self.computeStringHash(substring);
+                    const position = self.global_position + i;
+
+                    lookups_attempted += 1;
+
+                    const maybe_value_ptr = self.actual_counts.getPtr(substring, hash);
+                    if (maybe_value_ptr) |value_ptr| {
+                        lookups_found += 1;
+
+                        if (position >= value_ptr.next_valid_position) {
+                            value_ptr.count += 1;
+                            value_ptr.next_valid_position = position + MY_LEN;
+                            counts_incremented += 1;
+                        } else {
+                            overlaps_skipped += 1;
+                        }
+                    }
+                }
+
+                if (MY_LEN == 3 and i + 3 <= document.len) {
+                    const substring = document[i .. i + 3];
+                    const hash = self.computeStringHash(substring);
+                    const position = self.global_position + i;
+
+                    lookups_attempted += 1;
+
+                    const maybe_value_ptr = self.actual_counts.getPtr(substring, hash);
+                    if (maybe_value_ptr) |value_ptr| {
+                        lookups_found += 1;
+
+                        if (position >= value_ptr.next_valid_position) {
+                            value_ptr.count += 1;
+                            value_ptr.next_valid_position = position + MY_LEN;
+                            counts_incremented += 1;
+                        } else {
+                            overlaps_skipped += 1;
+                        }
+                    }
+                }
+            }
+
+            const doc_num = self.global_position / 1000;
+            if (lookups_found > 0 and doc_num % 10000 == 0) {
+                std.debug.print("Doc {d}: attempted={d}, found={d}, incremented={d}, overlaps_skipped={d}\n", .{ doc_num, lookups_attempted, lookups_found, counts_incremented, overlaps_skipped });
+            }
+
+            // Update global position for next document
+            self.global_position += document.len;
         }
 
         // Get results and calculate error statistics
@@ -603,13 +731,54 @@ pub fn StringFrequencyManager(
             var buffered_writer = std.io.bufferedWriter(file.writer());
             var writer = buffered_writer.writer();
 
+            const format_version: u32 = 3;
+            const version_bytes = std.mem.toBytes(format_version);
+            try writer.writeAll(&version_bytes);
+
             // Write header (256 u32 values for token counts by length)
             for (0..256) |i| {
                 const count_bytes = std.mem.toBytes(length_counts[i]);
                 try writer.writeAll(&count_bytes);
             }
 
+            // Write corpus metadata section
+            if (self.corpus_metadata) |metadata| {
+                // Write metadata
+                const file_count_bytes = std.mem.toBytes(metadata.file_count);
+                try writer.writeAll(&file_count_bytes);
+
+                const timestamp_bytes = std.mem.toBytes(metadata.timestamp);
+                try writer.writeAll(&timestamp_bytes);
+
+                const hash_seed_bytes = std.mem.toBytes(metadata.hash_seed);
+                try writer.writeAll(&hash_seed_bytes);
+
+                // Write file hashes
+                for (metadata.file_hashes) |hash| {
+                    const hash_bytes = std.mem.toBytes(hash);
+                    try writer.writeAll(&hash_bytes);
+                }
+
+                std.debug.print("[SFM] Wrote corpus metadata: {d} files, timestamp: {d}\n", .{ metadata.file_count, metadata.timestamp });
+            } else {
+                // Write empty metadata
+                const empty_u32: u32 = 0;
+                const empty_u64: u64 = 0;
+
+                const file_count_bytes = std.mem.toBytes(empty_u32);
+                try writer.writeAll(&file_count_bytes);
+
+                const timestamp_bytes = std.mem.toBytes(empty_u64);
+                try writer.writeAll(&timestamp_bytes);
+
+                const hash_seed_bytes = std.mem.toBytes(empty_u64);
+                try writer.writeAll(&hash_seed_bytes);
+
+                std.debug.print("[SFM] No corpus metadata available, wrote empty metadata section\n", .{});
+            }
+
             // Write interleaved data organized by length groups
+            var total_written: usize = 0;
             for (1..256) |length| {
                 if (length_counts[length] > 0) {
                     const tokens = &tokens_by_length.items[length];
@@ -622,6 +791,8 @@ pub fn StringFrequencyManager(
                         // Write occurrence count (8 bytes, u64)
                         const count_bytes = std.mem.toBytes(counts.items[i]);
                         try writer.writeAll(&count_bytes);
+
+                        total_written += 1;
                     }
                 }
             }

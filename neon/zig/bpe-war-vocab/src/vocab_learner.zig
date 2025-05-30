@@ -782,7 +782,7 @@ pub const VocabLearner = struct {
         var n_candidates_to_tokenize: usize = self.n_candidates_to_tokenize;
         const n_to_tokenize_increase_per_repeat: usize = 500;
         const n_to_tokenize_decrease_when_no_repeats: usize = 100;
-        try candidates_to_tokenize_arraylist.ensureTotalCapacity(n_candidates_to_tokenize);
+        try candidates_to_tokenize_arraylist.resize(n_candidates_to_tokenize);
 
         while (self.vocab_size < self.max_vocab_size) {
             //const max_acceptable = @min(accepted_current_step_tokens.len, self.max_vocab_size - self.vocab_size);
@@ -887,9 +887,9 @@ pub const VocabLearner = struct {
                         if (tokenize_candidates_heap.count() > 0) {
                             n_candidates_to_tokenize += n_to_tokenize_increase_per_repeat;
                             repeated = true;
-                            try candidates_to_tokenize_arraylist.ensureTotalCapacity(n_candidates_to_tokenize);
+                            try candidates_to_tokenize_arraylist.resize(n_candidates_to_tokenize);
                         }
-                        const candidates_to_tokenize = candidates_to_tokenize_arraylist.items[0..n_candidates_to_tokenize];
+                        const candidates_to_tokenize = candidates_to_tokenize_arraylist.items;
                         for (0..candidates_to_tokenize.len) |i| {
                             candidates_to_tokenize[i] = heap.remove();
                         }
@@ -988,9 +988,9 @@ pub const VocabLearner = struct {
                     if (tokenize_candidates_heap.count() > 0) {
                         n_candidates_to_tokenize += n_to_tokenize_increase_per_repeat;
                         repeated = true;
-                        try candidates_to_tokenize_arraylist.ensureTotalCapacity(n_candidates_to_tokenize);
+                        try candidates_to_tokenize_arraylist.resize(n_candidates_to_tokenize);
                     }
-                    const candidates_to_tokenize = candidates_to_tokenize_arraylist.items[0..n_candidates_to_tokenize];
+                    const candidates_to_tokenize = candidates_to_tokenize_arraylist.items;
                     for (0..candidates_to_tokenize.len) |i| {
                         candidates_to_tokenize[i] = heap.remove();
                     }
@@ -2109,14 +2109,28 @@ pub const VocabLearner = struct {
         }
     }
 
-    fn hashFile(file_path: []const u8, file_size: u64, seed: u64) u64 {
+    fn getAbsolutePath(allocator: std.mem.Allocator, file_path: []const u8) ![]u8 {
+        if (std.fs.path.isAbsolute(file_path)) {
+            return try allocator.dupe(u8, file_path);
+        }
+
+        const cwd = try std.process.getCwdAlloc(allocator);
+        defer allocator.free(cwd);
+
+        return try std.fs.path.join(allocator, &[_][]const u8{ cwd, file_path });
+    }
+
+    fn hashFile(allocator: std.mem.Allocator, file_path: []const u8, file_size: u64, seed: u64) !u64 {
+        const abs_path = try getAbsolutePath(allocator, file_path);
+        defer allocator.free(abs_path);
+
         var hasher = std.crypto.hash.Sha1.init(.{});
 
         var seed_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &seed_bytes, seed, .little);
         hasher.update(&seed_bytes);
 
-        hasher.update(file_path);
+        hasher.update(abs_path);
 
         var size_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &size_bytes, file_size, .little);
@@ -2168,7 +2182,7 @@ pub const VocabLearner = struct {
             // Get file size for better uniqueness
             const file_info = try std.fs.cwd().statFile(corpus_file);
 
-            const hash = hashFile(corpus_file, file_info.size, self.file_hash_seed);
+            const hash = try hashFile(self.allocator, corpus_file, file_info.size, self.file_hash_seed);
             var hash_bytes: [8]u8 = undefined;
             std.mem.writeInt(u64, &hash_bytes, hash, .little);
             try file.writeAll(&hash_bytes);
@@ -2299,7 +2313,7 @@ pub const VocabLearner = struct {
                 return false;
             };
 
-            current_hashes[i] = hashFile(corpus_file, file_info.size, header.hash_seed);
+            current_hashes[i] = try hashFile(self.allocator, corpus_file, file_info.size, header.hash_seed);
         }
 
         // Sort both hash arrays for comparison

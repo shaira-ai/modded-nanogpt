@@ -1,106 +1,294 @@
 const std = @import("std");
+const print = std.debug.print;
 const Allocator = std.mem.Allocator;
-const fs = std.fs;
-const io = std.io;
-const mem = std.mem;
+
+// Corpus metadata from tokenset files
+const CorpusMetadata = struct {
+    file_count: u32,
+    timestamp: u64,
+    hash_seed: u64,
+    file_hashes: []u64,
+
+    pub fn deinit(self: *CorpusMetadata, allocator: Allocator) void {
+        allocator.free(self.file_hashes);
+    }
+};
+
+// Token data extracted from tokenset files
+const TokenData = struct {
+    bytes: []u8,
+    count: u64,
+    length: usize,
+
+    pub fn deinit(self: *TokenData, allocator: Allocator) void {
+        allocator.free(self.bytes);
+    }
+};
+
+/// Read tokenset file in new format (version 3)
+fn readTokensetFile(allocator: Allocator, file_path: []const u8) !struct {
+    tokens: []TokenData,
+    metadata: CorpusMetadata,
+} {
+    const file = try std.fs.cwd().openFile(file_path, .{});
+    defer file.close();
+
+    var reader = file.reader();
+
+    // Read format version
+    const format_version = try reader.readInt(u32, .little);
+    if (format_version != 3) {
+        print("Error: Expected format version 3, got {d}\n", .{format_version});
+        return error.UnsupportedFormat;
+    }
+
+    print("Format version: {d}\n", .{format_version});
+
+    // Read header (token counts by length)
+    var header: [256]u32 = undefined;
+    for (&header) |*count| {
+        count.* = try reader.readInt(u32, .little);
+    }
+
+    // Read corpus metadata
+    var metadata: CorpusMetadata = undefined;
+    metadata.file_count = try reader.readInt(u32, .little);
+    metadata.timestamp = try reader.readInt(u64, .little);
+    metadata.hash_seed = try reader.readInt(u64, .little);
+
+    // Read file hashes
+    metadata.file_hashes = try allocator.alloc(u64, metadata.file_count);
+    for (metadata.file_hashes) |*hash| {
+        hash.* = try reader.readInt(u64, .little);
+    }
+
+    // Count total tokens
+    var total_tokens: usize = 0;
+    for (header) |count| {
+        total_tokens += count;
+    }
+
+    print("Total tokens: {d}\n", .{total_tokens});
+
+    // Read token data
+    var tokens = try allocator.alloc(TokenData, total_tokens);
+    var token_idx: usize = 0;
+
+    for (header, 0..) |count, length| {
+        if (count == 0) continue;
+
+        for (0..count) |_| {
+            // Read token bytes
+            const token_bytes = try allocator.alloc(u8, length);
+            const bytes_read = try reader.readAll(token_bytes);
+            if (bytes_read != length) {
+                return error.IncompleteTokenData;
+            }
+
+            // Read occurrence count
+            const occurrence_count = try reader.readInt(u64, .little);
+
+            tokens[token_idx] = TokenData{
+                .bytes = token_bytes,
+                .count = occurrence_count,
+                .length = length,
+            };
+            token_idx += 1;
+        }
+    }
+
+    return .{ .tokens = tokens, .metadata = metadata };
+}
+
+/// Print token statistics
+fn printTokenStats(tokens: []const TokenData) void {
+    print("\n=== TOKEN STATISTICS ===\n");
+
+    // Count by length
+    var length_counts: [16]u32 = [_]u32{0} ** 16;
+    var total_occurrences: u64 = 0;
+
+    for (tokens) |token| {
+        if (token.length < 16) {
+            length_counts[token.length] += 1;
+        }
+        total_occurrences += token.count;
+    }
+
+    for (length_counts, 0..) |count, length| {
+        if (count > 0) {
+            print("Length {d}: {d} tokens\n", .{ length, count });
+        }
+    }
+
+    print("Total occurrences: {d}\n", .{total_occurrences});
+}
+
+/// Print top tokens by occurrence count
+fn printTopTokens(tokens: []const TokenData, allocator: Allocator, limit: usize) !void {
+    print("\n=== TOP {d} TOKENS BY OCCURRENCE ===\n", .{limit});
+
+    // Create array of indices for sorting
+    var indices = try allocator.alloc(usize, tokens.len);
+    defer allocator.free(indices);
+
+    for (indices, 0..) |*idx, i| {
+        idx.* = i;
+    }
+
+    // Sort indices by token occurrence count (descending)
+    std.sort.pdq(usize, indices, tokens, struct {
+        fn compare(token_list: []const TokenData, a: usize, b: usize) bool {
+            return token_list[a].count > token_list[b].count;
+        }
+    }.compare);
+
+    for (indices[0..@min(limit, indices.len)]) |idx| {
+        const token = tokens[idx];
+        print("Token {d}: count={d}, length={d}, bytes=", .{ idx, token.count, token.length });
+
+        // Print bytes as hex and try to print as string if printable
+        print("[");
+        for (token.bytes, 0..) |byte, i| {
+            if (i > 0) print(" ");
+            print("{:02x}", .{byte});
+        }
+        print("]");
+
+        // Try to print as string if all bytes are printable
+        var all_printable = true;
+        for (token.bytes) |byte| {
+            if (byte < 32 or byte > 126) {
+                all_printable = false;
+                break;
+            }
+        }
+
+        if (all_printable) {
+            print(" \"{}\"", .{std.zig.fmtEscapes(token.bytes)});
+        }
+
+        print("\n");
+    }
+}
+
+/// Print usage information
+fn printUsage(program_name: []const u8) void {
+    print("Usage: {s} [options] <tokenset_file>\n", .{program_name});
+    print("\n", .{});
+    print("Options:\n", .{});
+    print("  --metadata              Show only metadata (default)\n", .{});
+    print("  --stats                 Show token statistics\n", .{});
+    print("  --top <N>               Show top N tokens by occurrence\n", .{});
+    print("  --all                   Show metadata, stats, and top 20 tokens\n", .{});
+    print("  --help                  Show this help message\n", .{});
+    print("\n", .{});
+    print("Examples:\n", .{});
+    print("  {s} tokenset_4.bin --metadata\n", .{program_name});
+    print("  {s} tokenset_4.bin --stats\n", .{program_name});
+    print("  {s} tokenset_4.bin --top 10\n", .{program_name});
+    print("  {s} tokenset_4.bin --all\n", .{program_name});
+}
 
 pub fn main() !void {
-    // Initialize general purpose allocator
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    // Parse command line arguments
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    if (args.len != 2) {
-        std.debug.print("Usage: {s} <binary_token_file>\n", .{args[0]});
+    if (args.len < 2) {
+        printUsage(args[0]);
         return;
     }
 
-    const input_path = args[1];
-    try displayTokenSet(allocator, input_path);
-}
+    // Parse arguments
+    var tokenset_file: ?[]const u8 = null;
+    var show_metadata = true;
+    var show_stats = false;
+    var show_top: ?usize = null;
 
-fn displayTokenSet(allocator: Allocator, file_path: []const u8) !void {
-    const file = try std.fs.cwd().openFile(file_path, .{});
-    defer file.close();
+    var i: usize = 1;
+    while (i < args.len) {
+        const arg = args[i];
 
-    const file_size = try file.getEndPos();
-    std.debug.print("Reading token set file: {s} ({d} bytes)\n", .{ file_path, file_size });
-
-    // Ensure file is large enough for header
-    const header_size = 256 * @sizeOf(u32);
-    if (file_size < header_size) {
-        return error.FileTooSmall;
-    }
-
-    // Read and parse header (256 u32s)
-    var header: [256]u32 = undefined;
-    const bytes_read = try file.readAll(std.mem.asBytes(&header));
-    if (bytes_read != header_size) {
-        return error.IncompleteHeader;
-    }
-
-    // Count total strings and validate header
-    var total_strings: usize = 0;
-    var total_bytes_in_strings: usize = 0;
-    for (header, 0..) |count, i| {
-        total_strings += count;
-        total_bytes_in_strings += count * (i + 1); // Each string has length (i+1)
-    }
-
-    std.debug.print("Header parsed: {d} total strings, {d} bytes of string data\n", .{ total_strings, total_bytes_in_strings });
-
-    // Validate file size
-    if (file_size != header_size + total_bytes_in_strings) {
-        std.debug.print("Warning: File size mismatch. Expected {d} bytes, got {d} bytes\n", .{ header_size + total_bytes_in_strings, file_size });
-    }
-
-    // Display strings from each length
-    var num_strings_displayed: usize = 0;
-    const max_strings_per_length: usize = 10; // Display at most this many strings per length
-    const truncate_at: usize = 40; // Truncate display of strings longer than this
-
-    for (header, 0..) |count, i| {
-        const length = i + 1; // Adjust from 0-based index
-
-        if (count == 0) continue;
-
-        std.debug.print("\n=== Length {d}: {d} strings ===\n", .{ length, count });
-
-        // Allocate buffer for reading strings of this length
-        const buffer_size = length * @min(count, max_strings_per_length);
-        const buffer = try allocator.alloc(u8, buffer_size);
-        defer allocator.free(buffer);
-
-        // Display a subset of strings
-        const strings_to_display = @min(count, max_strings_per_length);
-        if (strings_to_display < count) {
-            std.debug.print("(Showing first {d} of {d} strings)\n", .{ strings_to_display, count });
-        }
-
-        _ = try file.reader().readAll(buffer[0 .. strings_to_display * length]);
-
-        for (0..strings_to_display) |j| {
-            const str = buffer[j * length .. (j + 1) * length];
-
-            // Display the string (possibly truncated)
-            if (length > truncate_at) {
-                std.debug.print("{d}: {s}... (truncated, {d} bytes total)\n", .{ j + 1, str[0..truncate_at], length });
-            } else {
-                std.debug.print("{d}: {s}\n", .{ j + 1, str });
+        if (std.mem.eql(u8, arg, "--help")) {
+            printUsage(args[0]);
+            return;
+        } else if (std.mem.eql(u8, arg, "--metadata")) {
+            show_metadata = true;
+        } else if (std.mem.eql(u8, arg, "--stats")) {
+            show_stats = true;
+        } else if (std.mem.eql(u8, arg, "--top")) {
+            if (i + 1 >= args.len) {
+                print("Error: --top requires a number\n", .{});
+                return;
             }
+            i += 1;
+            show_top = std.fmt.parseInt(usize, args[i], 10) catch |err| {
+                print("Error: Invalid number for --top: {s} ({any})\n", .{ args[i], err });
+                return;
+            };
+        } else if (std.mem.eql(u8, arg, "--all")) {
+            show_metadata = true;
+            show_stats = true;
+            show_top = 20;
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            print("Unknown option: {s}\n", .{arg});
+            return;
+        } else {
+            // It's the tokenset file
+            if (tokenset_file != null) {
+                print("Error: Multiple tokenset files specified\n", .{});
+                return;
+            }
+            tokenset_file = arg;
         }
 
-        // Skip the remaining strings of this length
-        if (strings_to_display < count) {
-            try file.seekBy(@intCast((count - strings_to_display) * length));
-        }
-
-        num_strings_displayed += strings_to_display;
+        i += 1;
     }
 
-    std.debug.print("\nDisplayed {d} of {d} total strings\n", .{ num_strings_displayed, total_strings });
+    if (tokenset_file == null) {
+        print("Error: No tokenset file specified\n", .{});
+        printUsage(args[0]);
+        return;
+    }
+
+    // Read the tokenset file
+    print("Reading tokenset file: {s}\n", .{tokenset_file.?});
+    var result = readTokensetFile(allocator, tokenset_file.?) catch |err| {
+        print("Error reading tokenset file: {any}\n", .{err});
+        return;
+    };
+    defer {
+        for (result.tokens) |*token| {
+            token.deinit(allocator);
+        }
+        allocator.free(result.tokens);
+        result.metadata.deinit(allocator);
+    }
+
+    // Show metadata
+    if (show_metadata) {
+        print("\n=== METADATA ===\n");
+        print("File count: {d}\n", .{result.metadata.file_count});
+        print("Timestamp: {d}\n", .{result.metadata.timestamp});
+        print("Hash seed: 0x{x}\n", .{result.metadata.hash_seed});
+
+        print("File hashes:\n");
+        for (result.metadata.file_hashes, 0..) |hash, idx| {
+            print("  File {d}: 0x{x}\n", .{ idx, hash });
+        }
+    }
+
+    // Show stats
+    if (show_stats) {
+        printTokenStats(result.tokens);
+    }
+
+    // Show top tokens
+    if (show_top) |limit| {
+        try printTopTokens(result.tokens, allocator, limit);
+    }
 }

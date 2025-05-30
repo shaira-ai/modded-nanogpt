@@ -112,6 +112,23 @@ const input_files_ = [_][]const u8{
     "fineweb_train_000103.bin",
 };
 
+// Function to build full paths with data directory
+fn buildDataPaths(allocator: Allocator, data_dir: []const u8, n_files: usize) ![][]u8 {
+    const paths = try allocator.alloc([]u8, n_files);
+    for (0..n_files) |i| {
+        paths[i] = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, input_files_[i] });
+    }
+    return paths;
+}
+
+// Function to free the allocated paths
+fn freeDataPaths(allocator: Allocator, paths: [][]u8) void {
+    for (paths) |path| {
+        allocator.free(path);
+    }
+    allocator.free(paths);
+}
+
 pub fn main() !void {
     // Use this instead if you want fast compile times
     //try MainHaver(10).main(input_files_[0..2], 6);
@@ -119,7 +136,7 @@ pub fn main() !void {
 }
 
 pub fn anyMain() !void {
-    var mains: [257]*const fn ([]const []const u8, usize) anyerror!void = undefined;
+    var mains: [257]*const fn (usize, usize, []const u8) anyerror!void = undefined;
     inline for (2..257) |i| {
         mains[i] = MainHaver(i).main;
     }
@@ -128,29 +145,46 @@ pub fn anyMain() !void {
     _ = args_iterator.skip();
     const first_arg = args_iterator.next() orelse {
         std.debug.print("Error: Expected at least three arguments\n", .{});
+        std.debug.print("Usage: program <which> <n_threads> <n_files> [data_dir]\n", .{});
         std.process.exit(1);
     };
     const which = try std.fmt.parseUnsigned(usize, first_arg, 10);
     const second_arg = args_iterator.next() orelse {
         std.debug.print("Error: Expected at least three arguments\n", .{});
+        std.debug.print("Usage: program <which> <n_threads> <n_files> [data_dir]\n", .{});
         std.process.exit(1);
     };
     const n_threads = try std.fmt.parseUnsigned(usize, second_arg, 10);
     const third_arg = args_iterator.next() orelse {
         std.debug.print("Error: Expected at least three arguments\n", .{});
+        std.debug.print("Usage: program <which> <n_threads> <n_files> [data_dir]\n", .{});
         std.process.exit(1);
     };
     const n_files = try std.fmt.parseUnsigned(usize, third_arg, 10);
+
+    const data_dir = args_iterator.next() orelse "data";
+
     if (which >= 2 and which < 257) {
-        try mains[which](input_files_[0..n_files], n_threads);
+        try mains[which](n_files, n_threads, data_dir);
     }
 }
 
 pub fn MainHaver(MY_LEN: comptime_int) type {
     return struct {
-        pub fn main(input_files: []const []const u8, num_threads: usize) anyerror!void {
+        pub fn main(n_files: usize, num_threads: usize, data_dir: []const u8) anyerror!void {
             const allocator = std.heap.c_allocator;
             var timer = try std.time.Timer.start();
+
+            // Build the input file paths
+            const input_paths = try buildDataPaths(allocator, data_dir, n_files);
+            defer freeDataPaths(allocator, input_paths);
+
+            // Convert to []const []const u8 for the function calls
+            const input_files = try allocator.alloc([]const u8, input_paths.len);
+            defer allocator.free(input_files);
+            for (input_paths, 0..) |path, i| {
+                input_files[i] = path;
+            }
 
             // Configure parameters
             const top_k = 1000000; // Track top 10000 strings per length
@@ -164,18 +198,23 @@ pub fn MainHaver(MY_LEN: comptime_int) type {
             // Flag to skip disk I/O and keep data in memory between passes
             const skip_disk_io = true;
 
-            const vocab_file = "vocab.json";
-            const saved_data_path = "fineweb_first_pass_parallel.bin";
+            // Build paths for vocab file and saved data in the data directory
+            const vocab_file = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, "vocab.json" });
+            defer allocator.free(vocab_file);
+
+            const saved_data_path = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, "fineweb_first_pass_parallel.bin" });
+            defer allocator.free(saved_data_path);
 
             std.debug.print("=== Parallel String Frequency Analysis ===\n", .{});
             std.debug.print("Parameters:\n", .{});
+            std.debug.print("  - Data directory: {s}\n", .{data_dir});
             std.debug.print("  - CMS width: {d} counters\n", .{cms_width});
             std.debug.print("  - CMS depth: {d} hash functions\n", .{cms_depth});
             std.debug.print("  - length: {d}\n", .{MY_LEN});
             std.debug.print("  - Top K: {d} strings per length\n", .{top_k});
             std.debug.print("  - Worker threads: {d} (of {d} cores)\n", .{ num_threads, available_cores });
             std.debug.print("  - Skip disk I/O: {}\n", .{skip_disk_io});
-            std.debug.print("  - Using {d} input files\n", .{input_files.len});
+            std.debug.print("  - Using {d} input files\n", .{n_files});
 
             // Print file list
             for (input_files, 0..) |file, i| {
@@ -267,7 +306,16 @@ pub fn MainHaver(MY_LEN: comptime_int) type {
             }
 
             if (MY_LEN < 4) {
+                std.debug.print("\n=== ADDING SMALL STRINGS TO HEAP ===\n", .{});
                 try analyzer.addSmallStringsToHeap();
+                std.debug.print("Small strings added to heap\n", .{});
+
+                std.debug.print("\n=== SECOND PASS: Non-overlapping counting ===\n", .{});
+                _ = timer.lap();
+                try analyzer.runSecondPassSmallStrings();
+                const second_pass_time = timer.lap();
+                const second_pass_ms = @as(f64, @floatFromInt(second_pass_time)) / time.ns_per_ms;
+                std.debug.print("Non-overlapping counting completed in {d:.2}ms\n", .{second_pass_ms});
             }
 
             // Get and display results
@@ -277,7 +325,10 @@ pub fn MainHaver(MY_LEN: comptime_int) type {
             // Save tokens to binary format
             std.debug.print("\n=== SAVING TOKEN SET TO BINARY FORMAT ===\n", .{});
             var buf: [1024]u8 = undefined;
-            const token_set_path = try std.fmt.bufPrint(&buf, "tokenset_{d}.bin", .{MY_LEN});
+            const token_filename = try std.fmt.bufPrint(&buf, "tokenset_{d}.bin", .{MY_LEN});
+            const token_set_path = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, token_filename });
+            defer allocator.free(token_set_path);
+
             _ = timer.lap();
             try analyzer.saveTokensToBinaryFormat(token_set_path);
             const save_token_time = timer.lap();

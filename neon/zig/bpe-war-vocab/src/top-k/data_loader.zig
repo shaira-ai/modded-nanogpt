@@ -7,6 +7,27 @@ const Allocator = std.mem.Allocator;
 
 pub const SEPARATOR_TOKEN_ID: usize = 50256;
 
+pub const CorpusMetadata = struct {
+    file_count: u32,
+    timestamp: u64,
+    hash_seed: u64,
+    file_hashes: []u64,
+
+    pub fn init(allocator: Allocator, file_count: u32) !CorpusMetadata {
+        const file_hashes = try allocator.alloc(u64, file_count);
+        return CorpusMetadata{
+            .file_count = file_count,
+            .timestamp = @intCast(std.time.milliTimestamp()),
+            .hash_seed = 0x1971c968ea7,
+            .file_hashes = file_hashes,
+        };
+    }
+
+    pub fn deinit(self: *CorpusMetadata, allocator: Allocator) void {
+        allocator.free(self.file_hashes);
+    }
+};
+
 pub fn reportFunctionTime(function_name: []const u8, elapsed_ns: i128) void {
     const elapsed_u64 = if (elapsed_ns > 0)
         @as(u64, @intCast(@min(elapsed_ns, std.math.maxInt(u64))))
@@ -15,6 +36,40 @@ pub fn reportFunctionTime(function_name: []const u8, elapsed_ns: i128) void {
 
     const elapsed_ms = @as(f64, @floatFromInt(elapsed_u64)) / time.ns_per_ms;
     std.debug.print("[TIMING] {s}: {d:.2}ms\n", .{ function_name, elapsed_ms });
+}
+
+pub fn getAbsolutePath(allocator: std.mem.Allocator, file_path: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(file_path)) {
+        return try allocator.dupe(u8, file_path);
+    }
+
+    // Get current working directory
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+
+    return try std.fs.path.join(allocator, &[_][]const u8{ cwd, file_path });
+}
+
+fn computeFileHash(allocator: std.mem.Allocator, file_path: []const u8, file_size: u64, seed: u64) !u64 {
+    const abs_path = try getAbsolutePath(allocator, file_path);
+    defer allocator.free(abs_path);
+
+    var hasher = std.crypto.hash.Sha1.init(.{});
+
+    var seed_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &seed_bytes, seed, .little);
+    hasher.update(&seed_bytes);
+
+    hasher.update(abs_path);
+
+    var size_bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &size_bytes, file_size, .little);
+    hasher.update(&size_bytes);
+
+    var hash_result: [20]u8 = undefined;
+    hasher.final(&hash_result);
+
+    return std.mem.readInt(u64, hash_result[0..8], .little);
 }
 
 pub const FinewebDataLoader = struct {
@@ -44,6 +99,9 @@ pub const FinewebDataLoader = struct {
     // Vocabulary information for rewinding
     vocab_path: ?[]const u8,
 
+    // Corpus metadata tracking
+    corpus_metadata: CorpusMetadata,
+
     // Main initializer - process multiple files (or a single file)
     pub fn init(allocator: Allocator, file_paths: []const []const u8) !*FinewebDataLoader {
         const start_time = time.nanoTimestamp();
@@ -69,6 +127,30 @@ pub const FinewebDataLoader = struct {
             ptr.* = null;
         }
 
+        // Initialize corpus metadata
+        var corpus_metadata = try CorpusMetadata.init(allocator, @intCast(file_paths.len));
+
+        // Compute file hashes for all files
+        if (file_paths.len > 0) {
+            std.debug.print("[DataLoader] Computing file hashes (path+size) for {d} files...\n", .{file_paths.len});
+            for (file_paths, 0..) |file_path, file_idx| {
+                const file = try std.fs.cwd().openFile(file_path, .{});
+                const file_size = try file.getEndPos();
+                file.close();
+
+                const file_hash = computeFileHash(allocator, file_path, file_size, corpus_metadata.hash_seed) catch |err| {
+                    std.debug.print("[ERROR] Failed to compute hash for {s}: {}\n", .{ file_path, err });
+                    return err;
+                };
+                corpus_metadata.file_hashes[file_idx] = file_hash;
+
+                if (file_idx < 3 or file_idx % 10 == 0) {
+                    std.debug.print("[DataLoader] File {d}: {s} (size: {d}) -> hash: 0x{x}\n", .{ file_idx, file_path, file_size, file_hash });
+                }
+            }
+            std.debug.print("[DataLoader] File hash computation completed\n", .{});
+        }
+
         // Initialize with no open file yet
         self.* = .{
             .allocator = allocator,
@@ -83,6 +165,7 @@ pub const FinewebDataLoader = struct {
             .reached_end = false,
             .header_skipped = false,
             .vocab_path = null,
+            .corpus_metadata = corpus_metadata,
         };
 
         // Open the first file
@@ -180,11 +263,18 @@ pub const FinewebDataLoader = struct {
             self.allocator.free(path);
         }
 
+        self.corpus_metadata.deinit(self.allocator);
+
         self.allocator.destroy(self);
 
         // Print timing information
         const elapsed = time.nanoTimestamp() - start_time;
         reportFunctionTime("deinit", elapsed);
+    }
+
+    /// Get corpus metadata for verification
+    pub fn getCorpusMetadata(self: *FinewebDataLoader) *const CorpusMetadata {
+        return &self.corpus_metadata;
     }
 
     pub const DEFAULT_VOCAB_PATH = "vocab.json";

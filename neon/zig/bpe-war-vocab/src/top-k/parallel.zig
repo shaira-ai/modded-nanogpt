@@ -8,7 +8,6 @@ const SFM = @import("string_frequency_manager.zig").StringFrequencyManager;
 const CMS_F = @import("count_min_sketch.zig").CountMinSketch;
 const coordinator_mod = @import("coordinator.zig");
 const spsc = @import("spsc.zig");
-const CandidateString = @import("string_frequency_manager.zig").CandidateString;
 
 /// Parallel string frequency analysis framework
 pub fn ParallelAnalyzer(
@@ -167,12 +166,27 @@ pub fn ParallelAnalyzer(
             if (MY_LEN < 4) {
                 const start_time = time.nanoTimestamp();
                 var new_manager = try SFMType.init(self.allocator);
-                // Sum counters from all workers
+
+                // Use a HashSet to track unique indices across all workers
+                var seen_length2_indices = std.AutoHashMap(u16, void).init(self.allocator);
+                defer seen_length2_indices.deinit();
+                var seen_length3_indices = std.AutoHashMap(u32, void).init(self.allocator);
+                defer seen_length3_indices.deinit();
+
+                // Sum counters from all workers AND collect used indices
                 for (self.coordinator.workers) |worker| {
                     // Add each worker's length2 counters
                     if (MY_LEN == 2) {
                         for (0..new_manager.length2_counters.len) |i| {
                             new_manager.length2_counters[i] += worker.sfm.length2_counters[i];
+                        }
+
+                        // Collect unique indices from this worker
+                        for (worker.sfm.length2_used_indices.items) |index| {
+                            if (!seen_length2_indices.contains(index)) {
+                                try seen_length2_indices.put(index, {});
+                                try new_manager.length2_used_indices.append(index);
+                            }
                         }
                     }
 
@@ -181,12 +195,30 @@ pub fn ParallelAnalyzer(
                         for (0..new_manager.length3_counters.len) |i| {
                             new_manager.length3_counters[i] += worker.sfm.length3_counters[i];
                         }
+
+                        // Collect unique indices from this worker
+                        for (worker.sfm.length3_used_indices.items) |index| {
+                            if (!seen_length3_indices.contains(index)) {
+                                try seen_length3_indices.put(index, {});
+                                try new_manager.length3_used_indices.append(index);
+                            }
+                        }
                     }
 
                     if (self.debug) {
                         std.debug.print("[ParallelAnalyzer] Merged counters from worker {d}\n", .{worker.id});
                     }
                 }
+
+                if (self.debug) {
+                    if (MY_LEN == 2) {
+                        std.debug.print("[ParallelAnalyzer] Merged {d} unique length-2 indices\n", .{new_manager.length2_used_indices.items.len});
+                    }
+                    if (MY_LEN == 3) {
+                        std.debug.print("[ParallelAnalyzer] Merged {d} unique length-3 indices\n", .{new_manager.length3_used_indices.items.len});
+                    }
+                }
+
                 if (self.manager) |old_manager| {
                     old_manager.deinit();
                 }
@@ -261,9 +293,30 @@ pub fn ParallelAnalyzer(
             }
         }
 
+        /// Set corpus metadata in the final result SFM
+        fn setCorpusMetadata(self: *Self) void {
+            const metadata = self.data_loader.getCorpusMetadata();
+
+            if (self.manager) |manager| {
+                // For lengths < 4, set metadata on the merged manager
+                manager.setCorpusMetadata(metadata);
+                if (self.debug) {
+                    std.debug.print("[ParallelAnalyzer] Set corpus metadata on manager: {d} files processed\n", .{metadata.file_count});
+                }
+            } else {
+                // For lengths >= 4, set metadata on worker 0 after merge
+                self.coordinator.workers[0].sfm.setCorpusMetadata(metadata);
+                if (self.debug) {
+                    std.debug.print("[ParallelAnalyzer] Set corpus metadata on worker 0: {d} files processed\n", .{metadata.file_count});
+                }
+            }
+        }
         /// Run second pass using parallel processing
         pub fn runSecondPass(self: *Self) !void {
             if (MY_LEN < 4) {
+                if (self.debug) {
+                    std.debug.print("[ParallelAnalyzer] Early return: MY_LEN < 4\n", .{});
+                }
                 return;
             }
             const overall_start_time = time.nanoTimestamp();
@@ -305,9 +358,43 @@ pub fn ParallelAnalyzer(
                 }
             }
 
+            self.setCorpusMetadata();
+
             const total_time = time.nanoTimestamp() - overall_start_time;
             if (self.debug) {
                 std.debug.print("[ParallelAnalyzer] Second pass completed in {d:.2}ms\n", .{@as(f64, @floatFromInt(total_time)) / time.ns_per_ms});
+            }
+        }
+
+        pub fn runSecondPassSmallStrings(self: *Self) !void {
+            if (MY_LEN >= 4) return;
+
+            if (self.debug) {
+                std.debug.print("[ParallelAnalyzer] Running second pass for non-overlapping counts\n", .{});
+            }
+
+            try self.data_loader.rewind();
+
+            if (self.manager) |manager| {
+                manager.global_position = 0;
+            }
+
+            var documents_processed: usize = 0;
+            while (try self.data_loader.nextDocumentString()) |document| {
+                defer self.allocator.free(document);
+
+                if (self.manager) |manager| {
+                    try manager.processDocumentSecondPassSmallStrings(document);
+                }
+
+                documents_processed += 1;
+                if (self.debug and documents_processed % 10000 == 0) {
+                    std.debug.print("[ParallelAnalyzer] Processed {d} documents for non-overlapping counts\n", .{documents_processed});
+                }
+            }
+
+            if (self.debug) {
+                std.debug.print("[ParallelAnalyzer] Second pass completed: {d} documents processed\n", .{documents_processed});
             }
         }
 
@@ -338,6 +425,7 @@ pub fn ParallelAnalyzer(
             if (self.debug) {
                 std.debug.print("[ParallelAnalyzer] Saving token set to binary format: {s}\n", .{output_path});
             }
+            self.setCorpusMetadata();
 
             const manager = if (self.manager) |m| m else self.coordinator.workers[0].sfm;
 

@@ -1,126 +1,165 @@
 const std = @import("std");
-const fs = std.fs;
 const print = std.debug.print;
-const Allocator = std.mem.Allocator;
 
 const TokenInfo = struct {
-    bytes: []u8,
+    bytes: []const u8,
     count: u64,
     length: usize,
 };
 
-fn printableString(allocator: Allocator, bytes: []const u8) ![]u8 {
-    var result = std.ArrayList(u8).init(allocator);
-    defer result.deinit();
+const CorpusMetadata = struct {
+    file_count: u32,
+    timestamp: u64,
+    hash_seed: u64,
+    file_hashes: []u64,
 
-    for (bytes) |byte| {
-        if (byte >= 32 and byte <= 126) {
-            // Printable ASCII
-            try result.append(byte);
-        } else {
-            // Non-printable - show as hex
-            const hex = try std.fmt.allocPrint(allocator, "\\x{X:0>2}", .{byte});
-            defer allocator.free(hex);
-            try result.appendSlice(hex);
+    pub fn deinit(self: *CorpusMetadata, allocator: std.mem.Allocator) void {
+        allocator.free(self.file_hashes);
+    }
+
+    pub fn print_summary(self: *const CorpusMetadata) void {
+        print("=== Corpus Metadata ===\n", .{});
+        print("Files processed: {d}\n", .{self.file_count});
+        print("Timestamp: {d}\n", .{self.timestamp});
+        print("Hash seed: 0x{x}\n", .{self.hash_seed});
+
+        if (self.file_hashes.len > 0) {
+            print("File hashes:\n", .{});
+            const max_to_show = @min(10, self.file_hashes.len);
+            for (self.file_hashes[0..max_to_show], 0..) |hash, i| {
+                print("  File {d}: 0x{x}\n", .{ i, hash });
+            }
+            if (self.file_hashes.len > max_to_show) {
+                print("  ... and {d} more files\n", .{self.file_hashes.len - max_to_show});
+            }
         }
+        print("\n", .{});
     }
+};
 
-    return result.toOwnedSlice();
-}
+const ReadOptions = struct {
+    show_stats: bool = false,
+    show_metadata: bool = false,
+    show_tokens: bool = true,
+    top_n: usize = 50,
+    min_count: u64 = 0,
+    filter_length: ?usize = null,
+};
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Parse command line arguments
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
-    if (args.len < 2) {
-        print("Usage: {s} <tokenset_file.bin> [options]\n", .{args[0]});
-        print("Options:\n", .{});
-        print("  --top N        Show only top N tokens by count (default: 50)\n", .{});
-        print("  --length L     Show only tokens of length L\n", .{});
-        print("  --min-count C  Show only tokens with count >= C\n", .{});
-        print("  --stats        Show statistics summary\n", .{});
-        return;
-    }
-
-    const filename = args[1];
-
-    // Parse options
-    var show_top: usize = 50;
-    var filter_length: ?usize = null;
-    var min_count: u64 = 0;
-    var show_stats = false;
-
-    var i: usize = 2;
-    while (i < args.len) {
-        if (std.mem.eql(u8, args[i], "--top") and i + 1 < args.len) {
-            show_top = try std.fmt.parseUnsigned(usize, args[i + 1], 10);
-            i += 2;
-        } else if (std.mem.eql(u8, args[i], "--length") and i + 1 < args.len) {
-            filter_length = try std.fmt.parseUnsigned(usize, args[i + 1], 10);
-            i += 2;
-        } else if (std.mem.eql(u8, args[i], "--min-count") and i + 1 < args.len) {
-            min_count = try std.fmt.parseUnsigned(u64, args[i + 1], 10);
-            i += 2;
-        } else if (std.mem.eql(u8, args[i], "--stats")) {
-            show_stats = true;
-            i += 1;
-        } else {
-            print("Unknown option: {s}\n", .{args[i]});
-            return;
-        }
-    }
-
-    // Open and read the file
-    const file = fs.cwd().openFile(filename, .{}) catch |err| {
-        print("Error opening file '{s}': {s}\n", .{ filename, @errorName(err) });
-        return;
-    };
+fn readTokensetFile(allocator: std.mem.Allocator, file_path: []const u8, options: ReadOptions) !void {
+    const file = try std.fs.cwd().openFile(file_path, .{});
     defer file.close();
 
-    var buffered_reader = std.io.bufferedReader(file.reader());
-    var reader = buffered_reader.reader();
+    var reader = file.reader();
 
-    print("Reading tokenset file: {s}\n", .{filename});
-    print("=" ** 50 ++ "\n", .{});
+    // Read format version (new files have version 3+)
+    const format_version = reader.readInt(u32, .little) catch |err| {
+        if (err == error.EndOfStream) {
+            print("Error: File appears to be empty or corrupted\n", .{});
+            return;
+        }
+        return err;
+    };
 
-    // Read header (256 u32 values for token counts by length)
+    var has_metadata = false;
+    var corpus_metadata: CorpusMetadata = undefined;
     var header: [256]u32 = undefined;
-    const header_bytes = try reader.readAll(std.mem.asBytes(&header));
-    if (header_bytes != 256 * @sizeOf(u32)) {
-        print("Error: Invalid header size. Expected {d} bytes, got {d}\n", .{ 256 * @sizeOf(u32), header_bytes });
-        return;
+
+    if (format_version >= 3) {
+        // New format with metadata
+        has_metadata = true;
+
+        // Read header
+        for (&header) |*count| {
+            count.* = try reader.readInt(u32, .little);
+        }
+
+        // Read corpus metadata
+        corpus_metadata.file_count = try reader.readInt(u32, .little);
+        corpus_metadata.timestamp = try reader.readInt(u64, .little);
+        corpus_metadata.hash_seed = try reader.readInt(u64, .little);
+
+        // Read file hashes
+        if (corpus_metadata.file_count > 0) {
+            corpus_metadata.file_hashes = try allocator.alloc(u64, corpus_metadata.file_count);
+            for (corpus_metadata.file_hashes) |*hash| {
+                hash.* = try reader.readInt(u64, .little);
+            }
+        } else {
+            corpus_metadata.file_hashes = try allocator.alloc(u64, 0);
+        }
+    } else {
+        // Old format - treat format_version as first header entry
+        has_metadata = false;
+        header[0] = format_version;
+
+        // Read rest of header
+        for (header[1..]) |*count| {
+            count.* = try reader.readInt(u32, .little);
+        }
     }
 
-    // Calculate total tokens and show length distribution
+    defer if (has_metadata) corpus_metadata.deinit(allocator);
+
+    // Count total tokens and calculate length distribution
     var total_tokens: usize = 0;
-    var length_stats = std.ArrayList(struct { length: usize, count: u32 }).init(allocator);
-    defer length_stats.deinit();
+    var length_distribution: [256]u32 = [_]u32{0} ** 256;
 
     for (header, 0..) |count, length| {
         if (count > 0) {
             total_tokens += count;
-            try length_stats.append(.{ .length = length, .count = count });
+            length_distribution[length] = count;
         }
     }
 
+    print("Reading tokenset file: {s}\n", .{file_path});
+    if (has_metadata) {
+        print("Format version: {d} (with corpus metadata)\n", .{format_version});
+    } else {
+        print("Format version: legacy (no metadata)\n", .{});
+    }
+    print("==================================================\n", .{});
+
+    // Show corpus metadata if available and requested
+    if (has_metadata and (options.show_metadata or options.show_stats)) {
+        corpus_metadata.print_summary();
+    }
+
     print("Total tokens: {d}\n", .{total_tokens});
-    print("Length distribution:\n", .{});
-    for (length_stats.items) |stat| {
-        print("  Length {d}: {d} tokens\n", .{ stat.length, stat.count });
+
+    if (options.show_stats) {
+        print("Length distribution:\n", .{});
+        for (length_distribution, 0..) |count, length| {
+            if (count > 0) {
+                print("  Length {d}: {d} tokens\n", .{ length, count });
+            }
+        }
+        print("\n", .{});
+        return; // Just show stats, don't read tokens
+    }
+
+    // Filter by length if specified
+    if (options.filter_length) |target_length| {
+        if (length_distribution[target_length] == 0) {
+            print("No tokens found with length {d}\n", .{target_length});
+            return;
+        }
+        print("Filtering to show only length {d} tokens ({d} total)\n", .{ target_length, length_distribution[target_length] });
+    } else {
+        print("Length distribution:\n", .{});
+        for (length_distribution, 0..) |count, length| {
+            if (count > 0) {
+                print("  Length {d}: {d} tokens\n", .{ length, count });
+            }
+        }
     }
     print("\n", .{});
 
-    if (show_stats) {
-        print("Statistics summary complete.\n", .{});
+    if (!options.show_tokens) {
         return;
     }
 
-    // Read tokens with their counts
+    // Read and collect tokens
     var all_tokens = std.ArrayList(TokenInfo).init(allocator);
     defer {
         for (all_tokens.items) |token| {
@@ -129,100 +168,194 @@ pub fn main() !void {
         all_tokens.deinit();
     }
 
-    // Read interleaved data organized by length groups
     for (0..256) |length| {
         const count = header[length];
-        if (count == 0 or length == 0) continue; // Skip length-0 tokens
+        if (count == 0) continue;
 
-        print("Reading {d} tokens of length {d}...\n", .{ count, length });
+        // Skip if filtering by length
+        if (options.filter_length) |target_length| {
+            if (length != target_length) {
+                // Skip tokens of this length but still need to read past them
+                for (0..count) |_| {
+                    var buffer: [256]u8 = undefined;
+                    const bytes_read = try reader.readAll(buffer[0..length]);
+                    if (bytes_read < length) {
+                        print("Error: Expected {d} bytes for token, got {d}\n", .{ length, bytes_read });
+                        return;
+                    }
+                    _ = try reader.readInt(u64, .little); // Skip count
+                }
+                continue;
+            }
+        }
 
-        for (0..count) |token_idx| {
+        for (0..count) |_| {
             // Read token bytes
             const token_bytes = try allocator.alloc(u8, length);
             const bytes_read = try reader.readAll(token_bytes);
-            if (bytes_read != length) {
-                print("Error: Expected {d} bytes for token {d}, got {d}\n", .{ length, token_idx, bytes_read });
+            if (bytes_read < length) {
+                print("Error: Expected {d} bytes for token, got {d}\n", .{ length, bytes_read });
                 allocator.free(token_bytes);
                 return;
             }
 
-            // Read occurrence count (8 bytes, u64)
-            var count_bytes: [8]u8 = undefined;
-            const count_bytes_read = try reader.readAll(&count_bytes);
-            if (count_bytes_read != 8) {
-                print("Error: Expected 8 bytes for count of token {d}, got {d}\n", .{ token_idx, count_bytes_read });
-                print("Token bytes: {any}\n", .{token_bytes[0..@min(token_bytes.len, 10)]});
+            // Read occurrence count
+            const occurrence_count = try reader.readInt(u64, .little);
 
-                // Show remaining file size
-                const current_pos = try file.getPos();
-                const file_size = try file.getEndPos();
-                print("Current file position: {d}, file size: {d}, remaining: {d}\n", .{ current_pos - count_bytes_read, file_size, file_size - (current_pos - count_bytes_read) });
-
+            // Apply count filter
+            if (occurrence_count >= options.min_count) {
+                try all_tokens.append(TokenInfo{
+                    .bytes = token_bytes,
+                    .count = occurrence_count,
+                    .length = length,
+                });
+            } else {
                 allocator.free(token_bytes);
-                return;
             }
-            const occurrence_count = std.mem.readInt(u64, &count_bytes, .little);
-
-            // Apply filters
-            if (filter_length != null and length != filter_length.?) {
-                allocator.free(token_bytes);
-                continue;
-            }
-            if (occurrence_count < min_count) {
-                allocator.free(token_bytes);
-                continue;
-            }
-
-            try all_tokens.append(TokenInfo{
-                .bytes = token_bytes,
-                .count = occurrence_count,
-                .length = length,
-            });
         }
     }
 
-    // Sort by occurrence count (descending)
-    const SortContext = struct {
-        fn lessThan(context: void, a: TokenInfo, b: TokenInfo) bool {
-            _ = context;
-            return a.count > b.count; // Descending order
-        }
-    };
-    std.sort.pdq(TokenInfo, all_tokens.items, {}, SortContext.lessThan);
+    // Sort tokens by count (descending)
+    std.sort.heap(TokenInfo, all_tokens.items, {}, tokenCountCompare);
 
     // Display results
-    if (filter_length) |len| {
-        print("Showing tokens of length {d}:\n", .{len});
+    const tokens_to_show = @min(options.top_n, all_tokens.items.len);
+
+    if (options.filter_length) |target_length| {
+        print("Top {d} tokens of length {d} by occurrence count:\n", .{ tokens_to_show, target_length });
     } else {
-        print("Showing top {d} tokens by occurrence count:\n", .{@min(show_top, all_tokens.items.len)});
-    }
-    print("{s:>6} | {s:>12} | {s:>6} | {s}\n", .{ "Rank", "Count", "Length", "Token" });
-    print("-" ** 70 ++ "\n", .{});
-
-    const display_count = @min(show_top, all_tokens.items.len);
-    for (all_tokens.items[0..display_count], 1..) |token, rank| {
-        const printable = try printableString(allocator, token.bytes);
-        defer allocator.free(printable);
-
-        print("{d:>6} | {d:>12} | {d:>6} | '{s}'\n", .{ rank, token.count, token.length, printable });
+        print("Top {d} tokens by occurrence count:\n", .{tokens_to_show});
     }
 
-    if (all_tokens.items.len > display_count) {
-        print("... and {d} more tokens\n", .{all_tokens.items.len - display_count});
+    if (options.min_count > 0) {
+        print("(showing only tokens with count >= {d})\n", .{options.min_count});
     }
 
-    print("\nSummary:\n", .{});
-    print("  Total tokens matching filters: {d}\n", .{all_tokens.items.len});
+    print("  Rank |        Count | Length | Token\n", .{});
+    print("----------------------------------------------------------------------\n", .{});
+
+    for (all_tokens.items[0..tokens_to_show], 0..) |token, i| {
+        print("  {d:>4} | {d:>11} | {d:>6} | ", .{ i + 1, token.count, token.length });
+        printToken(token.bytes);
+        print("\n", .{});
+    }
+
+    if (all_tokens.items.len > tokens_to_show) {
+        print("... and {d} more tokens\n", .{all_tokens.items.len - tokens_to_show});
+    }
+
+    // Summary statistics
     if (all_tokens.items.len > 0) {
-        print("  Highest count: {d}\n", .{all_tokens.items[0].count});
-        print("  Lowest count: {d}\n", .{all_tokens.items[all_tokens.items.len - 1].count});
-
-        // Calculate total occurrences
+        const highest_count = all_tokens.items[0].count;
+        const lowest_count = all_tokens.items[all_tokens.items.len - 1].count;
         var total_occurrences: u64 = 0;
         for (all_tokens.items) |token| {
             total_occurrences += token.count;
         }
+        const avg_occurrences = @as(f64, @floatFromInt(total_occurrences)) / @as(f64, @floatFromInt(all_tokens.items.len));
+
+        print("\nSummary:\n", .{});
+        print("  Total tokens matching filters: {d}\n", .{all_tokens.items.len});
+        print("  Highest count: {d}\n", .{highest_count});
+        print("  Lowest count: {d}\n", .{lowest_count});
         print("  Total occurrences: {d}\n", .{total_occurrences});
-        print("  Average occurrences per token: {d:.2}\n", .{@as(f64, @floatFromInt(total_occurrences)) / @as(f64, @floatFromInt(all_tokens.items.len))});
+        print("  Average occurrences per token: {d:.2}\n", .{avg_occurrences});
     }
+}
+
+fn tokenCountCompare(context: void, a: TokenInfo, b: TokenInfo) bool {
+    _ = context;
+    return a.count > b.count;
+}
+
+fn printToken(bytes: []const u8) void {
+    print("'", .{});
+    for (bytes) |byte| {
+        if (std.ascii.isPrint(byte) and byte != '\'') {
+            print("{c}", .{byte});
+        } else {
+            print("\\x{X:0>2}", .{byte});
+        }
+    }
+    print("'", .{});
+}
+
+fn printUsage() void {
+    print("Usage: tokenset_reader <tokenset_file> [options]\n", .{});
+    print("\n", .{});
+    print("Options:\n", .{});
+    print("  --stats              Show file statistics only\n", .{});
+    print("  --metadata           Show corpus metadata only\n", .{});
+    print("  --top <N>            Show top N tokens (default: 50)\n", .{});
+    print("  --length <L>         Show only tokens of length L\n", .{});
+    print("  --min-count <C>      Show only tokens with count >= C\n", .{});
+    print("\n", .{});
+    print("Examples:\n", .{});
+    print("  tokenset_reader tokenset_4.bin\n", .{});
+    print("  tokenset_reader tokenset_4.bin --stats\n", .{});
+    print("  tokenset_reader tokenset_4.bin --metadata\n", .{});
+    print("  tokenset_reader tokenset_4.bin --top 20 --length 4\n", .{});
+    print("  tokenset_reader tokenset_4.bin --min-count 1000\n", .{});
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    if (args.len < 2) {
+        printUsage();
+        return;
+    }
+
+    const file_path = args[1];
+    var options = ReadOptions{};
+
+    // Parse command line options
+    var i: usize = 2;
+    while (i < args.len) {
+        const arg = args[i];
+
+        if (std.mem.eql(u8, arg, "--stats")) {
+            options.show_stats = true;
+            options.show_tokens = false;
+        } else if (std.mem.eql(u8, arg, "--metadata")) {
+            options.show_metadata = true;
+            options.show_tokens = false;
+        } else if (std.mem.eql(u8, arg, "--top")) {
+            if (i + 1 >= args.len) {
+                print("Error: --top requires a number\n", .{});
+                return;
+            }
+            i += 1;
+            options.top_n = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--length")) {
+            if (i + 1 >= args.len) {
+                print("Error: --length requires a number\n", .{});
+                return;
+            }
+            i += 1;
+            options.filter_length = try std.fmt.parseInt(usize, args[i], 10);
+        } else if (std.mem.eql(u8, arg, "--min-count")) {
+            if (i + 1 >= args.len) {
+                print("Error: --min-count requires a number\n", .{});
+                return;
+            }
+            i += 1;
+            options.min_count = try std.fmt.parseInt(u64, args[i], 10);
+        } else {
+            print("Unknown option: {s}\n", .{arg});
+            printUsage();
+            return;
+        }
+
+        i += 1;
+    }
+
+    readTokensetFile(allocator, file_path, options) catch |err| {
+        print("Error reading file: {}\n", .{err});
+    };
 }
