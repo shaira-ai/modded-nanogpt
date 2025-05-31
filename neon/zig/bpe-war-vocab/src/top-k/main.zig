@@ -113,16 +113,15 @@ const input_files_ = [_][]const u8{
 };
 
 // Function to build full paths with data directory
-fn buildDataPaths(allocator: Allocator, data_dir: []const u8, n_files: usize) ![][]u8 {
-    const paths = try allocator.alloc([]u8, n_files);
+fn buildDataPaths(allocator: Allocator, data_dir: []const u8, n_files: usize) ![][]const u8 {
+    const paths = try allocator.alloc([]const u8, n_files);
     for (0..n_files) |i| {
         paths[i] = try std.fs.path.join(allocator, &[_][]const u8{ data_dir, input_files_[i] });
     }
     return paths;
 }
 
-// Function to free the allocated paths
-fn freeDataPaths(allocator: Allocator, paths: [][]u8) void {
+fn freeDataPaths(allocator: Allocator, paths: [][]const u8) void {
     for (paths) |path| {
         allocator.free(path);
     }
@@ -131,7 +130,7 @@ fn freeDataPaths(allocator: Allocator, paths: [][]u8) void {
 
 pub fn main() !void {
     // Use this instead if you want fast compile times
-    //try MainHaver(10).main(input_files_[0..2], 6);
+    // try MainHaver(10).main(2, 3, "data");
     try anyMain();
 }
 
@@ -176,18 +175,11 @@ pub fn MainHaver(MY_LEN: comptime_int) type {
             var timer = try std.time.Timer.start();
 
             // Build the input file paths
-            const input_paths = try buildDataPaths(allocator, data_dir, n_files);
-            defer freeDataPaths(allocator, input_paths);
-
-            // Convert to []const []const u8 for the function calls
-            const input_files = try allocator.alloc([]const u8, input_paths.len);
-            defer allocator.free(input_files);
-            for (input_paths, 0..) |path, i| {
-                input_files[i] = path;
-            }
+            const input_files = try buildDataPaths(allocator, data_dir, n_files);
+            defer freeDataPaths(allocator, input_files);
 
             // Configure parameters
-            const top_k = 1000000; // Track top 10000 strings per length
+            const top_k = 1000000; // Track top 100000 strings per length
             const cms_width = 1 << 24; // ~16 million counters per hash function
             const cms_depth = 10;
 
@@ -298,24 +290,24 @@ pub fn MainHaver(MY_LEN: comptime_int) type {
                 std.debug.print("\n=== PASS 2: Finding Top Strings (Parallel) ===\n", .{});
                 _ = timer.lap();
 
-                try analyzer.runSecondPass();
+                if (MY_LEN < 4) {
+                    std.debug.print("\n=== ADDING SMALL STRINGS TO HEAP ===\n", .{});
+                    try analyzer.addSmallStringsToHeap();
+                    std.debug.print("Small strings added to heap\n", .{});
+
+                    std.debug.print("\n=== SECOND PASS: Non-overlapping counting ===\n", .{});
+                    _ = timer.lap();
+                    try analyzer.runSecondPassSmallStrings();
+                    const second_pass_time = timer.lap();
+                    const second_pass_ms = @as(f64, @floatFromInt(second_pass_time)) / time.ns_per_ms;
+                    std.debug.print("Non-overlapping counting completed in {d:.2}ms\n", .{second_pass_ms});
+                } else {
+                    try analyzer.runSecondPass();
+                }
 
                 const second_pass_time = timer.lap();
                 const second_pass_ms = @as(f64, @floatFromInt(second_pass_time)) / time.ns_per_ms;
                 std.debug.print("Pass 2 completed in {d:.2}ms\n", .{second_pass_ms});
-            }
-
-            if (MY_LEN < 4) {
-                std.debug.print("\n=== ADDING SMALL STRINGS TO HEAP ===\n", .{});
-                try analyzer.addSmallStringsToHeap();
-                std.debug.print("Small strings added to heap\n", .{});
-
-                std.debug.print("\n=== SECOND PASS: Non-overlapping counting ===\n", .{});
-                _ = timer.lap();
-                try analyzer.runSecondPassSmallStrings();
-                const second_pass_time = timer.lap();
-                const second_pass_ms = @as(f64, @floatFromInt(second_pass_time)) / time.ns_per_ms;
-                std.debug.print("Non-overlapping counting completed in {d:.2}ms\n", .{second_pass_ms});
             }
 
             // Get and display results

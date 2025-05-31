@@ -321,7 +321,7 @@ pub fn Coordinator(
                     if (pass == 1) {
                         self.first_pass_count += 1;
 
-                        if (self.debug and (self.first_pass_count % 1000 == 0 or self.first_pass_count < 10)) {
+                        if (self.debug and (self.first_pass_count % 10000 == 0 or self.first_pass_count < 10)) {
                             std.debug.print("[Coordinator] First pass processed: {d} documents\n", .{self.first_pass_count});
                             const n_pending = self.pending_documents_free_list.len - self.n_free_pending_documents;
                             std.debug.print("[Coordinator] [DEBUG] Removed document from pending list, {d} remaining\n", .{n_pending});
@@ -329,7 +329,7 @@ pub fn Coordinator(
                     } else if (pass == 2) {
                         self.second_pass_count += 1;
 
-                        if (self.debug and (self.second_pass_count % 1000 == 0 or self.second_pass_count < 10)) {
+                        if (self.debug and (self.second_pass_count % 10000 == 0 or self.second_pass_count < 10)) {
                             std.debug.print("[Coordinator] Second pass processed: {d} documents\n", .{self.second_pass_count});
                             const n_pending = self.pending_documents_free_list.len - self.n_free_pending_documents;
                             std.debug.print("[Coordinator] [DEBUG] Removed document from pending list, {d} remaining\n", .{n_pending});
@@ -462,11 +462,11 @@ pub fn Coordinator(
             var any_sent = false;
             while (i < self.num_workers) : (i += 1) {
                 if (i & mask == 0 and i + stride < self.num_workers) {
-                    const msg = message.createCMSMergeMessage(i, self.workers[i+stride].sfm.cms);
+                    const msg = message.createCMSMergeMessage(i, self.workers[i + stride].sfm.cms);
                     _ = self.sendMessageToWorker(i, msg, true); // Expect response
                     any_sent = true;
                     if (self.debug) {
-                        std.debug.print("[Coordinator] Sent CMS merge message to worker {d}, {d}\n", .{ i, i+stride });
+                        std.debug.print("[Coordinator] Sent CMS merge message to worker {d}, {d}\n", .{ i, i + stride });
                     }
                 }
             }
@@ -480,11 +480,11 @@ pub fn Coordinator(
             var any_sent = false;
             while (i < self.num_workers) : (i += 1) {
                 if (i & mask == 0 and i + stride < self.num_workers) {
-                    const msg = message.createMergeCountsMessage(i, self.workers[i+stride].sfm);
+                    const msg = message.createMergeCountsMessage(i, self.workers[i + stride].sfm);
                     _ = self.sendMessageToWorker(i, msg, true); // Expect response
                     any_sent = true;
                     if (self.debug) {
-                        std.debug.print("[Coordinator] Sent Counts merge message to worker {d}, {d}\n", .{ i, i+stride });
+                        std.debug.print("[Coordinator] Sent Counts merge message to worker {d}, {d}\n", .{ i, i + stride });
                     }
                 }
             }
