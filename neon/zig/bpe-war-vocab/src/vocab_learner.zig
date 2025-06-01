@@ -1381,7 +1381,7 @@ pub const VocabLearner = struct {
     }
 
     /// Load vocabulary from a binary file
-    pub fn loadVocabularyFromFile(allocator: Allocator, path: []const u8, debug: bool) !*VocabLearner {
+    pub fn loadVocabularyFromFile(allocator: Allocator, path: []const u8, input_tokenset_path: []const u8, corpus_paths: []const []const u8, max_vocab_size: u32, use_in_memory: bool, debug: bool) !*VocabLearner {
         const file = try std.fs.cwd().openFile(path, .{});
         defer file.close();
 
@@ -1403,28 +1403,30 @@ pub const VocabLearner = struct {
 
         learner.* = .{
             .allocator = allocator,
-            .candidate_stats = std.StringHashMap(*TokenStats).init(allocator),
+            .candidate_stats = &[_]TokenStats{},
             .vocab_automaton = try BakaCorasick.init(allocator),
             .eval_automaton = try BakaCorasick.init(allocator),
             .current_step = 0,
-            .max_vocab_size = header.vocab_size,
+            .n_token_ids = 0,
+            .vocab_size = 0,
+            .tokenset_contents = &[_]u8{},
+            .n_candidates_to_tokenize = 500,
+            .processed_files = std.StringHashMap(void).init(allocator),
+            .document_sampler = try DocumentSampler.init(allocator, corpus_paths, debug),
+            .max_vocab_size = max_vocab_size,
             .top_k_candidates = 200,
             .batch_size = 10,
-            .sample_size = 5,
+            .sample_size = 10000,
             .last_full_corpus_scan = 0,
             .debug = debug,
-            .simple_prng = std.Random.DefaultPrng.init(blk: {
-                var seed: u64 = undefined;
-                try std.crypto.randomBytes(std.mem.asBytes(&seed));
-                break :blk seed;
-            }),
+            .use_in_memory = use_in_memory,
         };
 
         // Reserve capacity for vocabulary
-        try learner.vocab.ensureTotalCapacity(header.vocab_size);
-
+        try learner.loadCandidateTokens(input_tokenset_path);
         // Read tokens
         var token_id: u32 = 0;
+        var matching_candidate_token_id: u32 = 254;
         while (token_id < header.vocab_size) {
             var id_bytes: [4]u8 = undefined;
             var len_bytes: [4]u8 = undefined;
@@ -1451,11 +1453,22 @@ pub const VocabLearner = struct {
                 return error.IncompleteToken;
             }
 
-            // Add token to vocabulary
-            try learner.vocab.append(token);
-            learner.candidate_stats[token_id].is_in_vocab = true;
-            try learner.vocab_automaton.insert(token, token_id);
+            var real_token_id = token_id;
+            if (token_id >= 256) {
+                matching_candidate_token_id = matching_candidate_token_id + 1;
+                while (!std.mem.eql(u8, token[0..], learner.getTokenStr(matching_candidate_token_id))) {
+                    matching_candidate_token_id = matching_candidate_token_id + 1;
+                    if (matching_candidate_token_id >= learner.n_token_ids) {
+                        std.debug.print("No matching candidate for {} '{s}'", .{ token_id, token });
+                        return error.UnrecognizedToken;
+                    }
+                }
+                real_token_id = matching_candidate_token_id;
+            }
 
+            // Add token to vocabulary
+            learner.addToVocab(real_token_id);
+            try learner.vocab_automaton.insert(token, real_token_id);
             token_id += 1;
         }
 
@@ -1463,7 +1476,7 @@ pub const VocabLearner = struct {
         try learner.vocab_automaton.computeSuffixLinks();
 
         if (debug) {
-            std.debug.print("Loaded vocabulary with {d} tokens from {s}\n", .{ learner.vocab.items.len, path });
+            std.debug.print("Loaded vocabulary with {d} tokens from {s}\n", .{ learner.vocab_size, path });
         }
 
         return learner;
@@ -2445,8 +2458,11 @@ pub fn main() !void {
 
     const tokenset_path = args[1];
     var stats_path: ?[]const u8 = null;
+    var vocab_path: ?[]const u8 = null;
     var use_in_memory = false;
+    var load_vocab = false;
     var corpus_paths: []const []const u8 = undefined;
+    var max_vocab_size: u32 = 50000;
 
     var non_flag_paths = std.ArrayList([]const u8).init(allocator);
     defer non_flag_paths.deinit();
@@ -2463,6 +2479,21 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "--in-memory")) {
             use_in_memory = true;
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "--load-vocab")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("Error: --load-vocab requires a value\n", .{});
+                return;
+            }
+            load_vocab = true;
+            vocab_path = args[i + 1];
+            i += 2;
+        } else if (std.mem.eql(u8, args[i], "--max-vocab-size")) {
+            if (i + 1 >= args.len) {
+                std.debug.print("Error: --max-vocab-size requires a value\n", .{});
+                return;
+            }
+            max_vocab_size = try std.fmt.parseInt(u32, args[i + 1], 10);
+            i += 2;
         } else {
             try non_flag_paths.append(args[i]);
             i += 1;
@@ -2472,7 +2503,12 @@ pub fn main() !void {
     corpus_paths = non_flag_paths.items;
     const debug = true;
 
-    var learner = try VocabLearner.init(allocator, tokenset_path, corpus_paths, 50000, use_in_memory, debug);
+    var learner: *VocabLearner = undefined;
+    if (vocab_path) |path| {
+        learner = try VocabLearner.loadVocabularyFromFile(allocator, path, tokenset_path, corpus_paths, max_vocab_size, use_in_memory, debug);
+    } else {
+        learner = try VocabLearner.init(allocator, tokenset_path, corpus_paths, max_vocab_size, use_in_memory, debug);
+    }
     defer learner.deinit();
 
     // Check if everything initialized properly
