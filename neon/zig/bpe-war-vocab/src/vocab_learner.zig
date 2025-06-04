@@ -146,7 +146,7 @@ pub const VocabLearner = struct {
     vocab_size: u32,
     tokenset_contents: []const u8,
     // Parameters
-    max_token_length: u32 = 15,
+    max_token_length: u32 = 60,
     max_vocab_size: u32,
     top_k_candidates: u32,
     batch_size: u32,
@@ -178,9 +178,9 @@ pub const VocabLearner = struct {
             .vocab_size = 0,
             .tokenset_contents = &[_]u8{},
             .max_vocab_size = max_vocab_size,
-            .top_k_candidates = 100,
+            .top_k_candidates = 50,
             .batch_size = 10,
-            .sample_size = 10000,
+            .sample_size = 40000,
             .n_candidates_to_tokenize = 500,
             .processed_files = std.StringHashMap(void).init(allocator),
             .last_full_corpus_scan = 0,
@@ -540,7 +540,7 @@ pub const VocabLearner = struct {
 
                 // add token to the automaton
                 try batch_automaton.insert(token_str, token_id);
-                estimated_automaton_size += estimated_increase;
+                estimated_automaton_size = batch_automaton.len;
                 current_idx += 1;
             }
 
@@ -767,7 +767,7 @@ pub const VocabLearner = struct {
             }
         }
 
-        const rejected_current_step_tokens = try self.allocator.alloc(u32, 1000);
+        const rejected_current_step_tokens = try self.allocator.alloc(u32, 1);
         const accepted_current_step_tokens = try self.allocator.alloc(u32, 10);
         const top_k_candidates = try self.allocator.alloc(SampleStats, self.top_k_candidates);
 
@@ -784,9 +784,11 @@ pub const VocabLearner = struct {
         const n_to_tokenize_decrease_when_no_repeats: usize = 100;
         try candidates_to_tokenize_arraylist.resize(n_candidates_to_tokenize);
 
+        var best_other_savings: f64 = 1e99;
+
         while (self.vocab_size < self.max_vocab_size) {
-            //const max_acceptable = @min(accepted_current_step_tokens.len, self.max_vocab_size - self.vocab_size);
-            const max_acceptable: usize = 1;
+            const max_acceptable = @min(accepted_current_step_tokens.len, self.max_vocab_size - self.vocab_size);
+            //const max_acceptable: usize = 1;
             const iteration_start = std.time.milliTimestamp();
             self.current_step += 1;
 
@@ -872,7 +874,7 @@ pub const VocabLearner = struct {
                 // and the best one is better than everything else,
                 // then we can stop.
                 const apparent_best_unsampled_token_id = heap.peek().?;
-                const best_other_savings = @max(best_leftover_savings, self.candidate_stats[apparent_best_unsampled_token_id].est_total_savings);
+                best_other_savings = @max(best_leftover_savings, self.candidate_stats[apparent_best_unsampled_token_id].est_total_savings);
                 if (this_step_heap.peek()) |elem| {
                     if (self.candidate_stats[elem].est_total_savings >= best_other_savings) {
                         break;
@@ -922,7 +924,9 @@ pub const VocabLearner = struct {
             while (n_accepted < max_acceptable and n_rejected < rejected_current_step_tokens.len) {
                 if (this_step_heap.peek()) |apparent_best_token_id| {
                     _ = this_step_heap.remove();
-                    if (self.tokenIsAlmostIndependentOfTokens(apparent_best_token_id, accepted_current_step_tokens[0..n_accepted])) {
+                    if (self.candidate_stats[apparent_best_token_id].est_total_savings >= best_other_savings and
+                        self.tokenIsAlmostIndependentOfTokens(apparent_best_token_id, accepted_current_step_tokens[0..n_accepted]))
+                    {
                         accepted_current_step_tokens[n_accepted] = apparent_best_token_id;
                         n_accepted += 1;
                     } else {
@@ -1970,7 +1974,7 @@ pub const VocabLearner = struct {
         // 5. TOKEN ADDITION PHASE
         // Use the normal token selection process to add tokens back
         var tokens_added: usize = 0;
-        const rejected_current_step_tokens = try self.allocator.alloc(u32, 1000);
+        const rejected_current_step_tokens = try self.allocator.alloc(u32, 1);
         defer self.allocator.free(rejected_current_step_tokens);
         const accepted_current_step_tokens = try self.allocator.alloc(u32, 100);
         defer self.allocator.free(accepted_current_step_tokens);
