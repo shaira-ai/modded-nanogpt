@@ -49,4 +49,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     b.installArtifact(vocab_learner);
+
+    const top_k = b.addExecutable(.{
+        .name = "top_k",
+        .root_source_file = b.path("src/top-k/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    b.installArtifact(top_k);
 }
