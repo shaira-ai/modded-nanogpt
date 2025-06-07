@@ -2149,27 +2149,18 @@ pub const VocabLearner = struct {
         return try std.fs.path.join(allocator, &[_][]const u8{ cwd, file_path });
     }
 
-    fn hashFile(allocator: std.mem.Allocator, file_path: []const u8, seed: u64) !u64 {
+    fn hashFile(file_content: []const u8, seed: u64) u64 {
         var hasher = std.crypto.hash.Sha1.init(.{});
 
         var seed_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &seed_bytes, seed, .little);
         hasher.update(&seed_bytes);
-
         // Read and hash file content
-        const file = try std.fs.cwd().openFile(file_path, .{});
-        defer file.close();
+        hasher.update(file_content);
 
-        const content = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-        defer allocator.free(content);
-
-        hasher.update(content);
-
-        // Get SHA1 result (20 bytes) and truncate to u64
         var hash_result: [20]u8 = undefined;
         hasher.final(&hash_result);
 
-        // Take first 8 bytes as u64
         return std.mem.readInt(u64, hash_result[0..8], .little);
     }
 
@@ -2208,8 +2199,15 @@ pub const VocabLearner = struct {
 
         // Write file identifiers (hashes of file paths and sizes)
         for (corpus_files.items) |corpus_file| {
-            // Get file size for better uniqueness
-            const hash = try hashFile(self.allocator, corpus_file, self.file_hash_seed);
+            const file_content = std.fs.cwd().readFileAlloc(self.allocator, corpus_file, std.math.maxInt(usize)) catch |err| {
+                if (self.debug) {
+                    std.debug.print("Error reading file {s}: {s}\n", .{ corpus_file, @errorName(err) });
+                }
+                return;
+            };
+            defer self.allocator.free(file_content);
+
+            const hash = hashFile(file_content, self.file_hash_seed);
             var hash_bytes: [8]u8 = undefined;
             std.mem.writeInt(u64, &hash_bytes, hash, .little);
             try file.writeAll(&hash_bytes);
@@ -2333,14 +2331,15 @@ pub const VocabLearner = struct {
         defer self.allocator.free(current_hashes);
 
         for (corpus_files.items, 0..) |corpus_file, i| {
-            const file_info = std.fs.cwd().statFile(corpus_file) catch |err| {
+            const file_content = std.fs.cwd().readFileAlloc(self.allocator, corpus_file, std.math.maxInt(usize)) catch |err| {
                 if (self.debug) {
-                    std.debug.print("Error getting file info for {s}: {s}\n", .{ corpus_file, @errorName(err) });
+                    std.debug.print("Error reading file {s}: {s}\n", .{ corpus_file, @errorName(err) });
                 }
                 return false;
             };
+            defer self.allocator.free(file_content);
 
-            current_hashes[i] = try hashFile(self.allocator, corpus_file, file_info.size, header.hash_seed);
+            current_hashes[i] = hashFile(file_content, header.hash_seed);
         }
 
         // Sort both hash arrays for comparison
