@@ -88,9 +88,9 @@ const StatsHeader = extern struct {
     vocab_size: u32,
     n_token_ids: u32,
     file_count: u32,
+    pad_b: [4]u8,
     timestamp: i64,
-    hash_seed: u64,
-    reserved: [20]u8, // Padding to reach 64 bytes
+    reserved: [32]u8, // Padding to reach 64 bytes
 
     // Ensure the struct is exactly 64 bytes
     comptime {
@@ -153,7 +153,6 @@ pub const VocabLearner = struct {
     sample_size: u32,
     n_candidates_to_tokenize: u32,
     processed_files: std.StringHashMap(void),
-    file_hash_seed: u64 = 0,
 
     // Tracking
     last_full_corpus_scan: u32,
@@ -1796,12 +1795,9 @@ pub const VocabLearner = struct {
         return try std.fs.path.join(allocator, &[_][]const u8{ cwd, file_path });
     }
 
-    fn hashFile(file_content: []const u8, seed: u64) u64 {
+    fn hashFile(file_content: []const u8) u64 {
         var hasher = std.crypto.hash.Sha1.init(.{});
 
-        var seed_bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &seed_bytes, seed, .little);
-        hasher.update(&seed_bytes);
         // Read and hash file content
         hasher.update(file_content);
 
@@ -1825,21 +1821,16 @@ pub const VocabLearner = struct {
         const file = try std.fs.cwd().createFile(path, .{});
         defer file.close();
 
-        // Use current timestamp as hash seed if not already set
-        if (self.file_hash_seed == 0) {
-            self.file_hash_seed = @intCast(std.time.milliTimestamp());
-        }
-
         // Create and write header
         const header = StatsHeader{
             .magic = STATS_MAGIC,
             .pad_a = [_]u8{0},
+            .pad_b = [_]u8{0} ** 4,
             .vocab_size = @intCast(self.vocab_size),
             .n_token_ids = self.n_token_ids,
             .timestamp = std.time.milliTimestamp(),
             .file_count = @intCast(corpus_files.items.len),
-            .hash_seed = self.file_hash_seed,
-            .reserved = [_]u8{0} ** 20,
+            .reserved = [_]u8{0} ** 32,
         };
 
         try file.writeAll(std.mem.asBytes(&header));
@@ -1854,7 +1845,7 @@ pub const VocabLearner = struct {
             };
             defer self.allocator.free(file_content);
 
-            const hash = hashFile(file_content, self.file_hash_seed);
+            const hash = hashFile(file_content);
             var hash_bytes: [8]u8 = undefined;
             std.mem.writeInt(u64, &hash_bytes, hash, .little);
             try file.writeAll(&hash_bytes);
@@ -1960,9 +1951,6 @@ pub const VocabLearner = struct {
             return false;
         }
 
-        // Store the hash seed for future use
-        self.file_hash_seed = header.hash_seed;
-
         // Read file hashes from stats file
         var saved_hashes = try self.allocator.alloc(u64, header.file_count);
         defer self.allocator.free(saved_hashes);
@@ -1986,7 +1974,7 @@ pub const VocabLearner = struct {
             };
             defer self.allocator.free(file_content);
 
-            current_hashes[i] = hashFile(file_content, header.hash_seed);
+            current_hashes[i] = hashFile(file_content);
         }
 
         // Sort both hash arrays for comparison
