@@ -1064,73 +1064,6 @@ pub const VocabLearner = struct {
         }
     }
 
-    fn removeRandomTokens(self: *VocabLearner, count: usize) !void {
-        const start_time = std.time.milliTimestamp();
-
-        if (self.debug) {
-            std.debug.print("Randomly removing {d} tokens from vocabulary...\n", .{count});
-        }
-
-        if (self.vocab_size < 256) {
-            if (self.debug) {
-                std.debug.print("Vocabulary size is already below 256, weird!!.\n", .{});
-                @panic("oh no!");
-            }
-            return error.VocabularySizeTooSmall;
-        }
-        const tokens_to_remove = @min(self.vocab_size - 256, count);
-
-        if (tokens_to_remove <= 0) {
-            if (self.debug) {
-                std.debug.print("No removable tokens available.\n", .{});
-            }
-            return;
-        }
-
-        if (tokens_to_remove < count) {
-            if (self.debug) {
-                std.debug.print("Removing {d} tokens instead of {d} requested.\n", .{ tokens_to_remove, count });
-            }
-        }
-
-        var ids_to_remove = try self.allocator.alloc(u32, tokens_to_remove);
-        defer self.allocator.free(ids_to_remove);
-        var n_found: usize = 0;
-        var can_idx: u32 = 256;
-        while (n_found < count) : (can_idx += 1) {
-            if (self.candidate_stats[can_idx].is_in_vocab) {
-                ids_to_remove[n_found] = can_idx;
-                n_found += 1;
-            }
-        }
-        while (can_idx < self.n_token_ids) : (can_idx += 1) {
-            if (self.candidate_stats[can_idx].is_in_vocab) {
-                const replace_idx = self.document_sampler.prng.uintLessThan(usize, n_found);
-                ids_to_remove[replace_idx] = can_idx;
-            }
-        }
-
-        // Remove the first 'tokens_to_remove' tokens
-        for (ids_to_remove) |id| {
-            self.removeFromVocab(id);
-        }
-
-        self.vocab_automaton.clear();
-        for (self.candidate_stats, 0..) |stats, id_usize| {
-            if (stats.is_in_vocab) {
-                const id: u32 = @intCast(id_usize);
-                const slice = self.getTokenStr(id);
-                try self.vocab_automaton.insert(slice, id);
-            }
-        }
-        try self.vocab_automaton.computeSuffixLinks();
-
-        const elapsed_ms = std.time.milliTimestamp() - start_time;
-        if (self.debug) {
-            std.debug.print("Removed {d} tokens in {d}ms. New vocabulary size: {d}\n", .{ tokens_to_remove, elapsed_ms, self.vocab_size });
-        }
-    }
-
     // Greedy tokenization algorithm
     fn tokenizeGreedy(self: *VocabLearner, automaton: *BakaCorasick, text: []const u8) !ArrayList(u32) {
         var tokens = ArrayList(u32).init(self.allocator);
@@ -1492,45 +1425,6 @@ pub const VocabLearner = struct {
         return learner;
     }
 
-    pub fn serializeToBuffer(self: *VocabLearner, allocator: Allocator) ![]u8 {
-        // Calculate total size needed
-        var total_size: usize = HEADER_SIZE;
-        for (self.vocab.items) |token| {
-            total_size += 8 + token.len; // 4 bytes ID + 4 bytes length + token content
-        }
-
-        // Allocate buffer
-        const buffer = try allocator.alloc(u8, total_size);
-        errdefer allocator.free(buffer);
-
-        // Create and write header
-        const header = VocabHeader{
-            .magic = VOCAB_MAGIC,
-            .vocab_size = @intCast(self.vocab_size),
-            .reserved = [_]u8{0} ** 20,
-        };
-        @memcpy(buffer[0..HEADER_SIZE], std.mem.asBytes(&header));
-
-        // Write tokens to buffer
-        var offset: usize = HEADER_SIZE;
-        for (self.vocab.items, 0..) |token, i| {
-            const token_id: u32 = @intCast(i);
-            const token_length: u32 = @intCast(token.len);
-
-            // Write token ID and length
-            std.mem.writeInt(u32, buffer[offset..][0..4], token_id, .little);
-            offset += 4;
-            std.mem.writeInt(u32, buffer[offset..][0..4], token_length, .little);
-            offset += 4;
-
-            // Write token content
-            @memcpy(buffer[offset..][0..token.len], token);
-            offset += token.len;
-        }
-
-        return buffer;
-    }
-
     pub fn getDocumentTokenCount(
         self: *const VocabLearner,
         document: []const u8,
@@ -1782,17 +1676,6 @@ pub const VocabLearner = struct {
                 self.candidate_stats[id].est_total_savings = @floatFromInt(occurrence_count * (token_len - 1));
             }
         }
-    }
-
-    fn getAbsolutePath(allocator: std.mem.Allocator, file_path: []const u8) ![]u8 {
-        if (std.fs.path.isAbsolute(file_path)) {
-            return try allocator.dupe(u8, file_path);
-        }
-
-        const cwd = try std.process.getCwdAlloc(allocator);
-        defer allocator.free(cwd);
-
-        return try std.fs.path.join(allocator, &[_][]const u8{ cwd, file_path });
     }
 
     fn hashFile(file_content: []const u8) u64 {
@@ -2064,33 +1947,6 @@ pub const VocabLearner = struct {
         }
     }
 };
-
-fn debugComputeSuffixLinks(allocator: Allocator) !void {
-    var a = try BakaCorasick.init(allocator);
-    var b = try BakaCorasick.init(allocator);
-    try a.insert(" ", 1);
-    try b.insert(" ", 1);
-    try a.insert("t", 2);
-    try b.insert("t", 2);
-    try a.insert("h", 3);
-    try b.insert("h", 3);
-    try a.insert("e", 4);
-    try b.insert("e", 4);
-    try a.computeSuffixLinks();
-    try a.insert(" the", 5);
-    try b.insert(" the", 5);
-    try a.computeSuffixLinks();
-    try b.computeSuffixLinks();
-    std.debug.print("a.len={}\n", .{a.len});
-    std.debug.print("b.len={}\n", .{b.len});
-    for (0..a.len) |i| {
-        std.debug.print("{}\n", .{a.info[i]});
-        std.debug.print("{}\n", .{b.info[i]});
-        std.debug.print("{any}\n", .{a.transitions[i]});
-        std.debug.print("{any}\n", .{b.transitions[i]});
-        std.debug.print("{}\n", .{std.mem.eql(u32, &a.transitions[i], &b.transitions[i])});
-    }
-}
 
 pub fn main() !void {
     const allocator = std.heap.c_allocator;
