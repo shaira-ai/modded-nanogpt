@@ -1270,8 +1270,8 @@ pub const VocabLearner = struct {
         const random = prng.random();
 
         {
-            var i = vocab_tokens.items.len;
-            while (i > 1) : (i -= 1) {
+            var i = vocab_tokens.items.len - 1;
+            while (i > 0) : (i -= 1) {
                 const j = random.uintLessThan(usize, i + 1); // Random index from 0 to i inclusive
                 const temp = vocab_tokens.items[i];
                 vocab_tokens.items[i] = vocab_tokens.items[j];
