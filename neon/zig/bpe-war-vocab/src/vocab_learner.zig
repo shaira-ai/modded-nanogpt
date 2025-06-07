@@ -163,10 +163,14 @@ pub const VocabLearner = struct {
         return @ptrCast(@alignCast(self.loader.?));
     }
 
-    pub fn init(allocator: Allocator, input_tokenset_path: []const u8, corpus_paths: []const []const u8, max_vocab_size: u32, use_in_memory: bool, debug: bool) !*VocabLearner {
-        var learner = try allocator.create(VocabLearner);
-
-        // Initialize fields
+    inline fn initLearner(
+        learner: *VocabLearner,
+        allocator: Allocator,
+        corpus_paths: []const []const u8,
+        max_vocab_size: u32,
+        use_in_memory: bool,
+        debug: bool,
+    ) !void {
         learner.* = .{
             .allocator = allocator,
             .candidate_stats = &[_]TokenStats{},
@@ -187,6 +191,20 @@ pub const VocabLearner = struct {
             .use_in_memory = use_in_memory,
             .debug = debug,
         };
+    }
+
+    pub fn init(allocator: Allocator, input_tokenset_path: []const u8, corpus_paths: []const []const u8, max_vocab_size: u32, use_in_memory: bool, debug: bool) !*VocabLearner {
+        var learner = try allocator.create(VocabLearner);
+
+        // Initialize fields
+        try initLearner(
+            learner,
+            allocator,
+            corpus_paths,
+            max_vocab_size,
+            use_in_memory,
+            debug,
+        );
 
         // Load candidate tokens from tokenset file
         try learner.loadCandidateTokens(input_tokenset_path);
@@ -786,7 +804,23 @@ pub const VocabLearner = struct {
 
         var best_other_savings: f64 = 1e99;
 
-        while (self.vocab_size < self.max_vocab_size) {
+        while (true) {
+            if (self.vocab_size == self.max_vocab_size) {
+                const token_count = if (self.use_in_memory) blk: {
+                    const loader = self.getLoader(InMemoryDataLoader);
+                    break :blk try parallel_dp.getCorpusTokenCount(loader);
+                } else blk: {
+                    const loader = self.getLoader(fineweb);
+                    break :blk try parallel_dp.getCorpusTokenCount(loader);
+                };
+                if (token_count < best_corpus_token_count) {
+                    best_corpus_token_count = token_count;
+                    std.debug.print("New best corpus token count: {d}\n", .{token_count});
+                    try self.saveVocabularyNow();
+                }
+                try self.deleteSomeTokens(&heap);
+            }
+
             const max_acceptable = @min(accepted_current_step_tokens.len, self.max_vocab_size - self.vocab_size);
             //const max_acceptable: usize = 1;
             const iteration_start = std.time.milliTimestamp();
@@ -975,21 +1009,7 @@ pub const VocabLearner = struct {
 
             try self.vocab_automaton.computeSuffixLinks();
 
-            if (self.vocab_size == self.max_vocab_size) {
-                const token_count = if (self.use_in_memory) blk: {
-                    const loader = self.getLoader(InMemoryDataLoader);
-                    break :blk try parallel_dp.getCorpusTokenCount(loader);
-                } else blk: {
-                    const loader = self.getLoader(fineweb);
-                    break :blk try parallel_dp.getCorpusTokenCount(loader);
-                };
-                if (token_count < best_corpus_token_count) {
-                    best_corpus_token_count = token_count;
-                    std.debug.print("New best corpus token count: {d}\n", .{token_count});
-                    try self.saveVocabularyNow();
-                }
-                try self.deleteSomeTokens(&heap);
-            } else {
+            {
                 var best_heap_est_savings = self.candidate_stats[heap.peek().?].est_total_savings;
                 var repeated = false;
                 while (tokenize_candidates_heap.count() < self.top_k_candidates or
@@ -1032,27 +1052,6 @@ pub const VocabLearner = struct {
                     try heap.add(token_id);
                 }
             }
-
-            // // 6. Delete Tokens
-            // if (self.vocab_size >= self.max_vocab_size) {
-            //     // Only do batch replacement if we have enough tokens to work with
-            //     const non_essential_token_count = self.vocab_size - 256;
-            //     const batch_size = 1000;
-
-            //     if (non_essential_token_count >= batch_size) {
-            //         const batch_count = @min(50, non_essential_token_count / batch_size);
-
-            //         if (batch_count > 0) {
-            //             if (self.debug) {
-            //                 std.debug.print("\nStarting batch token replacement phase...\n", .{});
-            //             }
-
-            //             try self.batchTokenReplacement(batch_count, batch_size, &parallel_dp);
-            //         }
-            //     } else if (self.debug) {
-            //         std.debug.print("\nNot enough non-essential tokens for batch replacement.\n", .{});
-            //     }
-            // }
 
             const iteration_elapsed = std.time.milliTimestamp() - iteration_start;
             if (self.debug) {
@@ -1257,7 +1256,7 @@ pub const VocabLearner = struct {
             }
         }
 
-        const batch_size = 1000;
+        const batch_size = (vocab_tokens.items.len + 2) / 3;
 
         const available_tokens = vocab_tokens.items.len;
         if (available_tokens < batch_size) {
@@ -1397,7 +1396,15 @@ pub const VocabLearner = struct {
     }
 
     /// Load vocabulary from a binary file
-    pub fn loadVocabularyFromFile(allocator: Allocator, path: []const u8, input_tokenset_path: []const u8, corpus_paths: []const []const u8, max_vocab_size: u32, use_in_memory: bool, debug: bool) !*VocabLearner {
+    pub fn loadVocabularyFromFile(
+        allocator: Allocator,
+        path: []const u8,
+        input_tokenset_path: []const u8,
+        corpus_paths: []const []const u8,
+        max_vocab_size: u32,
+        use_in_memory: bool,
+        debug: bool,
+    ) !*VocabLearner {
         const file = try std.fs.cwd().openFile(path, .{});
         defer file.close();
 
@@ -1417,26 +1424,14 @@ pub const VocabLearner = struct {
         var learner = try allocator.create(VocabLearner);
         errdefer allocator.destroy(learner);
 
-        learner.* = .{
-            .allocator = allocator,
-            .candidate_stats = &[_]TokenStats{},
-            .vocab_automaton = try BakaCorasick.init(allocator),
-            .eval_automaton = try BakaCorasick.init(allocator),
-            .current_step = 0,
-            .n_token_ids = 0,
-            .vocab_size = 0,
-            .tokenset_contents = &[_]u8{},
-            .n_candidates_to_tokenize = 500,
-            .processed_files = std.StringHashMap(void).init(allocator),
-            .document_sampler = try DocumentSampler.init(allocator, corpus_paths, debug),
-            .max_vocab_size = max_vocab_size,
-            .top_k_candidates = 200,
-            .batch_size = 10,
-            .sample_size = 10000,
-            .last_full_corpus_scan = 0,
-            .debug = debug,
-            .use_in_memory = use_in_memory,
-        };
+        try initLearner(
+            learner,
+            allocator,
+            corpus_paths,
+            max_vocab_size,
+            use_in_memory,
+            debug,
+        );
 
         // Reserve capacity for vocabulary
         try learner.loadCandidateTokens(input_tokenset_path);
@@ -1535,85 +1530,6 @@ pub const VocabLearner = struct {
         }
 
         return buffer;
-    }
-
-    pub fn deserializeFromBuffer(allocator: Allocator, buffer: []const u8, debug: bool) !*VocabLearner {
-        if (buffer.len < HEADER_SIZE) {
-            return error.BufferTooSmall;
-        }
-
-        // Parse header
-        const header = @as(*const VocabHeader, @ptrCast(@alignCast(buffer.ptr))).*;
-
-        // Validate magic number
-        if (!std.mem.eql(u8, &header.magic, &VOCAB_MAGIC)) {
-            return error.InvalidMagicNumber;
-        }
-
-        // Create new VocabLearner with empty initialization
-        var learner = try allocator.create(VocabLearner);
-        errdefer allocator.destroy(learner);
-
-        learner.* = .{
-            .allocator = allocator,
-            .candidate_stats = std.StringHashMap(*TokenStats).init(allocator),
-            .vocab_automaton = try BakaCorasick.init(allocator),
-            .eval_automaton = try BakaCorasick.init(allocator),
-            .current_step = 0,
-            .max_vocab_size = header.vocab_size,
-            .top_k_candidates = 200,
-            .batch_size = 10,
-            .sample_size = 5,
-            .last_full_corpus_scan = 0,
-            .debug = debug,
-            .simple_prng = std.Random.DefaultPrng.init(blk: {
-                var seed: u64 = undefined;
-                try std.crypto.randomBytes(std.mem.asBytes(&seed));
-                break :blk seed;
-            }),
-        };
-
-        try learner.vocab.ensureTotalCapacity(header.vocab_size);
-
-        // Parse tokens
-        var offset: usize = HEADER_SIZE;
-        var token_id: u32 = 0;
-
-        while (token_id < header.vocab_size) {
-            if (offset + 8 > buffer.len) {
-                return error.BufferTooSmall;
-            }
-
-            const read_token_id = std.mem.readInt(u32, buffer[offset..][0..4], .little);
-            offset += 4;
-            const token_length = std.mem.readInt(u32, buffer[offset..][0..4], .little);
-            offset += 4;
-
-            if (read_token_id != token_id) {
-                return error.InvalidTokenSequence;
-            }
-
-            if (offset + token_length > buffer.len) {
-                return error.BufferTooSmall;
-            }
-
-            const token = try allocator.dupe(u8, buffer[offset..][0..token_length]);
-            offset += token_length;
-
-            try learner.vocab.append(token);
-            learner.candidate_stats[token_id].is_in_vocab = true;
-            try learner.vocab_automaton.insert(token, token_id);
-
-            token_id += 1;
-        }
-
-        try learner.vocab_automaton.computeSuffixLinks();
-
-        if (debug) {
-            std.debug.print("Deserialized vocabulary with {d} tokens from buffer\n", .{learner.vocab.items.len});
-        }
-
-        return learner;
     }
 
     pub fn getDocumentTokenCount(
@@ -1866,275 +1782,6 @@ pub const VocabLearner = struct {
 
                 self.candidate_stats[id].est_total_savings = @floatFromInt(occurrence_count * (token_len - 1));
             }
-        }
-    }
-
-    // Process a single batch of tokens to delete and replace
-    fn processTokenBatch(self: *VocabLearner, tokens_to_delete: []const u32, parallel_dp: *parallel.ParallelDP) !void {
-        const start_time = std.time.milliTimestamp();
-        const batch_size = tokens_to_delete.len;
-
-        if (self.debug) {
-            std.debug.print("Processing batch of {d} tokens...\n", .{batch_size});
-        }
-
-        // 1. DELETE TOKENS PHASE
-        // Delete specified tokens (never delete one-byte tokens)
-        for (tokens_to_delete) |token_id| {
-            if (token_id >= 256) {
-                self.removeFromVocab(token_id);
-            }
-        }
-
-        // Rebuild the automaton without deleted tokens
-        self.vocab_automaton.clear();
-        for (0..self.n_token_ids) |id_usize| {
-            const id: u32 = @intCast(id_usize);
-            if (self.candidate_stats[id].is_in_vocab) {
-                const token_str = self.getTokenStr(id);
-                try self.vocab_automaton.insert(token_str, id);
-            }
-        }
-        try self.vocab_automaton.computeSuffixLinks();
-
-        // 2. RESET ESTIMATES PHASE
-        // Reset all token estimates to maximum values without recalculation
-        self.resetTokenEstimates();
-
-        // 3. HEAP CREATION PHASE
-        // Setup heap for token selection using reset estimated values
-        const Context = struct {
-            fn lessThan(ctx: *VocabLearner, a: u32, b: u32) std.math.Order {
-                const value_a = ctx.candidate_stats[a].getCurrentValueBound();
-                const value_b = ctx.candidate_stats[b].getCurrentValueBound();
-                return std.math.order(value_b, value_a);
-            }
-        };
-
-        var heap = std.PriorityQueue(u32, *VocabLearner, Context.lessThan).init(self.allocator, self);
-        defer heap.deinit();
-
-        // Add all non-vocab tokens to the heap
-        for (0..self.n_token_ids) |id_usize| {
-            const id: u32 = @intCast(id_usize);
-            if (!self.candidate_stats[id].is_in_vocab) {
-                try heap.add(id);
-            }
-        }
-
-        // 4. SELECTIVE RECALCULATION PHASE
-        // Get the top candidates and recalculate their estimates
-        const large_number = @min(500, heap.count()); // The "$large_number" sasuke mentioned
-        const top_k_candidates = try self.allocator.alloc(SampleStats, large_number);
-        defer self.allocator.free(top_k_candidates);
-
-        // Prepare data structures for candidate evaluation
-        var candidate_automaton = try BakaCorasick.init(self.allocator);
-        defer candidate_automaton.deinit();
-
-        // Extract top candidates for evaluation
-        for (0..large_number) |i| {
-            if (heap.count() == 0) break;
-            top_k_candidates[i] = .{ .token_id = heap.remove(), .sampled_occurrences = 0, .sampled_savings = 0 };
-        }
-
-        // Create automaton with just these candidates
-        for (top_k_candidates, 0..) |stats, my_idx_usize| {
-            const my_idx: u32 = @intCast(my_idx_usize);
-            const token_id = stats.token_id;
-            const token_str = self.getTokenStr(token_id);
-            try candidate_automaton.insert(token_str, my_idx);
-        }
-        try candidate_automaton.computeSuffixLinks();
-
-        // Use a smaller sample size for batch replacement
-        const original_sample_size = self.sample_size;
-        self.sample_size = @max(self.sample_size / 4, 5); // Reduce sample size for speed
-
-        if (self.use_in_memory) {
-            const loader = self.getLoader(InMemoryDataLoader);
-            try parallel_dp.processDocuments(loader, self.sample_size, top_k_candidates, &candidate_automaton);
-        } else {
-            const loader = self.getLoader(fineweb);
-            try parallel_dp.processDocuments(loader, self.sample_size, top_k_candidates, &candidate_automaton);
-        }
-
-        // Restore original sample size
-        self.sample_size = original_sample_size;
-
-        // Update estimates and return to heap
-        for (top_k_candidates) |sample_stats| {
-            const token_id = sample_stats.token_id;
-
-            // Only update value estimates if we have enough occurrences
-            const sampled_occurrences = sample_stats.sampled_occurrences;
-            if (sampled_occurrences >= 5) {
-                const sampled_savings = sample_stats.sampled_savings;
-                const total_occurrences = self.candidate_stats[token_id].n_nonoverlapping_occurrences;
-                const est_savings = @as(f64, @floatFromInt(sampled_savings)) *
-                    @as(f64, @floatFromInt(total_occurrences)) /
-                    @as(f64, @floatFromInt(sampled_occurrences));
-
-                self.candidate_stats[token_id].sampled_occurrences = sampled_occurrences;
-                self.candidate_stats[token_id].sampled_savings = sampled_savings;
-                self.candidate_stats[token_id].est_total_savings = est_savings;
-                self.candidate_stats[token_id].sampled_step = self.current_step;
-            }
-            try heap.add(token_id);
-        }
-
-        // 5. TOKEN ADDITION PHASE
-        // Use the normal token selection process to add tokens back
-        var tokens_added: usize = 0;
-        const rejected_current_step_tokens = try self.allocator.alloc(u32, 1);
-        defer self.allocator.free(rejected_current_step_tokens);
-        const accepted_current_step_tokens = try self.allocator.alloc(u32, 100);
-        defer self.allocator.free(accepted_current_step_tokens);
-
-        while (tokens_added < batch_size and heap.count() > 0) {
-            var n_accepted: usize = 0;
-            var n_rejected: usize = 0;
-
-            while (n_accepted < accepted_current_step_tokens.len and
-                n_rejected < rejected_current_step_tokens.len and
-                heap.count() > 0)
-            {
-                const top_token_id = heap.peek().?;
-
-                // Recalculate top token estimate if needed
-                if (self.candidate_stats[top_token_id].sampled_step < self.current_step) {
-                    // Skip this iteration if we need recalculation but can't do it now
-                    break;
-                }
-
-                _ = heap.remove();
-                if (self.tokenIsAlmostIndependentOfTokens(top_token_id, accepted_current_step_tokens[0..n_accepted])) {
-                    accepted_current_step_tokens[n_accepted] = top_token_id;
-                    n_accepted += 1;
-                } else {
-                    rejected_current_step_tokens[n_rejected] = top_token_id;
-                    n_rejected += 1;
-                }
-            }
-
-            // Return rejected tokens to heap
-            for (rejected_current_step_tokens[0..n_rejected]) |token_id| {
-                try heap.add(token_id);
-            }
-
-            // Add accepted tokens to vocabulary
-            for (accepted_current_step_tokens[0..n_accepted]) |token_id| {
-                const token_str = self.getTokenStr(token_id);
-                self.addToVocab(token_id);
-                try self.vocab_automaton.insert(token_str, token_id);
-
-                if (self.debug) {
-                    std.debug.print("  Added token {d}: \"", .{self.vocab_size});
-                    for (token_str) |byte| {
-                        if (byte >= 32 and byte < 127) {
-                            std.debug.print("{c}", .{byte});
-                        } else {
-                            std.debug.print("\\x{x:0>2}", .{byte});
-                        }
-                    }
-                    std.debug.print("\" (length: {d}, savings: {d:.2})\n", .{ token_str.len, self.candidate_stats[token_id].est_total_savings });
-                }
-
-                tokens_added += 1;
-                if (tokens_added >= batch_size) break;
-            }
-
-            try self.vocab_automaton.computeSuffixLinks();
-            self.current_step += 1;
-
-            if (n_accepted == 0) {
-                // No tokens added this round, avoid infinite loop
-                if (self.debug) {
-                    std.debug.print("  No tokens accepted in this round, stopping at {d}/{d}\n", .{ tokens_added, batch_size });
-                }
-                break;
-            }
-        }
-
-        const elapsed_ms = std.time.milliTimestamp() - start_time;
-        if (self.debug) {
-            std.debug.print("Completed batch processing in {d}ms. Added {d}/{d} tokens.\n", .{ elapsed_ms, tokens_added, batch_size });
-        }
-    }
-
-    // Main function to coordinate batch replacement
-    pub fn batchTokenReplacement(self: *VocabLearner, batch_count: usize, batch_size: usize, parallel_dp: *parallel.ParallelDP) !void {
-        const start_time = std.time.milliTimestamp();
-
-        if (self.debug) {
-            std.debug.print("\n=== Starting batch token replacement ===\n", .{});
-            std.debug.print("Creating {d} batches of {d} tokens each\n", .{ batch_count, batch_size });
-        }
-
-        // 1. Collect all non-essential tokens (tokens with ID >= 256)
-        var vocab_tokens = std.ArrayList(u32).init(self.allocator);
-        defer vocab_tokens.deinit();
-
-        for (0..self.n_token_ids) |id_usize| {
-            const id: u32 = @intCast(id_usize);
-            if (id >= 256 and self.candidate_stats[id].is_in_vocab) {
-                try vocab_tokens.append(id);
-            }
-        }
-
-        const available_tokens = vocab_tokens.items.len;
-        if (available_tokens < batch_size) {
-            if (self.debug) {
-                std.debug.print("Not enough non-essential tokens for replacement: {d} available, {d} needed per batch\n", .{ available_tokens, batch_size });
-            }
-            return;
-        }
-
-        // Determine how many batches we can create
-        const actual_batch_count = @min(batch_count, available_tokens / batch_size);
-
-        if (self.debug) {
-            std.debug.print("Found {d} eligible tokens, will create {d} batches\n", .{ available_tokens, actual_batch_count });
-        }
-
-        // 2. Shuffle the tokens
-        var prng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-        const random = prng.random();
-
-        {
-            var i = vocab_tokens.items.len;
-            while (i > 1) : (i -= 1) {
-                const j = random.uintLessThan(usize, i + 1); // Random index from 0 to i inclusive
-                const temp = vocab_tokens.items[i];
-                vocab_tokens.items[i] = vocab_tokens.items[j];
-                vocab_tokens.items[j] = temp;
-            }
-        }
-
-        // 3. Create and process batches
-        var batch = try self.allocator.alloc(u32, batch_size);
-        defer self.allocator.free(batch);
-
-        for (0..actual_batch_count) |batch_idx| {
-            if (self.debug) {
-                std.debug.print("\n--- Processing batch {d}/{d} ---\n", .{ batch_idx + 1, actual_batch_count });
-            }
-
-            // Fill the batch
-            const start_idx = batch_idx * batch_size;
-            for (0..batch_size) |i| {
-                batch[i] = vocab_tokens.items[start_idx + i];
-            }
-
-            // Process this batch with our optimized approach
-            try self.processTokenBatch(batch, parallel_dp);
-        }
-
-        const elapsed_sec = @as(f64, @floatFromInt(std.time.milliTimestamp() - start_time)) / 1000.0;
-        if (self.debug) {
-            std.debug.print("\n=== Completed batch token replacement in {d:.2}s ===\n", .{elapsed_sec});
-            std.debug.print("Processed {d} batches of {d} tokens each\n", .{ actual_batch_count, batch_size });
-            std.debug.print("Final vocabulary size: {d}\n", .{self.vocab_size});
         }
     }
 

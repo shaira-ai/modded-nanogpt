@@ -12,7 +12,7 @@ const MatchInfo = VocabLearnerModule.MatchInfo;
 const BoundedQueue = @import("spsc.zig").BoundedQueue;
 
 // Compile-time configuration for queue type
-const USE_SPMC_QUEUE = true;
+const USE_SPMC_QUEUE = false;
 
 /// Packed struct for coordinating thread pool state and notifications
 const Sync = packed struct {
@@ -364,13 +364,10 @@ const Node = if (USE_SPMC_QUEUE) struct {
     };
 } else void;
 
-const ProcessDocumentMessage = if (USE_SPMC_QUEUE) struct {
+const ProcessDocumentMessage = struct {
     id: usize,
     document: []const u8,
     automaton: *BakaCorasick,
-} else struct {
-    id: usize,
-    document: []const u8,
 };
 
 const CountTokensInDocumentMessage = if (USE_SPMC_QUEUE) struct {
@@ -404,7 +401,6 @@ const ErrorMessage = struct {
 
 const ResetMessage = struct {
     candidates: []SampleStats,
-    automaton: *BakaCorasick,
 };
 
 // Intrusive work task for SPMC mode
@@ -448,7 +444,6 @@ pub const Worker = struct {
     id: usize,
     vocab_learner: *VocabLearnerModule.VocabLearner,
     candidate_stats: []SampleStats,
-    candidate_automaton: *BakaCorasick,
     token_idx_to_least_end_pos: []u32,
     lookbacks: std.ArrayList(u64),
     dp_solution: std.ArrayList(u32),
@@ -479,7 +474,6 @@ pub const Worker = struct {
         allocator: Allocator,
         id: usize,
         vocab_learner: *VocabLearnerModule.VocabLearner,
-        candidate_automaton: *BakaCorasick,
         candidates_length: usize,
         submission_queue: if (USE_SPMC_QUEUE)
             *Node.Queue
@@ -500,7 +494,6 @@ pub const Worker = struct {
             .id = id,
             .vocab_learner = vocab_learner,
             .candidate_stats = candidate_stats,
-            .candidate_automaton = candidate_automaton,
             .token_idx_to_least_end_pos = token_idx_to_least_end_pos,
             .lookbacks = lookbacks,
             .dp_solution = dp_solution,
@@ -546,8 +539,14 @@ pub const Worker = struct {
     }
 
     // Conditional method signatures for exact SPSC compatibility
-    fn processDocument(self: *Worker, document: []const u8, doc_id: usize, automaton_param: if (USE_SPMC_QUEUE) *BakaCorasick else void, work_task_param: if (USE_SPMC_QUEUE) *WorkTask else void) !void {
-        const automaton = if (USE_SPMC_QUEUE) automaton_param else self.candidate_automaton;
+    fn processDocument(
+        self: *Worker,
+        document: []const u8,
+        doc_id: usize,
+        automaton_param: *BakaCorasick,
+        work_task_param: if (USE_SPMC_QUEUE) *WorkTask else void,
+    ) !void {
+        const automaton = automaton_param;
 
         try self.vocab_learner.evaluateCandidatesOnDocumentDP(
             self.candidate_stats[0..self.current_n_candidates],
@@ -715,7 +714,6 @@ pub const Worker = struct {
                     switch (msg) {
                         .Reset => |reset_message| {
                             const coordinator_stats = reset_message.candidates;
-                            const automaton = reset_message.automaton;
                             self.current_n_candidates = coordinator_stats.len;
                             if (self.candidate_stats.len < self.current_n_candidates) {
                                 @panic("oh no!1");
@@ -725,10 +723,9 @@ pub const Worker = struct {
                                 stats.sampled_savings = 0;
                                 stats.token_id = coordinator_stats[idx].token_id;
                             }
-                            self.candidate_automaton = automaton;
                         },
                         .ProcessDocument => |process_data| {
-                            self.processDocument(process_data.document, process_data.id, {}, {}) catch |err| {
+                            self.processDocument(process_data.document, process_data.id, process_data.automaton, {}) catch |err| {
                                 const error_msg = try std.fmt.allocPrint(self.allocator, "Error processing document: {s}", .{@errorName(err)});
                                 const error_message = CompletionQueueEntry{
                                     .Error = ErrorMessage{
@@ -1222,7 +1219,6 @@ pub const ParallelDP = struct {
     pub fn initWorkers(
         self: *ParallelDP,
         candidates: []SampleStats,
-        automaton: *BakaCorasick,
     ) !void {
         if (self.debug) {
             std.debug.print("[ParallelDP] Initializing {d} workers with {d} candidates\n", .{ self.num_workers, candidates.len });
@@ -1235,7 +1231,7 @@ pub const ParallelDP = struct {
                 else
                     &self.submission_queues[i];
 
-                self.workers[i] = try Worker.init(self.allocator, i, self.vocab_learner, automaton, candidates.len, submission_queue, &self.completion_queues[i], self.debug);
+                self.workers[i] = try Worker.init(self.allocator, i, self.vocab_learner, candidates.len, submission_queue, &self.completion_queues[i], self.debug);
 
                 // Set up SPMC-specific worker fields
                 if (USE_SPMC_QUEUE) {
@@ -1268,14 +1264,12 @@ pub const ParallelDP = struct {
                     stats.sampled_savings = 0;
                     stats.token_id = candidates[idx].token_id;
                 }
-                self.workers[i].candidate_automaton = automaton;
             }
         } else {
             for (0..self.num_workers) |i| {
                 const msg = SubmissionQueueEntry{
                     .Reset = .{
                         .candidates = candidates,
-                        .automaton = automaton,
                     },
                 };
                 _ = self.sendMessageToWorker(i, msg, false);
@@ -1283,18 +1277,44 @@ pub const ParallelDP = struct {
         }
     }
 
-    pub fn initWorkersForCorpusTokenCount(self: *ParallelDP) !void {
+    pub fn initWorkersForCorpusTokenCount(
+        self: *ParallelDP,
+    ) !void {
         if (self.debug) {
             std.debug.print("[ParallelDP] Initializing {d} workers for corpus token count\n", .{self.num_workers});
         }
 
         if (!self.started_workers) {
-            return error.FixMePlz;
-        }
+            const candidates_len = self.vocab_learner.n_token_ids;
+            for (0..self.num_workers) |i| {
+                const submission_queue = if (USE_SPMC_QUEUE)
+                    &self.submission_queues
+                else
+                    &self.submission_queues[i];
 
-        if (USE_SPMC_QUEUE) {
-            self.n_outstanding_jobs.store(0, .release);
-            self.shutdown_flag.store(false, .release);
+                self.workers[i] = try Worker.init(self.allocator, i, self.vocab_learner, candidates_len, submission_queue, &self.completion_queues[i], self.debug);
+
+                // Set up SPMC-specific worker fields
+                if (USE_SPMC_QUEUE) {
+                    self.workers[i].workers = self.workers;
+                    self.workers[i].shutdown_flag = &self.shutdown_flag;
+                    self.workers[i].coordinator = self;
+                }
+            }
+
+            // Start all workers
+            for (0..self.num_workers) |i| {
+                try self.workers[i].start();
+            }
+
+            // Initialize sync state with spawned thread count
+            if (USE_SPMC_QUEUE) {
+                var sync = @as(Sync, @bitCast(self.sync.load(.monotonic)));
+                sync.spawned = @intCast(self.num_workers);
+                self.sync.store(@bitCast(sync), .release);
+            }
+
+            self.started_workers = true;
         }
     }
 
@@ -1340,7 +1360,7 @@ pub const ParallelDP = struct {
             self.resetWorkTaskPool();
         }
 
-        try self.initWorkers(candidates, candidate_automaton);
+        try self.initWorkers(candidates);
 
         var documents_processed: usize = 0;
         var documents_submitted: usize = 0;
@@ -1425,6 +1445,7 @@ pub const ParallelDP = struct {
                             .ProcessDocument = ProcessDocumentMessage{
                                 .id = doc_idx,
                                 .document = doc,
+                                .automaton = candidate_automaton,
                             },
                         };
 
