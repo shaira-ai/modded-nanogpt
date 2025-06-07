@@ -1178,9 +1178,17 @@ pub const ParallelDP = struct {
         return work_task;
     }
 
-    fn recycleWorkTask(self: *ParallelDP, task: *WorkTask) void {
+    fn recycleWorkTask(self: *ParallelDP, task: *WorkTask, comptime DataLoaderType: type) void {
         if (!USE_SPMC_QUEUE) {
             @panic("recycleWorkTask() should only be called in SPMC mode");
+        }
+
+        if (DataLoaderType.NEEDS_DEALLOCATION) {
+            switch (task.data) {
+                .ProcessDocument => |data| self.allocator.free(data.document),
+                .CountTokensInDocument => |data| self.allocator.free(data.document),
+                .Shutdown => {},
+            }
         }
 
         // Lock-free push to recycled stack
@@ -1350,7 +1358,7 @@ pub const ParallelDP = struct {
                         switch (msg) {
                             .DocumentProcessed => |doc_processed_msg| {
                                 // Recycle the work task for reuse
-                                self.recycleWorkTask(doc_processed_msg.work_task);
+                                self.recycleWorkTask(doc_processed_msg.work_task, DataLoaderType);
                                 documents_processed += 1;
                             },
                             .TokenCount => {
@@ -1455,9 +1463,9 @@ pub const ParallelDP = struct {
     pub fn updateMaxSavingsByTokenizingCandidates(
         self: *ParallelDP,
         candidates: []u32,
+        loader: anytype,
     ) !void {
         const start_time = time.nanoTimestamp();
-
         if (USE_SPMC_QUEUE) {
             self.resetWorkTaskPool();
         }
@@ -1491,9 +1499,10 @@ pub const ParallelDP = struct {
                                 const new_savings: f64 = @floatFromInt(occurrence_count * (token_count - 1));
                                 stats.est_total_savings = @min(old_est_savings, new_savings);
                             }
+                            const DataLoaderType = @TypeOf(loader.*);
                             // Recycle the work task for reuse in SPMC mode
                             if (USE_SPMC_QUEUE) {
-                                self.recycleWorkTask(token_count_msg.work_task);
+                                self.recycleWorkTask(token_count_msg.work_task, DataLoaderType);
                             }
                             documents_processed += 1;
                         },
@@ -1593,7 +1602,7 @@ pub const ParallelDP = struct {
                                 self.removeFromPendingDocuments(token_count_msg.id, DataLoaderType);
                             } else {
                                 // Recycle the work task for reuse
-                                self.recycleWorkTask(token_count_msg.work_task);
+                                self.recycleWorkTask(token_count_msg.work_task, DataLoaderType);
                             }
                             ret += token_count_msg.token_count;
                             documents_processed += 1;

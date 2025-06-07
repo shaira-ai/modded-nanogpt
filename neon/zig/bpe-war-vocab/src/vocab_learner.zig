@@ -895,7 +895,13 @@ pub const VocabLearner = struct {
                         for (0..candidates_to_tokenize.len) |i| {
                             candidates_to_tokenize[i] = heap.remove();
                         }
-                        try parallel_dp.updateMaxSavingsByTokenizingCandidates(candidates_to_tokenize);
+                        if (self.use_in_memory) {
+                            const loader = self.getLoader(InMemoryDataLoader);
+                            try parallel_dp.updateMaxSavingsByTokenizingCandidates(candidates_to_tokenize, loader);
+                        } else {
+                            const loader = self.getLoader(fineweb);
+                            try parallel_dp.updateMaxSavingsByTokenizingCandidates(candidates_to_tokenize, loader);
+                        }
                         for (0..candidates_to_tokenize.len) |i| {
                             try tokenize_candidates_heap.add(candidates_to_tokenize[i]);
                         }
@@ -998,7 +1004,13 @@ pub const VocabLearner = struct {
                     for (0..candidates_to_tokenize.len) |i| {
                         candidates_to_tokenize[i] = heap.remove();
                     }
-                    try parallel_dp.updateMaxSavingsByTokenizingCandidates(candidates_to_tokenize);
+                    if (self.use_in_memory) {
+                        const loader = self.getLoader(InMemoryDataLoader);
+                        try parallel_dp.updateMaxSavingsByTokenizingCandidates(candidates_to_tokenize, loader);
+                    } else {
+                        const loader = self.getLoader(fineweb);
+                        try parallel_dp.updateMaxSavingsByTokenizingCandidates(candidates_to_tokenize, loader);
+                    }
                     for (0..candidates_to_tokenize.len) |i| {
                         try tokenize_candidates_heap.add(candidates_to_tokenize[i]);
                     }
@@ -2137,21 +2149,21 @@ pub const VocabLearner = struct {
         return try std.fs.path.join(allocator, &[_][]const u8{ cwd, file_path });
     }
 
-    fn hashFile(allocator: std.mem.Allocator, file_path: []const u8, file_size: u64, seed: u64) !u64 {
-        const abs_path = try getAbsolutePath(allocator, file_path);
-        defer allocator.free(abs_path);
-
+    fn hashFile(allocator: std.mem.Allocator, file_path: []const u8, seed: u64) !u64 {
         var hasher = std.crypto.hash.Sha1.init(.{});
 
         var seed_bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &seed_bytes, seed, .little);
         hasher.update(&seed_bytes);
 
-        hasher.update(abs_path);
+        // Read and hash file content
+        const file = try std.fs.cwd().openFile(file_path, .{});
+        defer file.close();
 
-        var size_bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &size_bytes, file_size, .little);
-        hasher.update(&size_bytes);
+        const content = try file.readToEndAlloc(allocator, std.math.maxInt(usize));
+        defer allocator.free(content);
+
+        hasher.update(content);
 
         // Get SHA1 result (20 bytes) and truncate to u64
         var hash_result: [20]u8 = undefined;
@@ -2197,9 +2209,7 @@ pub const VocabLearner = struct {
         // Write file identifiers (hashes of file paths and sizes)
         for (corpus_files.items) |corpus_file| {
             // Get file size for better uniqueness
-            const file_info = try std.fs.cwd().statFile(corpus_file);
-
-            const hash = try hashFile(self.allocator, corpus_file, file_info.size, self.file_hash_seed);
+            const hash = try hashFile(self.allocator, corpus_file, self.file_hash_seed);
             var hash_bytes: [8]u8 = undefined;
             std.mem.writeInt(u64, &hash_bytes, hash, .little);
             try file.writeAll(&hash_bytes);
