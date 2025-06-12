@@ -761,30 +761,40 @@ pub const VocabLearner = struct {
         return true;
     }
 
-    fn updateCoveredOccurrences(self: *VocabLearner, id: u32, cover_step: u64) void {
-        const my_covered_step = self.candidate_stats[id].covered_step;
-        if (my_covered_step == cover_step) {
-            return;
-        }
-        const my_len = self.candidate_stats[id].str_len;
-        const my_str = self.getTokenStr(id);
-        var n_covered_occurrences: u64 = 0;
+    fn updateCoveredOccurrences(
+        self: *VocabLearner,
+        candidate_automaton: *const BakaCorasick,
+    ) void {
         for (0..self.candidate_stats.len) |i_usize| {
             const i: u32 = @intCast(i_usize);
-            const supertoken_len = self.candidate_stats[i].str_len;
-            const is_in_vocab = self.candidate_stats[i].is_in_vocab;
-            if (is_in_vocab and supertoken_len > my_len) {
-                const supertoken_str = self.getTokenStr(i);
+            if (self.candidate_stats[i].is_in_vocab) {
+                const document = self.getTokenStr(i);
                 const increment = self.candidate_stats[i].n_uses_for_cover;
-                for (0..supertoken_len - my_len) |j| {
-                    if (std.mem.eql(u8, my_str, supertoken_str[j .. j + my_len])) {
-                        n_covered_occurrences += increment;
+                // Scan text with the automaton
+                var can_state: u32 = 0;
+                for (document) |byte| {
+                    can_state = candidate_automaton.transitions[can_state][byte];
+
+                    // Check if this state represents a match
+                    {
+                        const token_id = candidate_automaton.info[can_state].token_id;
+                        if (token_id != BakaCorasick.NO_TOKEN) {
+                            self.candidate_stats[token_id].n_covered_occurrences += increment;
+                        }
+                    }
+
+                    // Check suffix links for additional matches
+                    var suffix = candidate_automaton.info[can_state].green;
+                    while (suffix != 0) {
+                        const token_id = candidate_automaton.info[suffix].token_id;
+                        if (token_id != BakaCorasick.NO_TOKEN) {
+                            self.candidate_stats[token_id].n_covered_occurrences += increment;
+                        }
+                        suffix = candidate_automaton.info[suffix].green;
                     }
                 }
             }
         }
-        self.candidate_stats[id].covered_step = cover_step;
-        self.candidate_stats[id].n_covered_occurrences = n_covered_occurrences;
     }
 
     fn ensureSomeCandidatesLookGoodAfterUpdatingBound(
@@ -796,6 +806,7 @@ pub const VocabLearner = struct {
         parallel_dp: *parallel.ParallelDP,
         tokenize_candidates_scratch: *std.ArrayList(u32),
         cover_step: u64,
+        candidate_automaton: *BakaCorasick,
     ) !void {
         const n_to_tokenize_increase_per_repeat: usize = 500;
         const n_to_tokenize_decrease_when_no_repeats: usize = 100;
@@ -809,11 +820,23 @@ pub const VocabLearner = struct {
                 repeated = true;
                 try candidates_to_tokenize_arraylist.resize(n_candidates_to_tokenize.*);
             }
+            var any_candidates_need_covered_update = false;
+            candidate_automaton.clear();
             const candidates_to_tokenize = candidates_to_tokenize_arraylist.items;
             for (0..candidates_to_tokenize.len) |i| {
-                candidates_to_tokenize[i] = heap.remove();
-                // TODO: don't do this on the main thread?
-                self.updateCoveredOccurrences(candidates_to_tokenize[i], cover_step);
+                const id = heap.remove();
+                candidates_to_tokenize[i] = id;
+                if (self.candidate_stats[id].covered_step != cover_step) {
+                    try candidate_automaton.insert(self.getTokenStr(id), id);
+                    any_candidates_need_covered_update = true;
+                    self.candidate_stats[id].n_covered_occurrences = 0;
+                    self.candidate_stats[id].covered_step = cover_step;
+                }
+            }
+            if (any_candidates_need_covered_update) {
+                try candidate_automaton.computeSuffixLinks();
+                // TODO: maybe this shouldn't be single-threaded.
+                self.updateCoveredOccurrences(candidate_automaton);
             }
             if (self.use_in_memory) {
                 const loader = self.getLoader(InMemoryDataLoader);
@@ -1021,6 +1044,7 @@ pub const VocabLearner = struct {
                     &parallel_dp,
                     &tokenize_candidates_scratch,
                     cover_step,
+                    &candidate_automaton,
                 );
             }
 
@@ -1082,6 +1106,7 @@ pub const VocabLearner = struct {
                 &parallel_dp,
                 &tokenize_candidates_scratch,
                 cover_step,
+                &candidate_automaton,
             );
 
             const iteration_elapsed = std.time.milliTimestamp() - iteration_start;
