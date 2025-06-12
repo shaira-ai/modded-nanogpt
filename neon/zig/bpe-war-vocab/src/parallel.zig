@@ -409,6 +409,7 @@ const WorkTask = if (USE_SPMC_QUEUE) struct {
     data: union(enum) {
         ProcessDocument: ProcessDocumentMessage,
         CountTokensInDocument: CountTokensInDocumentMessage,
+        CountTokensInCandidate: CountTokensInDocumentMessage,
         Shutdown: usize,
     },
     recycle_next: ?*WorkTask = null,
@@ -429,6 +430,7 @@ const SubmissionQueueEntry = if (USE_SPMC_QUEUE) WorkTask else union(enum) {
     Reset: ResetMessage,
     ProcessDocument: ProcessDocumentMessage,
     CountTokensInDocument: CountTokensInDocumentMessage,
+    CountTokensInCandidate: CountTokensInDocumentMessage,
     Shutdown: usize,
 };
 
@@ -443,10 +445,12 @@ pub const Worker = struct {
     allocator: Allocator,
     id: usize,
     vocab_learner: *VocabLearnerModule.VocabLearner,
+    counts_for_cover: []u64,
     candidate_stats: []SampleStats,
     token_idx_to_least_end_pos: []u32,
     lookbacks: std.ArrayList(u64),
     dp_solution: std.ArrayList(u32),
+    token_lens: std.ArrayList(u32),
     matches: std.ArrayList(MatchInfo),
 
     submission_queue: if (USE_SPMC_QUEUE)
@@ -484,19 +488,23 @@ pub const Worker = struct {
     ) !Worker {
         const lookbacks = std.ArrayList(u64).init(allocator);
         const dp_solution = std.ArrayList(u32).init(allocator);
+        const token_lens = std.ArrayList(u32).init(allocator);
         const matches = std.ArrayList(MatchInfo).init(allocator);
 
         const token_idx_to_least_end_pos = try allocator.alloc(u32, candidates_length);
         const candidate_stats = try allocator.alloc(SampleStats, candidates_length);
+        const counts_for_cover = try allocator.alloc(u64, vocab_learner.candidate_stats.len);
 
         return Worker{
             .allocator = allocator,
             .id = id,
             .vocab_learner = vocab_learner,
+            .counts_for_cover = counts_for_cover,
             .candidate_stats = candidate_stats,
             .token_idx_to_least_end_pos = token_idx_to_least_end_pos,
             .lookbacks = lookbacks,
             .dp_solution = dp_solution,
+            .token_lens = token_lens,
             .matches = matches,
             .submission_queue = submission_queue,
             .completion_queue = completion_queue,
@@ -579,8 +587,38 @@ pub const Worker = struct {
         }
     }
 
-    fn countTokensInDocument(self: *Worker, document: []const u8, doc_id: usize, work_task_param: if (USE_SPMC_QUEUE) *WorkTask else void) !void {
-        const token_count = try self.vocab_learner.getDocumentTokenCount(document, &self.lookbacks, &self.dp_solution);
+    fn countTokensInDocument(
+        self: *Worker,
+        document: []const u8,
+        doc_id: usize,
+        work_task_param: if (USE_SPMC_QUEUE) *WorkTask else void,
+    ) !void {
+        try self.countTokensInDocumentInner(document, doc_id, true, work_task_param);
+    }
+
+    fn countTokensInCandidate(
+        self: *Worker,
+        document: []const u8,
+        doc_id: usize,
+        work_task_param: if (USE_SPMC_QUEUE) *WorkTask else void,
+    ) !void {
+        try self.countTokensInDocumentInner(document, doc_id, false, work_task_param);
+    }
+
+    fn countTokensInDocumentInner(
+        self: *Worker,
+        document: []const u8,
+        doc_id: usize,
+        comptime record_counts: bool,
+        work_task_param: if (USE_SPMC_QUEUE) *WorkTask else void,
+    ) !void {
+        const token_count = try self.vocab_learner.getDocumentTokenCount(
+            document,
+            &self.lookbacks,
+            &self.dp_solution,
+            &self.token_lens,
+            if (record_counts) self.counts_for_cover else {},
+        );
 
         const result_msg = if (USE_SPMC_QUEUE)
             CompletionQueueEntry{
@@ -694,6 +732,19 @@ pub const Worker = struct {
                                 _ = self.completion_queue.push(error_message);
                             };
                         },
+                        .CountTokensInCandidate => |count_tokens_in_candidate| {
+                            self.countTokensInCandidate(count_tokens_in_candidate.document, count_tokens_in_candidate.id, work_task) catch |err| {
+                                const error_msg = std.fmt.allocPrint(self.allocator, "Error counting tokens in candidate: {s}", .{@errorName(err)}) catch "OutOfMemory";
+                                defer if (!std.mem.eql(u8, error_msg, "OutOfMemory")) self.allocator.free(error_msg);
+                                const error_message = CompletionQueueEntry{
+                                    .Error = ErrorMessage{
+                                        .worker_id = self.id,
+                                        .message = error_msg,
+                                    },
+                                };
+                                _ = self.completion_queue.push(error_message);
+                            };
+                        },
                         .Shutdown => {
                             if (self.debug) {
                                 std.debug.print("[Worker {d}] Shutting down\n", .{self.id});
@@ -739,6 +790,18 @@ pub const Worker = struct {
                         .CountTokensInDocument => |count_tokens_in_document| {
                             self.countTokensInDocument(count_tokens_in_document.document, count_tokens_in_document.id, {}) catch |err| {
                                 const error_msg = try std.fmt.allocPrint(self.allocator, "Error counting tokens in document: {s}", .{@errorName(err)});
+                                const error_message = CompletionQueueEntry{
+                                    .Error = ErrorMessage{
+                                        .worker_id = self.id,
+                                        .message = error_msg,
+                                    },
+                                };
+                                _ = self.completion_queue.push(error_message);
+                            };
+                        },
+                        .CountTokensInCandidate => |count_tokens_in_candidate| {
+                            self.countTokensInCandidate(count_tokens_in_candidate.document, count_tokens_in_candidate.id, {}) catch |err| {
+                                const error_msg = try std.fmt.allocPrint(self.allocator, "Error counting tokens in candidate: {s}", .{@errorName(err)});
                                 const error_message = CompletionQueueEntry{
                                     .Error = ErrorMessage{
                                         .worker_id = self.id,
@@ -1184,6 +1247,7 @@ pub const ParallelDP = struct {
             switch (task.data) {
                 .ProcessDocument => |data| self.allocator.free(data.document),
                 .CountTokensInDocument => |data| self.allocator.free(data.document),
+                .CountTokensInCandidate => {},
                 .Shutdown => {},
             }
         }
@@ -1231,7 +1295,15 @@ pub const ParallelDP = struct {
                 else
                     &self.submission_queues[i];
 
-                self.workers[i] = try Worker.init(self.allocator, i, self.vocab_learner, candidates.len, submission_queue, &self.completion_queues[i], self.debug);
+                self.workers[i] = try Worker.init(
+                    self.allocator,
+                    i,
+                    self.vocab_learner,
+                    candidates.len,
+                    submission_queue,
+                    &self.completion_queues[i],
+                    self.debug,
+                );
 
                 // Set up SPMC-specific worker fields
                 if (USE_SPMC_QUEUE) {
@@ -1292,7 +1364,15 @@ pub const ParallelDP = struct {
                 else
                     &self.submission_queues[i];
 
-                self.workers[i] = try Worker.init(self.allocator, i, self.vocab_learner, candidates_len, submission_queue, &self.completion_queues[i], self.debug);
+                self.workers[i] = try Worker.init(
+                    self.allocator,
+                    i,
+                    self.vocab_learner,
+                    candidates_len,
+                    submission_queue,
+                    &self.completion_queues[i],
+                    self.debug,
+                );
 
                 // Set up SPMC-specific worker fields
                 if (USE_SPMC_QUEUE) {
@@ -1516,7 +1596,8 @@ pub const ParallelDP = struct {
                             if (token_count < old_token_count) {
                                 stats.len_in_tokens = token_count;
                                 const old_est_savings = stats.est_total_savings;
-                                const occurrence_count = stats.n_nonoverlapping_occurrences;
+                                // TODO: this is wrong, should be min(n_nonoverlapping_occurrences, n_occurrences - n_covered_occurrences)
+                                const occurrence_count = stats.n_nonoverlapping_occurrences - stats.n_covered_occurrences;
                                 const new_savings: f64 = @floatFromInt(occurrence_count * (token_count - 1));
                                 stats.est_total_savings = @min(old_est_savings, new_savings);
                             }
@@ -1554,7 +1635,7 @@ pub const ParallelDP = struct {
                         const work_task = try self.allocateWorkTask();
                         work_task.* = WorkTask{
                             .data = .{
-                                .CountTokensInDocument = CountTokensInDocumentMessage{
+                                .CountTokensInCandidate = CountTokensInDocumentMessage{
                                     .id = documents_submitted,
                                     .document = doc,
                                 },
@@ -1563,7 +1644,7 @@ pub const ParallelDP = struct {
                         self.scheduleWork(work_task);
                     } else {
                         const msg = SubmissionQueueEntry{
-                            .CountTokensInDocument = CountTokensInDocumentMessage{
+                            .CountTokensInCandidate = CountTokensInDocumentMessage{
                                 .id = documents_submitted,
                                 .document = doc,
                             },
@@ -1598,6 +1679,13 @@ pub const ParallelDP = struct {
         }
 
         try self.initWorkersForCorpusTokenCount();
+
+        for (self.vocab_learner.candidate_stats) |*stats| {
+            stats.n_uses_for_cover = 0;
+        }
+        for (self.workers) |worker| {
+            @memset(worker.counts_for_cover, 0);
+        }
 
         var documents_processed: usize = 0;
         var documents_submitted: usize = 0;
@@ -1687,6 +1775,12 @@ pub const ParallelDP = struct {
             }
 
             if (maybe_doc == null and documents_processed == documents_submitted) {
+                const learner_candidate_stats = self.vocab_learner.candidate_stats;
+                for (self.workers) |worker| {
+                    for (0..worker.counts_for_cover.len) |i| {
+                        learner_candidate_stats[i].n_uses_for_cover += worker.counts_for_cover[i];
+                    }
+                }
                 if (self.debug) {
                     const elapsed = time.nanoTimestamp() - start_time;
                     std.debug.print("[ParallelDP] Processed {d} documents in {d:.2}ms\n", .{ documents_processed, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
