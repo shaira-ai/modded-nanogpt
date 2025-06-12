@@ -1597,7 +1597,7 @@ pub const ParallelDP = struct {
                                 stats.len_in_tokens = token_count;
                                 const old_est_savings = stats.est_total_savings;
                                 // TODO: this is wrong, should be min(n_nonoverlapping_occurrences, n_occurrences - n_covered_occurrences)
-                                const occurrence_count = stats.n_nonoverlapping_occurrences - stats.n_covered_occurrences;
+                                const occurrence_count = stats.n_nonoverlapping_occurrences -| stats.n_covered_occurrences;
                                 const new_savings: f64 = @floatFromInt(occurrence_count * (token_count - 1));
                                 stats.est_total_savings = @min(old_est_savings, new_savings);
                             }

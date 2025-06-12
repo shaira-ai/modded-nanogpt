@@ -1016,8 +1016,7 @@ pub const VocabLearner = struct {
                     // Only update estimates if we have enough data
                     if (sampled_occurrences >= 5) {
                         const sampled_savings = sample_stats.sampled_savings;
-                        // TODO: this is incorrect!!!
-                        const total_occurrences = self.candidate_stats[token_id].n_nonoverlapping_occurrences - self.candidate_stats[token_id].n_covered_occurrences;
+                        const total_occurrences = self.candidate_stats[token_id].n_nonoverlapping_occurrences;
                         const est_savings = @as(f64, @floatFromInt(sampled_savings)) * @as(f64, @floatFromInt(total_occurrences)) / @as(f64, @floatFromInt(sampled_occurrences));
                         const token_count = self.candidate_stats[token_id].len_in_tokens;
                         const max_est_savings: f64 = @floatFromInt(total_occurrences * (token_count - 1));
