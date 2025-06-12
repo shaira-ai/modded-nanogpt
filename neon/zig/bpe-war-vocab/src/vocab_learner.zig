@@ -953,6 +953,20 @@ pub const VocabLearner = struct {
 
             // At the start of buildVocabulary loop
             while (true) {
+                // Recalculate upper bounds of candidates from heap until the top k
+                // candidates are some that have just had their upper bound calculated.
+                // Avoids expensive sampling on candidates that are predictably not good.
+                try self.ensureSomeCandidatesLookGoodAfterUpdatingBound(
+                    &heap,
+                    &tokenize_candidates_heap,
+                    &n_candidates_to_tokenize,
+                    &candidates_to_tokenize_arraylist,
+                    &parallel_dp,
+                    &tokenize_candidates_scratch,
+                    cover_step,
+                    &candidate_automaton,
+                );
+
                 // Extract candidates that haven't been evaluated yet
                 //if (!cleanup_mode) {
                 for (n_candidates..self.top_k_candidates) |i| {
@@ -1002,7 +1016,8 @@ pub const VocabLearner = struct {
                     // Only update estimates if we have enough data
                     if (sampled_occurrences >= 5) {
                         const sampled_savings = sample_stats.sampled_savings;
-                        const total_occurrences = self.candidate_stats[token_id].n_nonoverlapping_occurrences;
+                        // TODO: this is incorrect!!!
+                        const total_occurrences = self.candidate_stats[token_id].n_nonoverlapping_occurrences - self.candidate_stats[token_id].n_covered_occurrences;
                         const est_savings = @as(f64, @floatFromInt(sampled_savings)) * @as(f64, @floatFromInt(total_occurrences)) / @as(f64, @floatFromInt(sampled_occurrences));
                         const token_count = self.candidate_stats[token_id].len_in_tokens;
                         const max_est_savings: f64 = @floatFromInt(total_occurrences * (token_count - 1));
@@ -1036,16 +1051,6 @@ pub const VocabLearner = struct {
                         break;
                     }
                 }
-                try self.ensureSomeCandidatesLookGoodAfterUpdatingBound(
-                    &heap,
-                    &tokenize_candidates_heap,
-                    &n_candidates_to_tokenize,
-                    &candidates_to_tokenize_arraylist,
-                    &parallel_dp,
-                    &tokenize_candidates_scratch,
-                    cover_step,
-                    &candidate_automaton,
-                );
             }
 
             var n_accepted: usize = 0;
@@ -1097,17 +1102,6 @@ pub const VocabLearner = struct {
             }
 
             try self.vocab_automaton.computeSuffixLinks();
-
-            try self.ensureSomeCandidatesLookGoodAfterUpdatingBound(
-                &heap,
-                &tokenize_candidates_heap,
-                &n_candidates_to_tokenize,
-                &candidates_to_tokenize_arraylist,
-                &parallel_dp,
-                &tokenize_candidates_scratch,
-                cover_step,
-                &candidate_automaton,
-            );
 
             const iteration_elapsed = std.time.milliTimestamp() - iteration_start;
             if (self.debug) {
