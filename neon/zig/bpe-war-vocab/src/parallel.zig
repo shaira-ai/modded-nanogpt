@@ -1357,7 +1357,7 @@ pub const ParallelDP = struct {
         }
 
         if (!self.started_workers) {
-            const candidates_len = self.vocab_learner.n_token_ids;
+            const candidates_len = self.vocab_learner.top_k_candidates;
             for (0..self.num_workers) |i| {
                 const submission_queue = if (USE_SPMC_QUEUE)
                     &self.submission_queues
