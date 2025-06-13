@@ -16,6 +16,7 @@ pub const TokenStats = extern struct {
     n_covered_occurrences: u64 = 0,
     n_occurrences: u64 = 0,
     n_nonoverlapping_occurrences: u64 = 0,
+    n_total_occurrences: u64 = 0,
     sampled_occurrences: u64 = 0,
     sampled_savings: u64 = 0,
     sampled_step: u64 = 0,
@@ -84,6 +85,7 @@ pub const DocumentSampler = struct {
 };
 
 const STATS_MAGIC = "TOKSTAT".*;
+const STATS_MAGIC_V2 = "TOKSTAV".*;
 const STATS_HEADER_SIZE = 64; // Increased to 64 bytes for more flexibility
 
 const StatsHeader = extern struct {
@@ -152,7 +154,7 @@ pub const VocabLearner = struct {
     vocab_size: u32,
     tokenset_contents: []const u8,
     // Parameters
-    max_token_length: u32 = 60,
+    max_token_length: u32 = 10,
     max_vocab_size: u32,
     top_k_candidates: u32,
     batch_size: u32,
@@ -445,6 +447,7 @@ pub const VocabLearner = struct {
                 {
                     const token_id = batch_automaton.info[current_state].token_id;
                     if (token_id != BakaCorasick.NO_TOKEN) {
+                        token_id_to_stats[token_id].n_total_occurrences += 1;
                         const token_len = batch_automaton.info[current_state].depth;
                         if (position.* >= token_id_to_stats[token_id].next_valid_position) {
                             const next_valid_position = position.* + token_len;
@@ -459,6 +462,7 @@ pub const VocabLearner = struct {
                 while (suffix != 0) {
                     const token_id = batch_automaton.info[suffix].token_id;
                     if (token_id != BakaCorasick.NO_TOKEN) {
+                        token_id_to_stats[token_id].n_total_occurrences += 1;
                         const token_len = batch_automaton.info[suffix].depth;
                         if (position.* >= token_id_to_stats[token_id].next_valid_position) {
                             const next_valid_position = position.* + token_len;
@@ -498,12 +502,13 @@ pub const VocabLearner = struct {
         const automaton_size = 10_000_000;
         std.debug.print("Using target automaton size of {d} states\n", .{automaton_size});
 
-        const NonoverlappingStats = struct {
+        const Stats = struct {
             n_nonoverlapping_occurrences: u64,
+            n_total_occurrences: u64,
             next_valid_position: u64,
         };
 
-        const token_id_to_stats = try self.allocator.alloc(NonoverlappingStats, self.n_token_ids);
+        const token_id_to_stats = try self.allocator.alloc(Stats, self.n_token_ids);
         defer self.allocator.free(token_id_to_stats);
 
         const token_ids_buffer = try self.allocator.alloc(u32, self.n_token_ids);
@@ -528,6 +533,7 @@ pub const VocabLearner = struct {
 
         for (self.candidate_stats) |*stats| {
             stats.n_nonoverlapping_occurrences = 0;
+            stats.n_total_occurrences = 0;
             stats.est_total_savings = 0;
         }
 
@@ -541,7 +547,7 @@ pub const VocabLearner = struct {
             batch_automaton.clear();
 
             // reset stats for this batch
-            @memset(token_id_to_stats, .{ .n_nonoverlapping_occurrences = 0, .next_valid_position = 0 });
+            @memset(token_id_to_stats, .{ .n_nonoverlapping_occurrences = 0, .n_total_occurrences = 0, .next_valid_position = 0 });
 
             // add tokens until we reach target automaton size
             var current_idx = start_idx;
@@ -590,6 +596,7 @@ pub const VocabLearner = struct {
                 const token_id = tokens_to_process[idx];
                 self.candidate_stats[token_id].n_nonoverlapping_occurrences =
                     token_id_to_stats[token_id].n_nonoverlapping_occurrences;
+                self.candidate_stats[token_id].n_total_occurrences = token_id_to_stats[token_id].n_total_occurrences;
                 self.candidate_stats[token_id].est_total_savings = @floatFromInt(token_id_to_stats[token_id].n_nonoverlapping_occurrences *
                     (self.candidate_stats[token_id].str_len - 1));
             }
@@ -625,6 +632,7 @@ pub const VocabLearner = struct {
         for (0..256) |id| {
             const token_id: u32 = @intCast(id);
             self.candidate_stats[token_id].n_nonoverlapping_occurrences = single_byte_counts[id];
+            self.candidate_stats[token_id].n_total_occurrences = single_byte_counts[id];
             self.candidate_stats[token_id].est_total_savings = 0;
         }
 
@@ -1845,7 +1853,7 @@ pub const VocabLearner = struct {
 
         // Create and write header
         const header = StatsHeader{
-            .magic = STATS_MAGIC,
+            .magic = STATS_MAGIC_V2,
             .pad_a = [_]u8{0},
             .pad_b = [_]u8{0} ** 4,
             .vocab_size = @intCast(self.vocab_size),
@@ -1883,10 +1891,15 @@ pub const VocabLearner = struct {
             std.mem.writeInt(u32, &id_bytes, id, .little);
             try file.writeAll(&id_bytes);
 
-            // Write occurrence count
+            // Write non-overlapping occurrence count
             var occur_bytes: [8]u8 = undefined;
             std.mem.writeInt(u64, &occur_bytes, stats.n_nonoverlapping_occurrences, .little);
             try file.writeAll(&occur_bytes);
+
+            // Write total occurrence count
+            var total_occur_bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &total_occur_bytes, stats.n_total_occurrences, .little);
+            try file.writeAll(&total_occur_bytes);
 
             // Write estimated savings
             var savings_bytes: [8]u8 = undefined;
@@ -1946,7 +1959,10 @@ pub const VocabLearner = struct {
         }
 
         // Validate magic number
-        if (!std.mem.eql(u8, &header.magic, &STATS_MAGIC)) {
+        const is_old_format = std.mem.eql(u8, &header.magic, &STATS_MAGIC);
+        const is_new_format = std.mem.eql(u8, &header.magic, &STATS_MAGIC_V2);
+
+        if (!is_old_format and !is_new_format) {
             if (self.debug) {
                 std.debug.print("Invalid magic number in statistics file.\n", .{});
             }
@@ -2023,40 +2039,78 @@ pub const VocabLearner = struct {
         }
 
         // Load token statistics
-        for (0..self.n_token_ids) |_| {
-            var id_bytes: [4]u8 = undefined;
-            var occur_bytes: [8]u8 = undefined;
-            var savings_bytes: [8]u8 = undefined;
-            var sampled_occur_bytes: [8]u8 = undefined;
-            var sampled_savings_bytes: [8]u8 = undefined;
-            var step_bytes: [8]u8 = undefined;
-
-            // Read token ID
-            if (try file.readAll(&id_bytes) != 4) return false;
-            const id = std.mem.readInt(u32, &id_bytes, .little);
-
-            // Verify ID is within range
-            if (id >= self.n_token_ids) {
-                if (self.debug) {
-                    std.debug.print("Invalid token ID in file: {d}\n", .{id});
-                }
-                return false;
+        if (is_new_format) {
+            if (self.debug) {
+                std.debug.print("Loading new format file...\n", .{});
             }
 
-            // Read statistics
-            if (try file.readAll(&occur_bytes) != 8) return false;
-            if (try file.readAll(&savings_bytes) != 8) return false;
-            if (try file.readAll(&sampled_occur_bytes) != 8) return false;
-            if (try file.readAll(&sampled_savings_bytes) != 8) return false;
-            if (try file.readAll(&step_bytes) != 8) return false;
+            for (0..self.n_token_ids) |_| {
+                var id_bytes: [4]u8 = undefined;
+                var occur_bytes: [8]u8 = undefined;
+                var total_occur_bytes: [8]u8 = undefined;
+                var savings_bytes: [8]u8 = undefined;
+                var sampled_occur_bytes: [8]u8 = undefined;
+                var sampled_savings_bytes: [8]u8 = undefined;
+                var step_bytes: [8]u8 = undefined;
 
-            // Update token statistics
-            self.candidate_stats[id].n_nonoverlapping_occurrences = std.mem.readInt(u64, &occur_bytes, .little);
-            const savings_bits = std.mem.readInt(u64, &savings_bytes, .little);
-            self.candidate_stats[id].est_total_savings = @bitCast(savings_bits);
-            self.candidate_stats[id].sampled_occurrences = std.mem.readInt(u64, &sampled_occur_bytes, .little);
-            self.candidate_stats[id].sampled_savings = std.mem.readInt(u64, &sampled_savings_bytes, .little);
-            self.candidate_stats[id].sampled_step = std.mem.readInt(u64, &step_bytes, .little);
+                if (try file.readAll(&id_bytes) != 4) return false;
+                const id = std.mem.readInt(u32, &id_bytes, .little);
+                if (id >= self.n_token_ids) return false;
+
+                if (try file.readAll(&occur_bytes) != 8) return false;
+                if (try file.readAll(&total_occur_bytes) != 8) return false;
+                if (try file.readAll(&savings_bytes) != 8) return false;
+                if (try file.readAll(&sampled_occur_bytes) != 8) return false;
+                if (try file.readAll(&sampled_savings_bytes) != 8) return false;
+                if (try file.readAll(&step_bytes) != 8) return false;
+
+                self.candidate_stats[id].n_nonoverlapping_occurrences = std.mem.readInt(u64, &occur_bytes, .little);
+                self.candidate_stats[id].n_total_occurrences = std.mem.readInt(u64, &total_occur_bytes, .little);
+                const savings_bits = std.mem.readInt(u64, &savings_bytes, .little);
+                self.candidate_stats[id].est_total_savings = @bitCast(savings_bits);
+                self.candidate_stats[id].sampled_occurrences = std.mem.readInt(u64, &sampled_occur_bytes, .little);
+                self.candidate_stats[id].sampled_savings = std.mem.readInt(u64, &sampled_savings_bytes, .little);
+                self.candidate_stats[id].sampled_step = std.mem.readInt(u64, &step_bytes, .little);
+            }
+        } else {
+            if (self.debug) {
+                std.debug.print("Loading old format file, calculating total occurrences...\n", .{});
+            }
+
+            // Load old format data
+            for (0..self.n_token_ids) |_| {
+                var id_bytes: [4]u8 = undefined;
+                var occur_bytes: [8]u8 = undefined;
+                var savings_bytes: [8]u8 = undefined;
+                var sampled_occur_bytes: [8]u8 = undefined;
+                var sampled_savings_bytes: [8]u8 = undefined;
+                var step_bytes: [8]u8 = undefined;
+
+                if (try file.readAll(&id_bytes) != 4) return false;
+                const id = std.mem.readInt(u32, &id_bytes, .little);
+                if (id >= self.n_token_ids) return false;
+
+                if (try file.readAll(&occur_bytes) != 8) return false;
+                if (try file.readAll(&savings_bytes) != 8) return false;
+                if (try file.readAll(&sampled_occur_bytes) != 8) return false;
+                if (try file.readAll(&sampled_savings_bytes) != 8) return false;
+                if (try file.readAll(&step_bytes) != 8) return false;
+
+                self.candidate_stats[id].n_nonoverlapping_occurrences = std.mem.readInt(u64, &occur_bytes, .little);
+                const savings_bits = std.mem.readInt(u64, &savings_bytes, .little);
+                self.candidate_stats[id].est_total_savings = @bitCast(savings_bits);
+                self.candidate_stats[id].sampled_occurrences = std.mem.readInt(u64, &sampled_occur_bytes, .little);
+                self.candidate_stats[id].sampled_savings = std.mem.readInt(u64, &sampled_savings_bytes, .little);
+                self.candidate_stats[id].sampled_step = std.mem.readInt(u64, &step_bytes, .little);
+            }
+
+            // count overlapping occurrences and upgrade the file to new format
+            try self.processCorpus();
+            try self.saveCorpusStatistics(path);
+
+            if (self.debug) {
+                std.debug.print("Upgraded to new format and saved.\n", .{});
+            }
         }
 
         const elapsed = std.time.milliTimestamp() - start_time;
