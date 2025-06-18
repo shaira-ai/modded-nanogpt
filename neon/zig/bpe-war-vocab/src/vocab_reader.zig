@@ -2,14 +2,20 @@ const std = @import("std");
 
 // Constants from vocab_learner.zig
 const VOCAB_MAGIC = "VOCA".*;
-const VOCAB_VERSION: u32 = 1;
-const HEADER_SIZE = 32;
+const HEADER_SIZE = 28;
 
-const VocabHeader = struct {
+// Change from packed struct to regular struct
+const VocabHeader = extern struct {
     magic: [4]u8,
-    version: u32,
     vocab_size: u32,
     reserved: [20]u8,
+
+    // Ensure the struct is exactly 32 bytes
+    comptime {
+        if (@sizeOf(VocabHeader) != HEADER_SIZE) {
+            @compileError("VocabHeader size mismatch");
+        }
+    }
 };
 
 const InspectorError = error{
@@ -97,16 +103,10 @@ pub fn main() !void {
     std.debug.print("  Magic: ", .{});
     for (header.magic) |byte| std.debug.print("{c}", .{byte});
     std.debug.print("\n", .{});
-    std.debug.print("  Version: {d}\n", .{header.version});
 
     // Validate magic number
     if (!std.mem.eql(u8, &header.magic, &VOCAB_MAGIC)) {
         std.debug.print("\nWARNING: Invalid magic number! Expected 'VOCA'\n", .{});
-    }
-
-    // Check version compatibility
-    if (header.version != VOCAB_VERSION) {
-        std.debug.print("\nWARNING: Unsupported version! Expected {d}, found {d}\n", .{ VOCAB_VERSION, header.version });
     }
 
     // Allocate space for all tokens
