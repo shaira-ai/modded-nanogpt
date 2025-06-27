@@ -162,6 +162,8 @@ pub const VocabLearner = struct {
     n_candidates_to_tokenize: u32,
     processed_files: std.StringHashMap(void),
 
+    print_garbage: bool = false,
+
     // Tracking
     last_full_corpus_scan: u32,
     debug: bool,
@@ -919,6 +921,25 @@ pub const VocabLearner = struct {
         var n_candidates_to_tokenize: usize = self.n_candidates_to_tokenize;
         try candidates_to_tokenize_arraylist.resize(n_candidates_to_tokenize);
 
+        // var removal_candidate_arraylist = std.ArrayList(u32).init(self.allocator);
+        // defer removal_candidate_arraylist.deinit();
+
+        // try removal_candidate_arraylist.resize(n_removal_candidates);
+
+        var whole_vocab_arraylist = std.ArrayList(u32).init(self.allocator);
+        defer whole_vocab_arraylist.deinit();
+        try whole_vocab_arraylist.resize(self.vocab_size);
+
+        var vocab_idx: usize = 0;
+        for (0..self.n_token_ids) |id_usize| {
+            const id: u32 = @intCast(id_usize);
+            const stats = self.candidate_stats[id];
+            if (stats.is_in_vocab and stats.str_len > 1) {
+                whole_vocab_arraylist.items[vocab_idx] = id;
+            }
+            vocab_idx = vocab_idx + 1;
+        }
+
         var best_other_savings: f64 = 1e99;
 
         var cover_step: u64 = 0;
@@ -943,6 +964,7 @@ pub const VocabLearner = struct {
                         std.debug.print("New best corpus token count: {d}\n", .{token_count});
                         try self.saveVocabularyNow();
                     }
+                    try self.deleteWorstTokens(&heap, &parallel_dp);
                     try self.deleteSomeTokens(&heap);
                 }
             }
@@ -1225,6 +1247,129 @@ pub const VocabLearner = struct {
         }
     }
 
+    pub fn deleteWorstTokens(
+        self: *VocabLearner,
+        heap: *std.PriorityQueue(u32, *VocabLearner, buildVocabLessThan),
+        parallel_dp: *parallel.ParallelDP,
+        // automaton: *BakaCorasick,
+    ) !void {
+        const batch_size = 50;
+
+        if (self.debug) {
+            std.debug.print("\n=== Starting bad token deletion ===\n", .{});
+        }
+
+        var automaton = try BakaCorasick.init(self.allocator);
+        defer automaton.deinit();
+        const rem_candidates = try self.allocator.alloc(SampleStats, batch_size);
+        defer self.allocator.free(rem_candidates);
+
+        const start_time = std.time.milliTimestamp();
+
+        var token_cursor: usize = 0;
+        var rem_heap = std.PriorityQueue(u32, *VocabLearner, buildVocabGreaterThan).init(self.allocator, self);
+        defer rem_heap.deinit();
+        try rem_heap.ensureTotalCapacity(self.n_token_ids);
+        automaton.clear();
+
+        while (token_cursor < self.n_token_ids) {
+            var n_rem_candidates: u32 = 0;
+            for (token_cursor..self.n_token_ids) |id_usize| {
+                const id: u32 = @intCast(id_usize);
+                const stats = self.candidate_stats[id];
+                if (stats.is_in_vocab) {
+                    const len = self.candidate_stats[id_usize].str_len;
+                    if (len > 1) {
+                        rem_candidates[n_rem_candidates] = .{ .token_id = id };
+                        try automaton.insert(self.getTokenStr(id), @intCast(n_rem_candidates));
+                        n_rem_candidates = n_rem_candidates + 1;
+                        if (n_rem_candidates == batch_size) {
+                            token_cursor = id_usize + 1;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            try automaton.computeSuffixLinks();
+
+            if (self.use_in_memory) {
+                const loader = self.getLoader(InMemoryDataLoader);
+                try parallel_dp.processDocumentsForTokenRemoval(loader, rem_candidates[0..n_rem_candidates], &automaton);
+            } else {
+                const loader = self.getLoader(fineweb);
+                try parallel_dp.processDocumentsForTokenRemoval(loader, rem_candidates[0..n_rem_candidates], &automaton);
+            }
+
+            for (0..n_rem_candidates) |candidate_idx| {
+                const sample_stats = rem_candidates[candidate_idx];
+                const token_id = sample_stats.token_id;
+                const sampled_occurrences = sample_stats.sampled_occurrences;
+
+                const sampled_savings = sample_stats.sampled_savings;
+                const total_occurrences = self.candidate_stats[token_id].n_nonoverlapping_occurrences;
+                const est_savings = @as(f64, @floatFromInt(sampled_savings)) * @as(f64, @floatFromInt(total_occurrences)) / @as(f64, @floatFromInt(sampled_occurrences));
+
+                // self.candidate_stats[token_id].sampled_occurrences = sampled_occurrences;
+                // self.candidate_stats[token_id].sampled_savings = sampled_savings;
+                self.candidate_stats[token_id].est_total_savings = est_savings;
+                try rem_heap.add(token_id);
+            }
+            std.debug.print("Processed {}/{} vocab tokens\n", .{ rem_heap.count(), self.vocab_size });
+
+            if (n_rem_candidates < batch_size) {
+                break;
+            }
+        }
+
+        std.debug.print("Done processing {} vocab tokens\n", .{rem_heap.count()});
+
+        const n_to_remove = (self.vocab_size + 2) / 3;
+
+        var removed_tokens: usize = 0;
+        for (0..n_to_remove) |_| {
+            const token_id = rem_heap.removeOrNull();
+            if (token_id) |id| {
+                self.removeFromVocab(id);
+                removed_tokens = removed_tokens + 1;
+            } else {
+                break;
+            }
+        }
+
+        if (removed_tokens > 0) {
+            std.debug.print("Removed {} tokens\n", .{removed_tokens});
+            // Rebuild the automaton without deleted tokens
+            self.vocab_automaton.clear();
+            var readded_tokens: usize = 0;
+            for (0..self.n_token_ids) |id_usize| {
+                const id: u32 = @intCast(id_usize);
+                const stats = self.candidate_stats[id];
+                if (stats.is_in_vocab) {
+                    const token_str = self.getTokenStr(id);
+                    try self.vocab_automaton.insert(token_str, id);
+                    readded_tokens = readded_tokens + 1;
+                }
+            }
+            try self.vocab_automaton.computeSuffixLinks();
+
+            self.resetTokenEstimates();
+            heap.clearRetainingCapacity();
+            for (0..self.n_token_ids) |id_usize| {
+                const id: u32 = @intCast(id_usize);
+                if (!self.candidate_stats[id].is_in_vocab) {
+                    try heap.add(id);
+                }
+            }
+        }
+
+        const elapsed_ms = std.time.milliTimestamp() - start_time;
+
+        if (self.debug) {
+            std.debug.print("Completed deleting some (worst) tokens in {d}ms.\n", .{elapsed_ms});
+        }
+    }
+
     pub fn deleteSomeTokens(
         self: *VocabLearner,
         heap: *std.PriorityQueue(u32, *VocabLearner, buildVocabLessThan),
@@ -1281,7 +1426,7 @@ pub const VocabLearner = struct {
         for (0..self.n_token_ids) |id_usize| {
             const id: u32 = @intCast(id_usize);
             const stats = self.candidate_stats[id];
-            if (stats.is_in_vocab and stats.str_len > 1) {
+            if (stats.is_in_vocab) {
                 const token_str = self.getTokenStr(id);
                 try self.vocab_automaton.insert(token_str, id);
             }
@@ -1299,7 +1444,7 @@ pub const VocabLearner = struct {
 
         const elapsed_ms = std.time.milliTimestamp() - start_time;
         if (self.debug) {
-            std.debug.print("Completed deleting some tokens in {d}ms.\n", .{elapsed_ms});
+            std.debug.print("Completed deleting some (random) tokens in {d}ms.\n", .{elapsed_ms});
         }
     }
 
@@ -1552,6 +1697,9 @@ pub const VocabLearner = struct {
         token_lens_arraylist: *std.ArrayList(u32),
         counts_for_cover: []u64,
     ) !u64 {
+        if (self.print_garbage) {
+            std.debug.print("OMG COUNT TOKENS\n", .{});
+        }
         pl_arraylist.clearRetainingCapacity();
         try pl_arraylist.appendNTimes(~@as(u64, 0), document.len + 1);
         const pl = pl_arraylist.items;
@@ -1602,12 +1750,19 @@ pub const VocabLearner = struct {
             }
         }
 
+        if (self.print_garbage) {
+            std.debug.print("OMG COUNT TOKENS 2\n", .{});
+        }
+
         const baseline_cost = pl[pl.len - 1];
         var idx = pl.len - 1;
         while (idx > 0) {
             const token_id = token_ids[idx];
             counts_for_cover[token_id] += 1;
             idx -= token_lens[idx];
+        }
+        if (self.print_garbage) {
+            std.debug.print("OMG BASELINE COST {}\n", .{baseline_cost});
         }
         return baseline_cost;
     }
@@ -1807,6 +1962,187 @@ pub const VocabLearner = struct {
                     current_candidate_next_nonoverlapping_pos = pos + current_candidate_len;
                 }
             }
+        }
+    }
+
+    pub fn evaluateRemovalCandidatesOnDocumentDP(
+        self: *const VocabLearner,
+        candidates: []SampleStats,
+        candidates_automaton: *const BakaCorasick,
+        document: []const u8,
+        lookbacks_arraylist: *std.ArrayList(u64),
+        dp_solution_arraylist: *std.ArrayList(u32),
+        matches_arraylist: *std.ArrayList(MatchInfo),
+        token_idx_to_least_end_pos: []u32,
+    ) !void {
+        lookbacks_arraylist.clearRetainingCapacity();
+        try lookbacks_arraylist.appendNTimes(0, document.len + 1);
+        const lookbacks = lookbacks_arraylist.items;
+        dp_solution_arraylist.clearRetainingCapacity();
+        try dp_solution_arraylist.appendNTimes(0, document.len + 1);
+        const dp_solution = dp_solution_arraylist.items;
+        matches_arraylist.clearRetainingCapacity();
+
+        {
+            // Scan text with the automata
+            const vocab_automaton = &self.vocab_automaton;
+            var vocab_state: u32 = 0;
+            var candidates_state: u32 = 0;
+            for (document, 1..) |byte, i| {
+                vocab_state = vocab_automaton.transitions[vocab_state][byte];
+                candidates_state = candidates_automaton.transitions[candidates_state][byte];
+                var this_lookback: u64 = 0;
+
+                // Check if this state represents a match
+                {
+                    const token_id = vocab_automaton.info[vocab_state].token_id;
+                    if (token_id != BakaCorasick.NO_TOKEN) {
+                        const token_len = vocab_automaton.info[vocab_state].depth;
+                        this_lookback |= @as(u64, 1) << @intCast(token_len);
+                    }
+                }
+
+                // Check if this state represents a match
+                {
+                    const token_id = candidates_automaton.info[candidates_state].token_id;
+                    if (token_id != BakaCorasick.NO_TOKEN) {
+                        matches_arraylist.append(MatchInfo.init(token_id, @intCast(i))) catch unreachable;
+                    }
+                }
+
+                // Check suffix links for additional matches
+                var suffix = vocab_automaton.info[vocab_state].green;
+                while (suffix != 0) {
+                    const token_id = vocab_automaton.info[suffix].token_id;
+                    if (token_id != BakaCorasick.NO_TOKEN) {
+                        const token_len = vocab_automaton.info[suffix].depth;
+                        this_lookback |= @as(u64, 1) << @intCast(token_len);
+                    }
+                    suffix = vocab_automaton.info[suffix].green;
+                }
+                this_lookback &= ~@as(u64, 3);
+                lookbacks[i] = this_lookback;
+
+                // Check suffix links for additional matches
+                suffix = candidates_automaton.info[candidates_state].green;
+                while (suffix != 0) {
+                    const token_id = candidates_automaton.info[suffix].token_id;
+                    if (token_id != BakaCorasick.NO_TOKEN) {
+                        matches_arraylist.append(MatchInfo.init(token_id, @intCast(i))) catch unreachable;
+                    }
+                    suffix = candidates_automaton.info[suffix].green;
+                }
+            }
+        }
+
+        if (matches_arraylist.items.len == 0) {
+            return;
+        }
+
+        dp_solution[0] = 0;
+        for (1..dp_solution.len) |i| {
+            var entry_minus_one = dp_solution[i - 1];
+            var mask = lookbacks[i];
+            const n_iters = @popCount(mask);
+            for (0..n_iters) |_| {
+                const lookback = @ctz(mask);
+                mask &= mask - 1;
+                entry_minus_one = @min(entry_minus_one, dp_solution[i - lookback]);
+            }
+            dp_solution[i] = entry_minus_one + 1;
+        }
+        const baseline_cost = dp_solution[dp_solution.len - 1];
+
+        @memset(token_idx_to_least_end_pos, ~@as(u32, 0));
+        for (matches_arraylist.items) |match| {
+            const token_id = match.getTokenId();
+            const current = token_idx_to_least_end_pos[token_id];
+            token_idx_to_least_end_pos[token_id] = @min(current, match.getEndPos());
+        }
+
+        const lt = struct {
+            fn lessThan(ctx: []u32, a: MatchInfo, b: MatchInfo) bool {
+                const a_id = a.getTokenId();
+                const b_id = b.getTokenId();
+                if (a_id != b_id) {
+                    const end_pos_a = ctx[a_id];
+                    const end_pos_b = ctx[b_id];
+                    if (end_pos_a != end_pos_b) {
+                        return std.math.order(end_pos_b, end_pos_a) == .lt;
+                    }
+                }
+                return std.math.order(a.bits, b.bits) == .lt;
+            }
+        }.lessThan;
+        std.sort.pdq(MatchInfo, matches_arraylist.items, token_idx_to_least_end_pos, lt);
+
+        const NOT_A_TOKEN_ID = ~@as(u32, 0);
+        try matches_arraylist.append(MatchInfo.init(NOT_A_TOKEN_ID, 0));
+        const matches = matches_arraylist.items;
+        var current_candidate_id: u32 = matches[0].getTokenId();
+        var current_candidate_start_match_idx: usize = 0;
+        //var current_candidate_end_match_idx: usize = 0;
+        var current_candidate_start_doc_idx: usize = matches[0].getEndPos();
+        // var current_candidate_nonoverlapping_count: u64 = 1;
+        var current_candidate_global_token_id: u32 = candidates[current_candidate_id].token_id;
+        var current_candidate_len: u32 = self.candidate_stats[current_candidate_global_token_id].str_len;
+        // var current_candidate_next_nonoverlapping_pos: usize = current_candidate_start_doc_idx + current_candidate_len;
+        for (1..matches.len) |match_idx_| {
+            const match = matches[match_idx_];
+            const new_token_id = match.getTokenId();
+            if (new_token_id != current_candidate_id) {
+                var i = current_candidate_start_doc_idx;
+                // solve the dp problem starting from i
+                var match_idx = current_candidate_start_match_idx;
+                const candidate_mask = @as(u64, 1) << @intCast(current_candidate_len);
+
+                while (i < dp_solution.len) : (i += 1) {
+                    var entry_minus_one = dp_solution[i - 1];
+                    var mask = lookbacks[i];
+                    if ( //match_idx < current_candidate_end_match_idx and
+                    matches[match_idx].getEndPos() == i) {
+                        if (i >= current_candidate_len) {
+                            mask ^= candidate_mask;
+                        }
+                        match_idx += 1;
+                    }
+                    const n_iters = @popCount(mask);
+                    for (0..n_iters) |_| {
+                        const lookback = @ctz(mask);
+                        mask &= mask - 1;
+                        entry_minus_one = @min(entry_minus_one, dp_solution[i - lookback]);
+                    }
+
+                    dp_solution[i] = entry_minus_one + 1;
+                }
+                const savings = dp_solution[dp_solution.len - 1] - baseline_cost;
+                // if (self.debug) {
+                //     std.debug.print("dp_solution[dp_solution.len-1]={}, baseline_cost={}, len={}, savings={}\n",
+                //    .{ dp_solution[dp_solution.len-1], baseline_cost, document.len, savings });
+                // }
+                candidates[current_candidate_id].sampled_savings += savings;
+                // candidates[current_candidate_id].sampled_occurrences += current_candidate_nonoverlapping_count;
+
+                if (new_token_id == NOT_A_TOKEN_ID) {
+                    break;
+                }
+
+                // done with this candidate
+                current_candidate_id = new_token_id;
+                current_candidate_start_match_idx = match_idx;
+                current_candidate_start_doc_idx = match.getEndPos();
+                // current_candidate_nonoverlapping_count = 1;
+                current_candidate_global_token_id = candidates[current_candidate_id].token_id;
+                current_candidate_len = self.candidate_stats[current_candidate_global_token_id].str_len;
+                // current_candidate_next_nonoverlapping_pos = current_candidate_start_doc_idx + current_candidate_len;
+            }
+            // else {
+            // const pos = match.getEndPos();
+            // // if (pos >= current_candidate_next_nonoverlapping_pos) {
+            // //     current_candidate_nonoverlapping_count += 1;
+            // //     current_candidate_next_nonoverlapping_pos = pos + current_candidate_len;
+            // // }
+            // }
         }
     }
 

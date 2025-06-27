@@ -429,6 +429,7 @@ const WorkTask = if (USE_SPMC_QUEUE) struct {
 const SubmissionQueueEntry = if (USE_SPMC_QUEUE) WorkTask else union(enum) {
     Reset: ResetMessage,
     ProcessDocument: ProcessDocumentMessage,
+    ProcessDocumentForTokenRemoval: ProcessDocumentMessage,
     CountTokensInDocument: CountTokensInDocumentMessage,
     CountTokensInCandidate: CountTokensInDocumentMessage,
     Shutdown: usize,
@@ -557,6 +558,46 @@ pub const Worker = struct {
         const automaton = automaton_param;
 
         try self.vocab_learner.evaluateCandidatesOnDocumentDP(
+            self.candidate_stats[0..self.current_n_candidates],
+            automaton,
+            document,
+            &self.lookbacks,
+            &self.dp_solution,
+            &self.matches,
+            self.token_idx_to_least_end_pos[0..self.current_n_candidates],
+        );
+
+        const result_msg = if (USE_SPMC_QUEUE)
+            CompletionQueueEntry{
+                .DocumentProcessed = DocumentProcessedMessage{
+                    .id = doc_id,
+                    .work_task = work_task_param,
+                },
+            }
+        else
+            CompletionQueueEntry{
+                .DocumentProcessed = DocumentProcessedMessage{
+                    .id = doc_id,
+                },
+            };
+
+        var pushed = self.completion_queue.push(result_msg);
+        while (!pushed) {
+            std.time.sleep(1 * std.time.ns_per_ms);
+            pushed = self.completion_queue.push(result_msg);
+        }
+    }
+
+    fn ProcessDocumentForTokenRemoval(
+        self: *Worker,
+        document: []const u8,
+        doc_id: usize,
+        automaton_param: *BakaCorasick,
+        work_task_param: if (USE_SPMC_QUEUE) *WorkTask else void,
+    ) !void {
+        const automaton = automaton_param;
+
+        try self.vocab_learner.evaluateRemovalCandidatesOnDocumentDP(
             self.candidate_stats[0..self.current_n_candidates],
             automaton,
             document,
@@ -719,6 +760,19 @@ pub const Worker = struct {
                                 _ = self.completion_queue.push(error_message);
                             };
                         },
+                        .ProcessDocumentForTokenRemoval => |process_data| {
+                            self.ProcessDocumentForTokenRemoval(process_data.document, process_data.id, process_data.automaton, work_task) catch |err| {
+                                const error_msg = std.fmt.allocPrint(self.allocator, "Error processing document: {s}", .{@errorName(err)}) catch "OutOfMemory";
+                                defer if (!std.mem.eql(u8, error_msg, "OutOfMemory")) self.allocator.free(error_msg);
+                                const error_message = CompletionQueueEntry{
+                                    .Error = ErrorMessage{
+                                        .worker_id = self.id,
+                                        .message = error_msg,
+                                    },
+                                };
+                                _ = self.completion_queue.push(error_message);
+                            };
+                        },
                         .CountTokensInDocument => |count_tokens_in_document| {
                             self.countTokensInDocument(count_tokens_in_document.document, count_tokens_in_document.id, work_task) catch |err| {
                                 const error_msg = std.fmt.allocPrint(self.allocator, "Error counting tokens in document: {s}", .{@errorName(err)}) catch "OutOfMemory";
@@ -777,6 +831,18 @@ pub const Worker = struct {
                         },
                         .ProcessDocument => |process_data| {
                             self.processDocument(process_data.document, process_data.id, process_data.automaton, {}) catch |err| {
+                                const error_msg = try std.fmt.allocPrint(self.allocator, "Error processing document: {s}", .{@errorName(err)});
+                                const error_message = CompletionQueueEntry{
+                                    .Error = ErrorMessage{
+                                        .worker_id = self.id,
+                                        .message = error_msg,
+                                    },
+                                };
+                                _ = self.completion_queue.push(error_message);
+                            };
+                        },
+                        .ProcessDocumentForTokenRemoval => |process_data| {
+                            self.ProcessDocumentForTokenRemoval(process_data.document, process_data.id, process_data.automaton, {}) catch |err| {
                                 const error_msg = try std.fmt.allocPrint(self.allocator, "Error processing document: {s}", .{@errorName(err)});
                                 const error_message = CompletionQueueEntry{
                                     .Error = ErrorMessage{
@@ -1423,6 +1489,149 @@ pub const ParallelDP = struct {
             if (DataLoaderType.NEEDS_DEALLOCATION) {
                 // Document will be freed when work task is reset
             }
+        }
+    }
+
+    pub fn processDocumentsForTokenRemoval(
+        self: *ParallelDP,
+        loader: anytype,
+        // sample_size: usize,
+        candidates: []SampleStats,
+        candidate_automaton: *BakaCorasick,
+    ) !void {
+        const DataLoaderType = @TypeOf(loader.*);
+        const start_time = time.nanoTimestamp();
+
+        if (USE_SPMC_QUEUE) {
+            self.resetWorkTaskPool();
+        }
+
+        try self.initWorkers(candidates);
+
+        var documents_processed: usize = 0;
+        var documents_submitted: usize = 0;
+        var running = true;
+        var submitted_everything = false;
+        try loader.rewind();
+
+        while (running) {
+            var did_anything = false;
+
+            if (USE_SPMC_QUEUE) {
+                for (0..self.num_workers) |i| {
+                    if (self.completion_queues[i].pop()) |msg| {
+                        _ = self.n_outstanding_jobs.fetchSub(1, .monotonic);
+                        did_anything = true;
+
+                        switch (msg) {
+                            .DocumentProcessed => |doc_processed_msg| {
+                                // Recycle the work task for reuse
+                                self.recycleWorkTask(doc_processed_msg.work_task, DataLoaderType);
+                                documents_processed += 1;
+                            },
+                            .TokenCount => {
+                                // Ignore leftover messages from previous operations
+                            },
+                            .Error => |error_data| {
+                                std.debug.print("[Coordinator] Worker {d} error: {s}\n", .{ i, error_data.message });
+                                return error.WorkerError;
+                            },
+                        }
+                    }
+                }
+
+                // Submit work when capacity allows
+                if (submitted_everything and self.canScheduleWork()) {
+                    const doc_maybe = try loader.nextDocumentString();
+                    did_anything = true;
+                    if (doc_maybe) |doc| {
+                        const work_task = try self.allocateWorkTask();
+                        work_task.* = WorkTask{
+                            .data = .{
+                                .ProcessDocumentForTokenRemoval = ProcessDocumentMessage{
+                                    .id = documents_submitted, // Use as document ID for SPMC
+                                    .document = doc,
+                                    .automaton = candidate_automaton,
+                                },
+                            },
+                        };
+
+                        self.scheduleWork(work_task);
+                        documents_submitted += 1;
+
+                        if (DataLoaderType.NEEDS_DEALLOCATION) {
+                            // Document is now owned by work task, will be freed during task reset
+                        }
+                    } else {
+                        submitted_everything = true;
+                    }
+                }
+            } else {
+                for (0..self.num_workers) |i| {
+                    if (self.completion_queues[i].pop()) |msg| {
+                        self.n_outstanding_jobs[i] -= 1;
+                        did_anything = true;
+                        switch (msg) {
+                            .DocumentProcessed => |doc_processed_msg| {
+                                self.removeFromPendingDocuments(doc_processed_msg.id, DataLoaderType);
+                                documents_processed += 1;
+                            },
+                            .TokenCount => {
+                                // Ignore leftover messages
+                            },
+                            .Error => |error_data| {
+                                std.debug.print("[Coordinator] Worker {d} error: {s}\n", .{ i, error_data.message });
+                                @panic("oh no!2");
+                            },
+                        }
+                    }
+
+                    if (!submitted_everything and self.n_outstanding_jobs[i] < self.queue_depth_for_dp) {
+                        const doc_maybe = try loader.nextDocumentString();
+                        did_anything = true;
+                        if (doc_maybe) |doc| {
+                            const doc_idx = self.addToPendingDocuments(doc);
+
+                            const msg = SubmissionQueueEntry{
+                                .ProcessDocumentForTokenRemoval = ProcessDocumentMessage{
+                                    .id = doc_idx,
+                                    .document = doc,
+                                    .automaton = candidate_automaton,
+                                },
+                            };
+
+                            _ = self.sendMessageToWorker(i, msg, true);
+                            documents_submitted += 1;
+                        } else {
+                            submitted_everything = true;
+                        }
+                    }
+                }
+            }
+
+            if (documents_processed == documents_submitted and submitted_everything) {
+                // Copy the stats from all workers
+                for (self.workers) |worker| {
+                    for (worker.candidate_stats, 0..) |stats, idx| {
+                        // candidates[idx].sampled_occurrences += stats.sampled_occurrences;
+                        candidates[idx].sampled_savings += stats.sampled_savings;
+                    }
+                }
+                running = false;
+            }
+
+            if (!did_anything) {
+                std.time.sleep(1);
+            }
+        }
+
+        if (self.debug) {
+            std.debug.print("[ParallelDP] Initially submitted {d} documents to workers\n", .{documents_submitted});
+        }
+
+        const elapsed = time.nanoTimestamp() - start_time;
+        if (self.debug) {
+            std.debug.print("[ParallelDP] Processed {d} documents in {d:.2}ms\n", .{ documents_processed, @as(f64, @floatFromInt(elapsed)) / time.ns_per_ms });
         }
     }
 
